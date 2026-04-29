@@ -4,4 +4,4 @@ app = FastAPI()
 
 @app.get("/")
 def home():
-    return {"msg": "API ERP FUNCIONANDO"}
+    return {"msg": "API ERP CON POSTGRES OK"}
