@@ -5,7 +5,10 @@ import os
 app = FastAPI()
 
 def get_conn():
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+    return psycopg2.connect(
+        os.getenv("DATABASE_URL"),
+        sslmode="require"
+    )
 
 # 🔹 INICIO
 @app.get("/")
