@@ -39,6 +39,25 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id SERIAL PRIMARY KEY,
+        usuario VARCHAR(50) UNIQUE,
+        clave VARCHAR(50),
+        rol VARCHAR(20)
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS caja (
+        id SERIAL PRIMARY KEY,
+        tipo VARCHAR(50),
+        monto NUMERIC,
+        estado_pago VARCHAR(20),
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)    
+
+    cur.execute("""
     INSERT INTO usuarios (usuario, clave, rol)
     VALUES ('admin', '1234', 'admin')
     ON CONFLICT (usuario) DO NOTHING;
