@@ -20,3 +20,28 @@ def test_db():
     conn.close()
 
     return {"db": "ok", "result": result}
+    
+@app.get("/init-db")
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id SERIAL PRIMARY KEY,
+        usuario VARCHAR(50),
+        clave VARCHAR(50),
+        rol VARCHAR(20)
+    );
+    """)
+
+    cur.execute("""
+    INSERT INTO usuarios (usuario, clave, rol)
+    VALUES ('admin', '1234', 'admin')
+    ON CONFLICT DO NOTHING;
+    """)
+
+    conn.commit()
+    conn.close()
+
+    return {"msg": "Base de datos lista"}    
