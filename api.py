@@ -23,6 +23,7 @@ def test_db():
     
 @app.get("/init-db")
 def init_db():
+    
     conn = get_conn()
     cur = conn.cursor()
 
