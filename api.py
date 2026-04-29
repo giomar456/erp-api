@@ -4,9 +4,18 @@ import os
 
 app = FastAPI()
 
+from urllib.parse import urlparse
+
 def get_conn():
+    url = os.getenv("DATABASE_URL")
+    result = urlparse(url)
+
     return psycopg2.connect(
-        os.getenv("DATABASE_URL"),
+        dbname=result.path[1:],
+        user=result.username,
+        password=result.password,
+        host=result.hostname,
+        port=result.port,
         sslmode="require"
     )
 
