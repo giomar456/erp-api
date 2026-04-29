@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException
 import psycopg2
 import os
+from urllib.parse import urlparse
 
 app = FastAPI()
 
-from urllib.parse import urlparse
-
+# 🔗 CONEXIÓN CORRECTA PARA RENDER
 def get_conn():
     url = os.getenv("DATABASE_URL")
     result = urlparse(url)
@@ -35,7 +35,7 @@ def test_db():
 
     return {"db": "ok", "result": result}
 
-# 🔹 CREAR TABLAS
+# 🔹 CREAR TABLAS (SIN ERROR)
 @app.get("/init-db")
 def init_db():
     conn = get_conn()
@@ -62,11 +62,13 @@ def init_db():
     );
     """)
 
-    # INSERT USUARIO ADMIN
+    # INSERT ADMIN (SIN CONFLICT ERROR)
     cur.execute("""
     INSERT INTO usuarios (usuario, clave, rol)
-    VALUES ('admin', '1234', 'admin')
-    ON CONFLICT (usuario) DO NOTHING;
+    SELECT 'admin', '1234', 'admin'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM usuarios WHERE usuario = 'admin'
+    );
     """)
 
     conn.commit()
@@ -97,7 +99,7 @@ def login(data: dict):
         "rol": user[3]
     }
 
-# 💰 REGISTRAR MOVIMIENTO DE CAJA
+# 💰 REGISTRAR CAJA
 @app.post("/caja")
 def registrar_caja(data: dict):
     conn = get_conn()
