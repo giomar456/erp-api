@@ -29,6 +29,7 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
+    # TABLA USUARIOS
     cur.execute("""
     CREATE TABLE IF NOT EXISTS usuarios (
         id SERIAL PRIMARY KEY,
@@ -38,15 +39,7 @@ def init_db():
     );
     """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usuarios (
-        id SERIAL PRIMARY KEY,
-        usuario VARCHAR(50) UNIQUE,
-        clave VARCHAR(50),
-        rol VARCHAR(20)
-    );
-    """)
-
+    # TABLA CAJA
     cur.execute("""
     CREATE TABLE IF NOT EXISTS caja (
         id SERIAL PRIMARY KEY,
@@ -55,8 +48,9 @@ def init_db():
         estado_pago VARCHAR(20),
         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-    """)    
+    """)
 
+    # INSERT USUARIO ADMIN
     cur.execute("""
     INSERT INTO usuarios (usuario, clave, rol)
     VALUES ('admin', '1234', 'admin')
@@ -90,3 +84,32 @@ def login(data: dict):
         "usuario": user[1],
         "rol": user[3]
     }
+
+# 💰 REGISTRAR MOVIMIENTO DE CAJA
+@app.post("/caja")
+def registrar_caja(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO caja (tipo, monto, estado_pago)
+    VALUES (%s, %s, %s)
+    """, (data["tipo"], data["monto"], data["estado"]))
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "msg": "Movimiento registrado"}
+
+# 📊 LISTAR CAJA
+@app.get("/caja")
+def listar_caja():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM caja ORDER BY id DESC")
+    data = cur.fetchall()
+
+    conn.close()
+
+    return data
