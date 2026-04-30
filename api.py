@@ -50,96 +50,35 @@ def test_conn():
     except Exception as e:
         return {"error": str(e)}
 
-# ================= INIT =================
 @app.get("/init")
 def init():
-    conn = get_conn()
-    cur = conn.cursor()
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
 
-    # USUARIOS
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usuarios (
-        id SERIAL PRIMARY KEY,
-        usuario TEXT UNIQUE,
-        clave TEXT,
-        rol TEXT
-    );
-    """)
-    cur.execute("""
-    INSERT INTO usuarios (usuario, clave, rol)
-    VALUES ('admin','1234','admin')
-    ON CONFLICT (usuario) DO NOTHING;
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id SERIAL PRIMARY KEY,
+            usuario TEXT UNIQUE,
+            clave TEXT,
+            rol TEXT
+        );
+        """)
 
-    # CLIENTES
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS clientes (
-        id SERIAL PRIMARY KEY,
-        tipo_documento TEXT,
-        numero_documento TEXT,
-        nombre TEXT,
-        direccion TEXT
-    );
-    """)
+        cur.execute("""
+        INSERT INTO usuarios (usuario, clave, rol)
+        VALUES ('admin','1234','admin')
+        ON CONFLICT (usuario) DO NOTHING;
+        """)
 
-    # PRODUCTOS
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS productos (
-        id SERIAL PRIMARY KEY,
-        nombre TEXT,
-        categoria TEXT,
-        marca TEXT,
-        modelo TEXT,
-        precio_compra NUMERIC,
-        precio_venta NUMERIC,
-        stock INT
-    );
-    """)
+        conn.commit()
+        conn.close()
 
-    # SERIES
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS series (
-        id SERIAL PRIMARY KEY,
-        tipo TEXT UNIQUE,
-        serie TEXT,
-        correlativo INT
-    );
-    """)
-    cur.execute("""
-    INSERT INTO series (tipo, serie, correlativo)
-    VALUES ('BOLETA','B001',1),('FACTURA','F001',1)
-    ON CONFLICT (tipo) DO NOTHING;
-    """)
+        return {"ok": True}
 
-    # VENTAS
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ventas (
-        id SERIAL PRIMARY KEY,
-        tipo TEXT,
-        numero TEXT,
-        cliente TEXT,
-        total NUMERIC,
-        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-
-    # DETALLE
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ventas_detalle (
-        id SERIAL PRIMARY KEY,
-        venta_id INT,
-        producto_id INT,
-        cantidad INT,
-        precio NUMERIC,
-        total NUMERIC
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-    return {"ok": True}
-
+    except Exception as e:
+        return {"error": str(e)}
+        
 # ================= LOGIN =================
 @app.post("/login")
 def login(data: dict):
