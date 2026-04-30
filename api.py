@@ -83,6 +83,10 @@ class CajaMovimiento(BaseModel):
     estado_pago: str = "PAGADO"
 
 
+class EstadoPagoUpdate(BaseModel):
+    estado_pago: str
+
+
 class Producto(BaseModel):
     nombre: str
     categoria: str
@@ -632,6 +636,55 @@ def detalle_documento(documento_id: int):
 
     conn.close()
     return data
+
+
+@app.put("/documentos/{documento_id}/estado-pago")
+def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        estado_pago = (data.estado_pago or "PAGADO").upper()
+        if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
+            estado_pago = "PAGADO"
+
+        cur.execute("""
+        UPDATE ventas
+        SET estado_pago=%s
+        WHERE id=%s
+        RETURNING id, tipo, numero, cliente, total, usuario_emisor
+        """, (estado_pago, documento_id))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "msg": "Documento no encontrado"}
+
+        venta_id, tipo, numero, cliente, total, usuario = row
+
+        cur.execute("""
+        UPDATE caja_movimientos
+        SET tipo=%s, estado_pago=%s
+        WHERE documento_tipo=%s AND documento_numero=%s
+        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, tipo, numero))
+
+        if cur.rowcount == 0:
+            cur.execute("""
+            INSERT INTO caja_movimientos (
+                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                "INGRESO" if estado_pago == "PAGADO" else estado_pago,
+                f"{tipo} {numero} - {cliente}",
+                total, usuario or "", tipo, numero, estado_pago
+            ))
+
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": venta_id, "estado_pago": estado_pago}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
 
 
 @app.get("/caja")
