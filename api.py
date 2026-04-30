@@ -74,6 +74,16 @@ class StockAjuste(BaseModel):
     stock: int
 
 
+class Usuario(BaseModel):
+    usuario: str
+    clave: str
+    rol: str = "VENTAS"
+
+
+class UsuarioRolUpdate(BaseModel):
+    rol: str
+
+
 class CajaMovimiento(BaseModel):
     tipo: str = "INGRESO"
     detalle: str
@@ -130,6 +140,17 @@ def init():
             rol TEXT
         );
         """)
+
+        for usuario, clave, rol in [
+            ("Giomar", "43yk0rr21", "ADMIN"),
+            ("Mily", "081508Pr", "ADMIN"),
+        ]:
+            cur.execute("""
+            INSERT INTO usuarios (usuario, clave, rol)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (usuario)
+            DO UPDATE SET clave=EXCLUDED.clave, rol=EXCLUDED.rol
+            """, (usuario, clave, rol))
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
@@ -255,13 +276,32 @@ def init():
         return {"ok": False, "error": str(e)}
 
 
+# ================= AUTO UPDATE =================
+@app.get("/app/version")
+def app_version():
+    version = os.getenv("APP_VERSION", "1.0.0")
+    download_url = os.getenv("APP_DOWNLOAD_URL", "")
+    exe_name = os.getenv("APP_EXE_NAME", "erp_sql_pro_v20.exe")
+    notes = os.getenv("APP_UPDATE_NOTES", "")
+    force_update = os.getenv("APP_FORCE_UPDATE", "false").lower() in ("1", "true", "yes", "si")
+    return {
+        "ok": True,
+        "success": True,
+        "version": version,
+        "url": download_url,
+        "name": exe_name,
+        "notes": notes,
+        "force_update": force_update
+    }
+
+
 # ================= LOGIN =================
 @app.post("/login")
 def login(data: dict):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM usuarios WHERE usuario=%s AND clave=%s",
+    cur.execute("SELECT * FROM usuarios WHERE lower(usuario)=lower(%s) AND clave=%s",
                 (data["usuario"], data["clave"]))
     user = cur.fetchone()
 
@@ -271,6 +311,80 @@ def login(data: dict):
         return {"ok": False}
 
     return {"ok": True, "usuario": user[1], "rol": user[3]}
+
+
+# ================= USUARIOS =================
+@app.get("/usuarios")
+def listar_usuarios():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, usuario, rol FROM usuarios ORDER BY usuario")
+    data = dict_fetchall(cur)
+    conn.close()
+    return data
+
+
+@app.post("/usuarios")
+def guardar_usuario(data: Usuario):
+    conn = get_conn()
+    cur = conn.cursor()
+    usuario = (data.usuario or "").strip()
+    clave = data.clave or ""
+    rol = (data.rol or "VENTAS").upper()
+    if rol not in ("ADMIN", "VENTAS"):
+        rol = "VENTAS"
+    if not usuario or not clave:
+        conn.close()
+        return {"ok": False, "msg": "Usuario y clave son obligatorios"}
+    cur.execute("""
+    INSERT INTO usuarios (usuario, clave, rol)
+    VALUES (%s,%s,%s)
+    ON CONFLICT (usuario)
+    DO UPDATE SET clave=EXCLUDED.clave, rol=EXCLUDED.rol
+    RETURNING id
+    """, (usuario, clave, rol))
+    user_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": user_id}
+
+
+@app.put("/usuarios/{usuario_id}/rol")
+def cambiar_rol_usuario(usuario_id: int, data: UsuarioRolUpdate):
+    conn = get_conn()
+    cur = conn.cursor()
+    rol = (data.rol or "VENTAS").upper()
+    if rol not in ("ADMIN", "VENTAS"):
+        rol = "VENTAS"
+    cur.execute("""
+    UPDATE usuarios SET rol=%s
+    WHERE id=%s
+    RETURNING id
+    """, (rol, usuario_id))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True, "id": row[0], "rol": rol}
+
+
+@app.delete("/usuarios/{usuario_id}")
+def eliminar_usuario(usuario_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT usuario FROM usuarios WHERE id=%s", (usuario_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    if str(row[0]).strip().lower() == "giomar":
+        conn.close()
+        return {"ok": False, "msg": "No se puede eliminar Giomar"}
+    cur.execute("DELETE FROM usuarios WHERE id=%s", (usuario_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True}
 
 
 # ================= CLIENTES =================
