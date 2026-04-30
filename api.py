@@ -1,3 +1,12 @@
+@app.get("/test-conn")
+def test_conn():
+    try:
+        conn = get_conn()
+        conn.close()
+        return {"ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+        
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
