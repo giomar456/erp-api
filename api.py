@@ -1,35 +1,19 @@
-@app.get("/test-conn")
-def test_conn():
-    try:
-        conn = get_conn()
-        conn.close()
-        return {"ok": True}
-    except Exception as e:
-        return {"error": str(e)}
-        
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
 import psycopg2
 import os
-from urllib.parse import urlparse
 
 app = FastAPI()
 
-# ---------------- CONEXIÓN ----------------
+# ================= CONEXIÓN (SIMPLE Y ESTABLE) =================
 def get_conn():
-    url = os.getenv("DATABASE_URL")
-    result = urlparse(url)
     return psycopg2.connect(
-        dbname=result.path[1:],
-        user=result.username,
-        password=result.password,
-        host=result.hostname,
-        port=result.port,
+        os.getenv("DATABASE_URL"),
         sslmode="require"
     )
 
-# ---------------- MODELOS ----------------
+# ================= MODELOS =================
 class ItemVenta(BaseModel):
     id: int
     cantidad: int
@@ -56,7 +40,17 @@ class Producto(BaseModel):
     precio_venta: float
     stock: int
 
-# ---------------- INIT ----------------
+# ================= TEST CONEXIÓN =================
+@app.get("/test-conn")
+def test_conn():
+    try:
+        conn = get_conn()
+        conn.close()
+        return {"ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ================= INIT =================
 @app.get("/init")
 def init():
     conn = get_conn()
@@ -71,7 +65,6 @@ def init():
         rol TEXT
     );
     """)
-
     cur.execute("""
     INSERT INTO usuarios (usuario, clave, rol)
     VALUES ('admin','1234','admin')
@@ -112,12 +105,9 @@ def init():
         correlativo INT
     );
     """)
-
     cur.execute("""
     INSERT INTO series (tipo, serie, correlativo)
-    VALUES
-    ('BOLETA','B001',1),
-    ('FACTURA','F001',1)
+    VALUES ('BOLETA','B001',1),('FACTURA','F001',1)
     ON CONFLICT (tipo) DO NOTHING;
     """)
 
@@ -150,7 +140,7 @@ def init():
 
     return {"ok": True}
 
-# ---------------- LOGIN ----------------
+# ================= LOGIN =================
 @app.post("/login")
 def login(data: dict):
     conn = get_conn()
@@ -167,7 +157,7 @@ def login(data: dict):
 
     return {"ok": True, "usuario": user[1], "rol": user[3]}
 
-# ---------------- CLIENTES ----------------
+# ================= CLIENTES =================
 @app.post("/clientes")
 def crear_cliente(data: Cliente):
     conn = get_conn()
@@ -194,17 +184,9 @@ def listar_clientes():
 
     conn.close()
 
-    return [
-        {
-            "id": x[0],
-            "tipo_documento": x[1],
-            "numero_documento": x[2],
-            "nombre": x[3],
-            "direccion": x[4]
-        } for x in data
-    ]
+    return data
 
-# ---------------- PRODUCTOS ----------------
+# ================= PRODUCTOS =================
 @app.post("/productos")
 def crear_producto(data: Producto):
     conn = get_conn()
@@ -232,19 +214,9 @@ def listar_productos():
 
     conn.close()
 
-    return [
-        {
-            "id": x[0],
-            "nombre": x[1],
-            "categoria": x[2],
-            "marca": x[3],
-            "modelo": x[4],
-            "precio_venta": float(x[6]),
-            "stock": x[7]
-        } for x in data
-    ]
+    return data
 
-# ---------------- SERIES ----------------
+# ================= SERIES =================
 @app.get("/series/{tipo}")
 def get_serie(tipo: str):
     conn = get_conn()
@@ -261,7 +233,7 @@ def get_serie(tipo: str):
     _, serie, corr = row
     return {"numero": f"{serie}-{str(corr).zfill(6)}"}
 
-# ---------------- VENTAS ----------------
+# ================= VENTAS =================
 @app.post("/ventas")
 def crear_venta(data: Venta):
     conn = get_conn()
@@ -302,30 +274,3 @@ def crear_venta(data: Venta):
     conn.close()
 
     return {"ok": True, "numero": numero, "total": total}
-
-# ---------------- DASHBOARD ----------------
-@app.get("/dashboard")
-def dashboard():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM clientes")
-    clientes = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM productos")
-    productos = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM ventas")
-    ventas = cur.fetchone()[0]
-
-    cur.execute("SELECT COALESCE(SUM(total),0) FROM ventas")
-    total_ventas = float(cur.fetchone()[0])
-
-    conn.close()
-
-    return {
-        "clientes": clientes,
-        "productos": productos,
-        "documentos": ventas,
-        "total_ventas": total_ventas
-    }
