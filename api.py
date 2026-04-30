@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import psycopg2
 import os
+import requests
 
 app = FastAPI()
 
@@ -385,6 +386,96 @@ def eliminar_usuario(usuario_id: int):
     conn.commit()
     conn.close()
     return {"ok": True, "success": True}
+
+
+# ================= PAGINA WEB / WOOCOMMERCE =================
+def woo_credentials():
+    site_url = os.getenv("WOO_SITE_URL", "https://compuarmy.com").strip().rstrip("/")
+    consumer_key = os.getenv("WOO_CONSUMER_KEY", "").strip()
+    consumer_secret = os.getenv("WOO_CONSUMER_SECRET", "").strip()
+    if not site_url.startswith(("http://", "https://")):
+        site_url = "https://" + site_url
+    return site_url, consumer_key, consumer_secret
+
+
+def woo_request(method, path, **kwargs):
+    site_url, consumer_key, consumer_secret = woo_credentials()
+    if not consumer_key or not consumer_secret:
+        return {"ok": False, "success": False, "msg": "Faltan WOO_CONSUMER_KEY y WOO_CONSUMER_SECRET en Render."}
+    url = f"{site_url}/wp-json/wc/v3/{path.lstrip('/')}"
+    try:
+        r = requests.request(
+            method,
+            url,
+            auth=(consumer_key, consumer_secret),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=35,
+            **kwargs
+        )
+        if r.status_code >= 400:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            return {"ok": False, "success": False, "status": r.status_code, "msg": str(detail)}
+        return {"ok": True, "success": True, "data": r.json() if r.text else None}
+    except Exception as e:
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.get("/web/woocommerce/test")
+def web_woocommerce_test():
+    site_url, consumer_key, consumer_secret = woo_credentials()
+    resp = woo_request("GET", "products", params={"per_page": 1})
+    if not resp.get("ok"):
+        return resp
+    return {
+        "ok": True,
+        "success": True,
+        "site_url": site_url,
+        "configured": bool(consumer_key and consumer_secret),
+        "sample_count": len(resp.get("data") or [])
+    }
+
+
+@app.get("/web/woocommerce/products")
+def web_woocommerce_products(search: str = ""):
+    params = {"per_page": 50, "orderby": "modified", "order": "desc"}
+    if search:
+        params["search"] = search
+    resp = woo_request("GET", "products", params=params)
+    if not resp.get("ok"):
+        return resp
+    rows = []
+    for item in resp.get("data") or []:
+        rows.append({
+            "id": item.get("id", ""),
+            "name": item.get("name", ""),
+            "sku": item.get("sku", ""),
+            "status": item.get("status", ""),
+            "regular_price": item.get("regular_price", ""),
+            "sale_price": item.get("sale_price", ""),
+            "stock_quantity": item.get("stock_quantity", ""),
+            "stock_status": item.get("stock_status", ""),
+            "manage_stock": item.get("manage_stock", False),
+            "modified": item.get("date_modified", ""),
+        })
+    return {"ok": True, "success": True, "data": rows}
+
+
+@app.get("/web/woocommerce/products/{product_id}")
+def web_woocommerce_product(product_id: int):
+    return woo_request("GET", f"products/{product_id}")
+
+
+@app.post("/web/woocommerce/products")
+def web_woocommerce_create_product(data: dict):
+    return woo_request("POST", "products", json=data)
+
+
+@app.put("/web/woocommerce/products/{product_id}")
+def web_woocommerce_update_product(product_id: int, data: dict):
+    return woo_request("PUT", f"products/{product_id}", json=data)
 
 
 # ================= CLIENTES =================
