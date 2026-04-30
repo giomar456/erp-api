@@ -50,6 +50,7 @@ class Venta(BaseModel):
     direccion_cliente: str = ""
     usuario_emisor: str = ""
     observacion: str = ""
+    estado_pago: str = "PAGADO"
 
 
 class Cliente(BaseModel):
@@ -57,6 +58,29 @@ class Cliente(BaseModel):
     numero_documento: str
     nombre: str
     direccion: str
+
+
+class SerieProducto(BaseModel):
+    producto_id: int
+    serie: str
+    proveedor: str = ""
+    estado: str = "DISPONIBLE"
+    fecha_ingreso: str = ""
+    fecha_salida: Optional[str] = None
+
+
+class StockAjuste(BaseModel):
+    stock: int
+
+
+class CajaMovimiento(BaseModel):
+    tipo: str = "INGRESO"
+    detalle: str
+    monto: float
+    usuario: str = ""
+    documento_tipo: str = "MOVIMIENTO"
+    documento_numero: str = ""
+    estado_pago: str = "PAGADO"
 
 
 class Producto(BaseModel):
@@ -143,6 +167,19 @@ def init():
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS producto_series (
+            id SERIAL PRIMARY KEY,
+            producto_id INT REFERENCES productos(id) ON DELETE CASCADE,
+            serie TEXT UNIQUE,
+            proveedor TEXT,
+            estado TEXT DEFAULT 'DISPONIBLE',
+            fecha_ingreso TEXT,
+            fecha_salida TEXT,
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id SERIAL PRIMARY KEY,
             tipo TEXT,
@@ -161,6 +198,7 @@ def init():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion TEXT",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS usuario_emisor TEXT",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_pago TEXT DEFAULT 'PAGADO'",
         ]:
             cur.execute(column_sql)
 
@@ -182,6 +220,20 @@ def init():
             "ALTER TABLE ventas_detalle ADD COLUMN IF NOT EXISTS series_texto TEXT",
         ]:
             cur.execute(column_sql)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS caja_movimientos (
+            id SERIAL PRIMARY KEY,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tipo TEXT,
+            detalle TEXT,
+            monto NUMERIC,
+            usuario TEXT,
+            documento_tipo TEXT,
+            documento_numero TEXT,
+            estado_pago TEXT DEFAULT 'PAGADO'
+        );
+        """)
 
         conn.commit()
         conn.close()
@@ -289,6 +341,112 @@ def listar_productos():
     return data
 
 
+@app.get("/series")
+def listar_series(q: str = ""):
+    conn = get_conn()
+    cur = conn.cursor()
+    texto = f"%{(q or '').lower()}%"
+    cur.execute("""
+    SELECT
+        ps.id,
+        ps.producto_id,
+        p.nombre AS producto_nombre,
+        p.marca,
+        p.modelo,
+        ps.serie,
+        ps.proveedor,
+        ps.estado,
+        ps.fecha_ingreso,
+        ps.fecha_salida
+    FROM producto_series ps
+    LEFT JOIN productos p ON p.id = ps.producto_id
+    WHERE %s = '%%'
+       OR LOWER(COALESCE(ps.serie,'')) LIKE %s
+       OR LOWER(COALESCE(ps.proveedor,'')) LIKE %s
+       OR LOWER(COALESCE(ps.estado,'')) LIKE %s
+       OR LOWER(COALESCE(p.nombre,'')) LIKE %s
+       OR LOWER(COALESCE(p.marca,'')) LIKE %s
+       OR LOWER(COALESCE(p.modelo,'')) LIKE %s
+    ORDER BY ps.id DESC
+    """, (texto, texto, texto, texto, texto, texto, texto))
+    data = dict_fetchall(cur)
+    conn.close()
+    return data
+
+
+@app.post("/series")
+def guardar_serie_producto(data: SerieProducto):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        serie = (data.serie or "").strip()
+        if not serie:
+            conn.close()
+            return {"ok": False, "msg": "La serie no puede estar vacia"}
+
+        cur.execute("SELECT stock FROM productos WHERE id=%s", (data.producto_id,))
+        producto = cur.fetchone()
+        if not producto:
+            conn.close()
+            return {"ok": False, "msg": "Producto no encontrado"}
+
+        cur.execute("""
+        INSERT INTO producto_series (
+            producto_id, serie, proveedor, estado, fecha_ingreso, fecha_salida
+        )
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (serie)
+        DO UPDATE SET producto_id=EXCLUDED.producto_id,
+                      proveedor=EXCLUDED.proveedor,
+                      estado=EXCLUDED.estado,
+                      fecha_ingreso=EXCLUDED.fecha_ingreso,
+                      fecha_salida=EXCLUDED.fecha_salida
+        RETURNING id
+        """, (
+            data.producto_id, serie, data.proveedor, data.estado,
+            data.fecha_ingreso, data.fecha_salida
+        ))
+        serie_id = cur.fetchone()[0]
+
+        if (data.estado or "").upper() == "DISPONIBLE":
+            cur.execute("""
+            UPDATE productos
+            SET stock = (
+                SELECT COUNT(*) FROM producto_series
+                WHERE producto_id=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
+            )
+            WHERE id=%s
+            """, (data.producto_id, data.producto_id))
+
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": serie_id}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
+@app.post("/productos/{producto_id}/ajustar-stock")
+def ajustar_stock(producto_id: int, data: StockAjuste):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        nuevo_stock = max(0, int(data.stock))
+        cur.execute("UPDATE productos SET stock=%s WHERE id=%s RETURNING id", (nuevo_stock, producto_id))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "msg": "Producto no encontrado"}
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": producto_id, "stock": nuevo_stock}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
 # ================= SERIES =================
 @app.get("/series/{tipo}")
 def get_serie(tipo: str):
@@ -330,17 +488,21 @@ def crear_venta(data: Venta):
         if data.tipo_documento_cliente and documento_cliente:
             documento_cliente = f"{data.tipo_documento_cliente}: {documento_cliente}"
 
+        estado_pago = (data.estado_pago or "PAGADO").upper()
+        if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
+            estado_pago = "PAGADO"
+
         cur.execute("""
         INSERT INTO ventas (
             tipo, numero, cliente, documento_cliente, direccion_cliente,
-            subtotal, igv, total, observacion, usuario_emisor, estado
+            subtotal, igv, total, observacion, usuario_emisor, estado, estado_pago
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO')
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s)
         RETURNING id
         """, (
             data.tipo, numero, data.cliente_nombre, documento_cliente,
             data.direccion_cliente, subtotal, igv, total,
-            data.observacion, data.usuario_emisor
+            data.observacion, data.usuario_emisor, estado_pago
         ))
 
         venta_id = cur.fetchone()[0]
@@ -378,6 +540,17 @@ def crear_venta(data: Venta):
 
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
+        cur.execute("""
+        INSERT INTO caja_movimientos (
+            tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            "INGRESO" if estado_pago == "PAGADO" else estado_pago,
+            f"{data.tipo} {numero} - {data.cliente_nombre}",
+            total, data.usuario_emisor, data.tipo, numero, estado_pago
+        ))
+
         conn.commit()
         conn.close()
 
@@ -389,7 +562,8 @@ def crear_venta(data: Venta):
             "numero": numero,
             "subtotal": subtotal,
             "igv": igv,
-            "total": total
+            "total": total,
+            "estado_pago": estado_pago
         }
     except Exception as e:
         conn.rollback()
@@ -421,7 +595,8 @@ def listar_documentos():
         COALESCE(total, 0) AS total,
         COALESCE(observacion, '') AS observacion,
         COALESCE(usuario_emisor, '') AS usuario_emisor,
-        COALESCE(estado, 'EMITIDO') AS estado
+        COALESCE(estado, 'EMITIDO') AS estado,
+        COALESCE(estado_pago, 'PAGADO') AS estado_pago
     FROM ventas
     ORDER BY id DESC
     """)
@@ -459,6 +634,46 @@ def detalle_documento(documento_id: int):
     return data
 
 
+@app.get("/caja")
+def listar_caja():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT id, fecha, tipo, detalle, monto, usuario,
+           COALESCE(documento_tipo, '') AS documento_tipo,
+           COALESCE(documento_numero, '') AS documento_numero,
+           COALESCE(estado_pago, 'PAGADO') AS estado_pago
+    FROM caja_movimientos
+    ORDER BY id DESC
+    """)
+    data = dict_fetchall(cur)
+    conn.close()
+    return data
+
+
+@app.post("/caja")
+def registrar_caja(data: CajaMovimiento):
+    conn = get_conn()
+    cur = conn.cursor()
+    estado_pago = (data.estado_pago or "PAGADO").upper()
+    if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
+        estado_pago = "PAGADO"
+    cur.execute("""
+    INSERT INTO caja_movimientos (
+        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s)
+    RETURNING id
+    """, (
+        data.tipo, data.detalle, data.monto, data.usuario,
+        data.documento_tipo, data.documento_numero, estado_pago
+    ))
+    movimiento_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": movimiento_id}
+
+
 @app.get("/dashboard")
 def dashboard():
     conn = get_conn()
@@ -472,6 +687,15 @@ def dashboard():
     documentos = cur.fetchone()[0]
     cur.execute("SELECT COALESCE(SUM(total),0) FROM ventas")
     total_ventas = float(cur.fetchone()[0] or 0)
+    try:
+        cur.execute("""
+        SELECT COALESCE(SUM(CASE WHEN tipo='INGRESO' AND estado_pago='PAGADO' THEN monto ELSE 0 END),0)
+             - COALESCE(SUM(CASE WHEN tipo='EGRESO' THEN monto ELSE 0 END),0)
+        FROM caja_movimientos
+        """)
+        saldo_caja = float(cur.fetchone()[0] or 0)
+    except Exception:
+        saldo_caja = total_ventas
 
     conn.close()
     return {
@@ -480,5 +704,5 @@ def dashboard():
         "documentos": documentos,
         "compras": 0,
         "total_ventas": total_ventas,
-        "saldo_caja": total_ventas,
+        "saldo_caja": saldo_caja,
     }
