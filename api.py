@@ -56,8 +56,12 @@ def init():
         conn = get_conn()
         cur = conn.cursor()
 
+        # 🔹 BORRAR TABLA SI EXISTE (para limpiar error)
+        cur.execute("DROP TABLE IF EXISTS usuarios;")
+
+        # 🔹 CREAR BIEN
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
+        CREATE TABLE usuarios (
             id SERIAL PRIMARY KEY,
             usuario TEXT UNIQUE,
             clave TEXT,
@@ -65,10 +69,10 @@ def init():
         );
         """)
 
+        # 🔹 INSERTAR ADMIN
         cur.execute("""
         INSERT INTO usuarios (usuario, clave, rol)
-        VALUES ('admin','1234','admin')
-        ON CONFLICT (usuario) DO NOTHING;
+        VALUES ('admin','1234','admin');
         """)
 
         conn.commit()
