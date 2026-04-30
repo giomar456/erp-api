@@ -156,3 +156,162 @@ def dashboard():
         "total_ventas": 0,
         "saldo_caja": 0
     }
+# ==== INIT PRO (puedes llamarlo una vez) ====
+@app.get("/init-pro")
+def init_pro():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # SERIES
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS series (
+        id SERIAL PRIMARY KEY,
+        tipo TEXT UNIQUE,
+        serie TEXT,
+        correlativo INT
+    );
+    """)
+
+    # VENTAS
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ventas (
+        id SERIAL PRIMARY KEY,
+        tipo TEXT,
+        numero TEXT,
+        cliente TEXT,
+        total NUMERIC,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # DETALLE VENTAS
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ventas_detalle (
+        id SERIAL PRIMARY KEY,
+        venta_id INT,
+        producto_id INT,
+        cantidad INT,
+        precio NUMERIC,
+        total NUMERIC
+    );
+    """)
+
+    # SERIES POR DEFECTO
+    cur.execute("""
+    INSERT INTO series (tipo, serie, correlativo)
+    VALUES
+    ('BOLETA','B001',1),
+    ('FACTURA','F001',1),
+    ('PROFORMA','P001',1)
+    ON CONFLICT (tipo) DO NOTHING;
+    """)
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+
+@app.get("/series/{tipo}")
+def get_serie(tipo: str):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT serie, correlativo FROM series WHERE tipo=%s", (tipo,))
+    row = cur.fetchone()
+
+    conn.close()
+
+    if not row:
+        return {"numero": "000001"}
+
+    serie, corr = row
+    return {"numero": f"{serie}-{str(corr).zfill(6)}"}
+
+@app.post("/ventas")
+def crear_venta(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    tipo = data.get("tipo", "BOLETA")
+
+    # OBTENER SERIE
+    cur.execute("SELECT id, serie, correlativo FROM series WHERE tipo=%s", (tipo,))
+    row = cur.fetchone()
+
+    if not row:
+        return {"ok": False, "msg": "Serie no configurada"}
+
+    serie_id, serie, corr = row
+    numero = f"{serie}-{str(corr).zfill(6)}"
+
+    total = sum([i["total"] for i in data["items"]])
+
+    # INSERT VENTA
+    cur.execute("""
+    INSERT INTO ventas (tipo, numero, cliente, total)
+    VALUES (%s,%s,%s,%s)
+    RETURNING id
+    """, (tipo, numero, data["cliente_nombre"], total))
+
+    venta_id = cur.fetchone()[0]
+
+    # DETALLE + STOCK
+    for item in data["items"]:
+        cur.execute("""
+        INSERT INTO ventas_detalle (venta_id, producto_id, cantidad, precio, total)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (venta_id, item["id"], item["cantidad"], item["precio"], item["total"]))
+
+        # 🔻 BAJAR STOCK
+        cur.execute("""
+        UPDATE productos
+        SET stock = stock - %s
+        WHERE id = %s
+        """, (item["cantidad"], item["id"]))
+
+    # ACTUALIZAR CORRELATIVO
+    cur.execute("""
+    UPDATE series SET correlativo = correlativo + 1 WHERE id=%s
+    """, (serie_id,))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "numero": numero,
+        "total": total,
+        "subtotal": total,
+        "igv": 0
+    }
+
+@app.get("/dashboard")
+def dashboard():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM clientes")
+    clientes = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM productos")
+    productos = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM ventas")
+    documentos = cur.fetchone()[0]
+
+    cur.execute("SELECT COALESCE(SUM(total),0) FROM ventas")
+    total_ventas = float(cur.fetchone()[0])
+
+    cur.execute("SELECT COALESCE(SUM(monto),0) FROM caja")
+    caja = float(cur.fetchone()[0])
+
+    conn.close()
+
+    return {
+        "clientes": clientes,
+        "productos": productos,
+        "documentos": documentos,
+        "compras": 0,
+        "total_ventas": total_ventas,
+        "saldo_caja": caja
+    }
