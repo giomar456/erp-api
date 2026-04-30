@@ -51,6 +51,7 @@ class Venta(BaseModel):
     usuario_emisor: str = ""
     observacion: str = ""
     estado_pago: str = "PAGADO"
+    metodo_pago: str = ""
 
 
 class Cliente(BaseModel):
@@ -81,10 +82,12 @@ class CajaMovimiento(BaseModel):
     documento_tipo: str = "MOVIMIENTO"
     documento_numero: str = ""
     estado_pago: str = "PAGADO"
+    metodo_pago: str = ""
 
 
 class EstadoPagoUpdate(BaseModel):
     estado_pago: str
+    metodo_pago: Optional[str] = None
 
 
 class Producto(BaseModel):
@@ -203,6 +206,7 @@ def init():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS usuario_emisor TEXT",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_pago TEXT DEFAULT 'PAGADO'",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''",
         ]:
             cur.execute(column_sql)
 
@@ -235,9 +239,12 @@ def init():
             usuario TEXT,
             documento_tipo TEXT,
             documento_numero TEXT,
-            estado_pago TEXT DEFAULT 'PAGADO'
+            estado_pago TEXT DEFAULT 'PAGADO',
+            metodo_pago TEXT DEFAULT ''
         );
         """)
+
+        cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''")
 
         conn.commit()
         conn.close()
@@ -495,18 +502,19 @@ def crear_venta(data: Venta):
         estado_pago = (data.estado_pago or "PAGADO").upper()
         if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
             estado_pago = "PAGADO"
+        metodo_pago = (data.metodo_pago or "").upper()
 
         cur.execute("""
         INSERT INTO ventas (
             tipo, numero, cliente, documento_cliente, direccion_cliente,
-            subtotal, igv, total, observacion, usuario_emisor, estado, estado_pago
+            subtotal, igv, total, observacion, usuario_emisor, estado, estado_pago, metodo_pago
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s)
         RETURNING id
         """, (
             data.tipo, numero, data.cliente_nombre, documento_cliente,
             data.direccion_cliente, subtotal, igv, total,
-            data.observacion, data.usuario_emisor, estado_pago
+            data.observacion, data.usuario_emisor, estado_pago, metodo_pago
         ))
 
         venta_id = cur.fetchone()[0]
@@ -546,13 +554,13 @@ def crear_venta(data: Venta):
 
         cur.execute("""
         INSERT INTO caja_movimientos (
-            tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago
+            tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             "INGRESO" if estado_pago == "PAGADO" else estado_pago,
             f"{data.tipo} {numero} - {data.cliente_nombre}",
-            total, data.usuario_emisor, data.tipo, numero, estado_pago
+            total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago
         ))
 
         conn.commit()
@@ -567,7 +575,8 @@ def crear_venta(data: Venta):
             "subtotal": subtotal,
             "igv": igv,
             "total": total,
-            "estado_pago": estado_pago
+            "estado_pago": estado_pago,
+            "metodo_pago": metodo_pago
         }
     except Exception as e:
         conn.rollback()
@@ -600,7 +609,8 @@ def listar_documentos():
         COALESCE(observacion, '') AS observacion,
         COALESCE(usuario_emisor, '') AS usuario_emisor,
         COALESCE(estado, 'EMITIDO') AS estado,
-        COALESCE(estado_pago, 'PAGADO') AS estado_pago
+        COALESCE(estado_pago, 'PAGADO') AS estado_pago,
+        COALESCE(metodo_pago, '') AS metodo_pago
     FROM ventas
     ORDER BY id DESC
     """)
@@ -647,40 +657,42 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate):
         if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
             estado_pago = "PAGADO"
 
+        metodo_pago = data.metodo_pago.upper() if data.metodo_pago else None
+
         cur.execute("""
         UPDATE ventas
-        SET estado_pago=%s
+        SET estado_pago=%s, metodo_pago=COALESCE(%s, metodo_pago, '')
         WHERE id=%s
-        RETURNING id, tipo, numero, cliente, total, usuario_emisor
-        """, (estado_pago, documento_id))
+        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, '')
+        """, (estado_pago, metodo_pago, documento_id))
         row = cur.fetchone()
         if not row:
             conn.close()
             return {"ok": False, "msg": "Documento no encontrado"}
 
-        venta_id, tipo, numero, cliente, total, usuario = row
+        venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db = row
 
         cur.execute("""
         UPDATE caja_movimientos
-        SET tipo=%s, estado_pago=%s
+        SET tipo=%s, estado_pago=%s, metodo_pago=%s
         WHERE documento_tipo=%s AND documento_numero=%s
-        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, tipo, numero))
+        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, metodo_pago_db, tipo, numero))
 
         if cur.rowcount == 0:
             cur.execute("""
             INSERT INTO caja_movimientos (
-                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago
+                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 "INGRESO" if estado_pago == "PAGADO" else estado_pago,
                 f"{tipo} {numero} - {cliente}",
-                total, usuario or "", tipo, numero, estado_pago
+                total, usuario or "", tipo, numero, estado_pago, metodo_pago_db
             ))
 
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": venta_id, "estado_pago": estado_pago}
+        return {"ok": True, "success": True, "id": venta_id, "estado_pago": estado_pago, "metodo_pago": metodo_pago_db}
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -695,7 +707,8 @@ def listar_caja():
     SELECT id, fecha, tipo, detalle, monto, usuario,
            COALESCE(documento_tipo, '') AS documento_tipo,
            COALESCE(documento_numero, '') AS documento_numero,
-           COALESCE(estado_pago, 'PAGADO') AS estado_pago
+           COALESCE(estado_pago, 'PAGADO') AS estado_pago,
+           COALESCE(metodo_pago, '') AS metodo_pago
     FROM caja_movimientos
     ORDER BY id DESC
     """)
@@ -711,15 +724,16 @@ def registrar_caja(data: CajaMovimiento):
     estado_pago = (data.estado_pago or "PAGADO").upper()
     if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
         estado_pago = "PAGADO"
+    metodo_pago = (data.metodo_pago or "").upper()
     cur.execute("""
     INSERT INTO caja_movimientos (
-        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago
+        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (
         data.tipo, data.detalle, data.monto, data.usuario,
-        data.documento_tipo, data.documento_numero, estado_pago
+        data.documento_tipo, data.documento_numero, estado_pago, metodo_pago
     ))
     movimiento_id = cur.fetchone()[0]
     conn.commit()
