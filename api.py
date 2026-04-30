@@ -56,12 +56,9 @@ def init():
         conn = get_conn()
         cur = conn.cursor()
 
-        # 🔹 BORRAR TABLA SI EXISTE (para limpiar error)
-        cur.execute("DROP TABLE IF EXISTS usuarios;")
-
-        # 🔹 CREAR BIEN
+        # 🔹 USUARIOS
         cur.execute("""
-        CREATE TABLE usuarios (
+        CREATE TABLE IF NOT EXISTS usuarios (
             id SERIAL PRIMARY KEY,
             usuario TEXT UNIQUE,
             clave TEXT,
@@ -69,16 +66,75 @@ def init():
         );
         """)
 
-        # 🔹 INSERTAR ADMIN
+        # 🔹 CLIENTES
         cur.execute("""
-        INSERT INTO usuarios (usuario, clave, rol)
-        VALUES ('admin','1234','admin');
+        CREATE TABLE IF NOT EXISTS clientes (
+            id SERIAL PRIMARY KEY,
+            tipo_documento TEXT,
+            numero_documento TEXT,
+            nombre TEXT,
+            direccion TEXT
+        );
+        """)
+
+        # 🔹 PRODUCTOS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS productos (
+            id SERIAL PRIMARY KEY,
+            nombre TEXT,
+            categoria TEXT,
+            marca TEXT,
+            modelo TEXT,
+            precio_compra NUMERIC,
+            precio_venta NUMERIC,
+            stock INT
+        );
+        """)
+
+        # 🔹 SERIES
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS series (
+            id SERIAL PRIMARY KEY,
+            tipo TEXT UNIQUE,
+            serie TEXT,
+            correlativo INT
+        );
+        """)
+
+        cur.execute("""
+        INSERT INTO series (tipo, serie, correlativo)
+        VALUES ('BOLETA','B001',1),('FACTURA','F001',1)
+        ON CONFLICT (tipo) DO NOTHING;
+        """)
+
+        # 🔹 VENTAS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ventas (
+            id SERIAL PRIMARY KEY,
+            tipo TEXT,
+            numero TEXT,
+            cliente TEXT,
+            total NUMERIC,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        # 🔹 DETALLE VENTAS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ventas_detalle (
+            id SERIAL PRIMARY KEY,
+            venta_id INT,
+            producto_id INT,
+            cantidad INT,
+            precio NUMERIC,
+            total NUMERIC
+        );
         """)
 
         conn.commit()
         conn.close()
 
-        return {"ok": True}
+        return {"ok": True, "msg": "Base completa lista"}
 
     except Exception as e:
         return {"error": str(e)}
