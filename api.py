@@ -127,3 +127,96 @@ def listar_caja():
     conn.close()
 
     return data
+@app.post("/clientes")
+def crear_cliente(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clientes (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT,
+        documento TEXT
+    );
+    """)
+
+    cur.execute(
+        "INSERT INTO clientes (nombre, documento) VALUES (%s, %s)",
+        (data.get("nombre"), data.get("documento"))
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+    
+@app.get("/clientes")
+def listar_clientes():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM clientes")
+    data = cur.fetchall()
+
+    conn.close()
+    return data
+
+@app.post("/ventas")
+def crear_venta(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ventas (
+        id SERIAL PRIMARY KEY,
+        cliente TEXT,
+        total NUMERIC,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    cur.execute(
+        "INSERT INTO ventas (cliente, total) VALUES (%s, %s)",
+        (data.get("cliente"), data.get("total"))
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+    
+@app.post("/ventas")
+def crear_venta(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ventas (
+        id SERIAL PRIMARY KEY,
+        cliente TEXT,
+        total NUMERIC,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    cur.execute(
+        "INSERT INTO ventas (cliente, total) VALUES (%s, %s)",
+        (data.get("cliente"), data.get("total"))
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+    
+@app.get("/ventas")
+def listar_ventas():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM ventas ORDER BY id DESC")
+    data = cur.fetchall()
+
+    conn.close()
+    return data
+
