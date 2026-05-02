@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import psycopg2
 import os
+import json
 
 app = FastAPI()
 
@@ -267,6 +268,26 @@ def init():
 
         cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''")
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_config (
+            clave TEXT PRIMARY KEY,
+            valor TEXT,
+            actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS auditoria (
+            id SERIAL PRIMARY KEY,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            usuario TEXT,
+            rol TEXT,
+            empresa TEXT,
+            accion TEXT,
+            detalle TEXT
+        );
+        """)
+
         conn.commit()
         conn.close()
 
@@ -336,13 +357,20 @@ def guardar_usuario(data: Usuario):
     if not usuario or not clave:
         conn.close()
         return {"ok": False, "msg": "Usuario y clave son obligatorios"}
-    cur.execute("""
-    INSERT INTO usuarios (usuario, clave, rol)
-    VALUES (%s,%s,%s)
-    ON CONFLICT (usuario)
-    DO UPDATE SET clave=EXCLUDED.clave, rol=EXCLUDED.rol
-    RETURNING id
-    """, (usuario, clave, rol))
+    cur.execute("SELECT id FROM usuarios WHERE lower(usuario)=lower(%s)", (usuario,))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute("""
+        UPDATE usuarios SET usuario=%s, clave=%s, rol=%s
+        WHERE id=%s
+        RETURNING id
+        """, (usuario, clave, rol, existing[0]))
+    else:
+        cur.execute("""
+        INSERT INTO usuarios (usuario, clave, rol)
+        VALUES (%s,%s,%s)
+        RETURNING id
+        """, (usuario, clave, rol))
     user_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -382,6 +410,125 @@ def eliminar_usuario(usuario_id: int):
         conn.close()
         return {"ok": False, "msg": "No se puede eliminar Giomar"}
     cur.execute("DELETE FROM usuarios WHERE id=%s", (usuario_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True}
+
+
+# ================= AUDITORIA CENTRAL =================
+@app.post("/auditoria")
+def registrar_auditoria(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS auditoria (
+        id SERIAL PRIMARY KEY,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        usuario TEXT,
+        rol TEXT,
+        empresa TEXT,
+        accion TEXT,
+        detalle TEXT
+    );
+    """)
+    cur.execute("""
+    INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+    VALUES (%s,%s,%s,%s,%s)
+    RETURNING id
+    """, (
+        str(data.get("usuario", "")),
+        str(data.get("rol", "")),
+        str(data.get("empresa", "")),
+        str(data.get("accion", "")),
+        str(data.get("detalle", "")),
+    ))
+    audit_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": audit_id}
+
+
+@app.get("/auditoria")
+def listar_auditoria(q: str = "", limit: int = 1000):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS auditoria (
+        id SERIAL PRIMARY KEY,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        usuario TEXT,
+        rol TEXT,
+        empresa TEXT,
+        accion TEXT,
+        detalle TEXT
+    );
+    """)
+    limit = max(1, min(int(limit or 1000), 5000))
+    texto = f"%{(q or '').lower()}%"
+    cur.execute("""
+    SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
+           COALESCE(usuario,'') AS usuario,
+           COALESCE(rol,'') AS rol,
+           COALESCE(empresa,'') AS empresa,
+           COALESCE(accion,'') AS accion,
+           COALESCE(detalle,'') AS detalle
+    FROM auditoria
+    WHERE %s = '%%'
+       OR LOWER(COALESCE(usuario,'')) LIKE %s
+       OR LOWER(COALESCE(rol,'')) LIKE %s
+       OR LOWER(COALESCE(empresa,'')) LIKE %s
+       OR LOWER(COALESCE(accion,'')) LIKE %s
+       OR LOWER(COALESCE(detalle,'')) LIKE %s
+    ORDER BY id DESC
+    LIMIT %s
+    """, (texto, texto, texto, texto, texto, texto, limit))
+    data = dict_fetchall(cur)
+    conn.commit()
+    conn.close()
+    return data
+
+
+# ================= CONFIGURACION CENTRAL =================
+@app.get("/config/documento")
+def obtener_config_documento():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS app_config (
+        clave TEXT PRIMARY KEY,
+        valor TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("SELECT valor FROM app_config WHERE clave=%s", ("documento",))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row or not row[0]:
+        return {"ok": True, "success": True, "data": {}}
+    try:
+        return {"ok": True, "success": True, "data": json.loads(row[0])}
+    except Exception:
+        return {"ok": True, "success": True, "data": {}}
+
+
+@app.post("/config/documento")
+def guardar_config_documento(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS app_config (
+        clave TEXT PRIMARY KEY,
+        valor TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("""
+    INSERT INTO app_config (clave, valor, actualizado)
+    VALUES (%s,%s,CURRENT_TIMESTAMP)
+    ON CONFLICT (clave)
+    DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
+    """, ("documento", json.dumps(data, ensure_ascii=False)))
     conn.commit()
     conn.close()
     return {"ok": True, "success": True}
@@ -464,6 +611,54 @@ def listar_productos():
     conn.close()
 
     return data
+
+
+@app.put("/productos/{producto_id}")
+def actualizar_producto(producto_id: int, data: Producto):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+        UPDATE productos
+        SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
+            precio_compra=%s, precio_venta=%s, stock=%s
+        WHERE id=%s
+        RETURNING id
+        """, (
+            data.nombre, data.categoria, data.marca, data.modelo,
+            data.precio_compra, data.precio_venta, data.stock, producto_id
+        ))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Producto no encontrado"}
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": row[0]}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.delete("/productos/{producto_id}")
+def eliminar_producto(producto_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM producto_series WHERE producto_id=%s", (producto_id,))
+        cur.execute("DELETE FROM productos WHERE id=%s RETURNING id", (producto_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Producto no encontrado"}
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": row[0]}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
 
 
 @app.get("/series")
