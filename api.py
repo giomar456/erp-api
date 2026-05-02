@@ -109,6 +109,7 @@ class Producto(BaseModel):
     precio_compra: float
     precio_venta: float
     stock: int
+    imagen_url: Optional[str] = ""
 
 
 # ================= TEST CONEXION =================
@@ -172,9 +173,12 @@ def init():
             modelo TEXT,
             precio_compra NUMERIC,
             precio_venta NUMERIC,
-            stock INT
+            stock INT,
+            imagen_url TEXT DEFAULT ''
         );
         """)
+
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS imagen_url TEXT DEFAULT ''")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS series (
@@ -582,12 +586,12 @@ def crear_producto(data: Producto):
     cur = conn.cursor()
 
     cur.execute("""
-    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock)
-    VALUES (%s,%s,%s,%s,%s,%s,%s)
+    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (data.nombre, data.categoria, data.marca,
           data.modelo, data.precio_compra,
-          data.precio_venta, data.stock))
+          data.precio_venta, data.stock, data.imagen_url or ""))
     producto_id = cur.fetchone()[0]
 
     conn.commit()
@@ -602,7 +606,7 @@ def listar_productos():
     cur = conn.cursor()
 
     cur.execute("""
-    SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock
+    SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock, COALESCE(imagen_url, '') AS imagen_url
     FROM productos
     ORDER BY nombre
     """)
@@ -621,12 +625,12 @@ def actualizar_producto(producto_id: int, data: Producto):
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
-            precio_compra=%s, precio_venta=%s, stock=%s
+            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s
         WHERE id=%s
         RETURNING id
         """, (
             data.nombre, data.categoria, data.marca, data.modelo,
-            data.precio_compra, data.precio_venta, data.stock, producto_id
+            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", producto_id
         ))
         row = cur.fetchone()
         if not row:
