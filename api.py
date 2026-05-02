@@ -160,9 +160,11 @@ def init():
             tipo_documento TEXT,
             numero_documento TEXT UNIQUE,
             nombre TEXT,
-            direccion TEXT
+            direccion TEXT,
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS productos (
@@ -1120,6 +1122,71 @@ def dashboard():
     except Exception:
         saldo_caja = total_ventas
 
+    cur.execute("""
+        SELECT to_char(fecha::date, 'YYYY-MM-DD') AS dia, COALESCE(SUM(total), 0) AS total
+        FROM ventas
+        WHERE fecha >= CURRENT_DATE - INTERVAL '29 days'
+        GROUP BY fecha::date
+        ORDER BY fecha::date
+    """)
+    ventas_por_dia = [{"dia": r[0], "total": float(r[1] or 0)} for r in cur.fetchall()]
+
+    cur.execute("""
+        SELECT tipo, numero, COALESCE(cliente_nombre,''), COALESCE(total,0),
+               COALESCE(estado_pago,'PAGADO'), COALESCE(usuario_emisor,'')
+        FROM ventas
+        ORDER BY fecha DESC, id DESC
+        LIMIT 8
+    """)
+    recientes = [
+        {
+            "tipo": r[0],
+            "numero": r[1],
+            "cliente": r[2],
+            "total": float(r[3] or 0),
+            "estado_pago": r[4],
+            "usuario": r[5],
+        }
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("""
+        SELECT COALESCE(NULLIF(metodo_pago,''),'SIN METODO') AS metodo, COALESCE(SUM(total),0) AS total
+        FROM ventas
+        WHERE COALESCE(estado_pago,'PAGADO')='PAGADO'
+        GROUP BY COALESCE(NULLIF(metodo_pago,''),'SIN METODO')
+        ORDER BY total DESC
+    """)
+    metodos_pago = [{"metodo": r[0], "total": float(r[1] or 0)} for r in cur.fetchall()]
+
+    cur.execute("""
+        SELECT id, nombre, categoria, marca, modelo, stock, precio_venta, COALESCE(imagen_url,'') AS imagen_url
+        FROM productos
+        WHERE COALESCE(stock,0) <= 5
+        ORDER BY stock ASC, nombre ASC
+        LIMIT 8
+    """)
+    productos_bajos = [
+        {
+            "id": r[0],
+            "nombre": r[1],
+            "categoria": r[2],
+            "marca": r[3],
+            "modelo": r[4],
+            "stock": int(r[5] or 0),
+            "precio_venta": float(r[6] or 0),
+            "imagen_url": r[7],
+        }
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(stock,0) <= 5")
+    stock_bajo = int(cur.fetchone()[0] or 0)
+    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA')")
+    facturas_cobrar = int(cur.fetchone()[0] or 0)
+    cur.execute("SELECT COUNT(*) FROM clientes WHERE creado_en >= CURRENT_DATE")
+    clientes_hoy = int(cur.fetchone()[0] or 0)
+
     conn.close()
     return {
         "clientes": clientes,
@@ -1128,4 +1195,11 @@ def dashboard():
         "compras": 0,
         "total_ventas": total_ventas,
         "saldo_caja": saldo_caja,
+        "ventas_por_dia": ventas_por_dia,
+        "recientes": recientes,
+        "metodos_pago": metodos_pago,
+        "productos_bajos": productos_bajos,
+        "stock_bajo": stock_bajo,
+        "facturas_cobrar": facturas_cobrar,
+        "clientes_hoy": clientes_hoy,
     }
