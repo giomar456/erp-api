@@ -4,6 +4,7 @@ from typing import List, Optional
 import psycopg2
 import os
 import json
+import requests
 
 app = FastAPI()
 
@@ -79,6 +80,7 @@ class Usuario(BaseModel):
     usuario: str
     clave: str
     rol: str = "VENTAS"
+    foto_url: Optional[str] = ""
 
 
 class UsuarioRolUpdate(BaseModel):
@@ -112,6 +114,19 @@ class Producto(BaseModel):
     imagen_url: Optional[str] = ""
 
 
+class WooProduct(BaseModel):
+    name: str
+    sku: str = ""
+    status: str = "publish"
+    regular_price: str = ""
+    sale_price: str = ""
+    short_description: str = ""
+    description: str = ""
+    manage_stock: bool = True
+    stock_quantity: Optional[int] = None
+    images: Optional[list] = None
+
+
 # ================= TEST CONEXION =================
 @app.get("/")
 def home():
@@ -139,9 +154,11 @@ def init():
             id SERIAL PRIMARY KEY,
             usuario TEXT UNIQUE,
             clave TEXT,
-            rol TEXT
+            rol TEXT,
+            foto_url TEXT DEFAULT ''
         );
         """)
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto_url TEXT DEFAULT ''")
 
         for usuario, clave, rol in [
             ("Giomar", "43yk0rr21", "ADMIN"),
@@ -328,16 +345,20 @@ def login(data: dict):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM usuarios WHERE lower(usuario)=lower(%s) AND clave=%s",
+    cur.execute("""
+        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url
+        FROM usuarios
+        WHERE lower(usuario)=lower(%s) AND clave=%s
+    """,
                 (data["usuario"], data["clave"]))
-    user = cur.fetchone()
+    user = dict_fetchone(cur)
 
     conn.close()
 
     if not user:
         return {"ok": False}
 
-    return {"ok": True, "usuario": user[1], "rol": user[3]}
+    return {"ok": True, "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", "")}
 
 
 # ================= USUARIOS =================
@@ -345,7 +366,7 @@ def login(data: dict):
 def listar_usuarios():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, usuario, rol FROM usuarios ORDER BY usuario")
+    cur.execute("SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url FROM usuarios ORDER BY usuario")
     data = dict_fetchall(cur)
     conn.close()
     return data
@@ -358,6 +379,7 @@ def guardar_usuario(data: Usuario):
     usuario = (data.usuario or "").strip()
     clave = data.clave or ""
     rol = (data.rol or "VENTAS").upper()
+    foto_url = data.foto_url or ""
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
     if not usuario or not clave:
@@ -367,20 +389,41 @@ def guardar_usuario(data: Usuario):
     existing = cur.fetchone()
     if existing:
         cur.execute("""
-        UPDATE usuarios SET usuario=%s, clave=%s, rol=%s
+        UPDATE usuarios
+        SET usuario=%s, clave=%s, rol=%s,
+            foto_url=CASE WHEN %s <> '' THEN %s ELSE COALESCE(foto_url,'') END
         WHERE id=%s
         RETURNING id
-        """, (usuario, clave, rol, existing[0]))
+        """, (usuario, clave, rol, foto_url, foto_url, existing[0]))
     else:
         cur.execute("""
-        INSERT INTO usuarios (usuario, clave, rol)
-        VALUES (%s,%s,%s)
+        INSERT INTO usuarios (usuario, clave, rol, foto_url)
+        VALUES (%s,%s,%s,%s)
         RETURNING id
-        """, (usuario, clave, rol))
+        """, (usuario, clave, rol, foto_url))
     user_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "id": user_id}
+
+
+@app.put("/usuarios/{usuario_id}/foto")
+def actualizar_foto_usuario(usuario_id: int, data: dict):
+    foto_url = str(data.get("foto_url", "") or "")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE usuarios
+        SET foto_url=%s
+        WHERE id=%s
+        RETURNING id
+    """, (foto_url, usuario_id))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True}
 
 
 @app.put("/usuarios/{usuario_id}/rol")
@@ -1097,6 +1140,144 @@ def registrar_caja(data: CajaMovimiento):
     conn.commit()
     conn.close()
     return {"ok": True, "id": movimiento_id}
+
+
+# ================= WOOCOMMERCE CENTRAL =================
+def woo_config():
+    site = (os.getenv("WC_STORE_URL") or os.getenv("WOOCOMMERCE_URL") or os.getenv("WP_URL") or "").strip().rstrip("/")
+    ck = (os.getenv("WC_CONSUMER_KEY") or os.getenv("WOOCOMMERCE_CONSUMER_KEY") or "").strip()
+    cs = (os.getenv("WC_CONSUMER_SECRET") or os.getenv("WOOCOMMERCE_CONSUMER_SECRET") or "").strip()
+    if not site or not ck or not cs:
+        return None
+    return site, ck, cs
+
+
+def woo_request(method, endpoint, **kwargs):
+    cfg = woo_config()
+    if not cfg:
+        return {"ok": False, "msg": "Faltan variables WC_STORE_URL, WC_CONSUMER_KEY y WC_CONSUMER_SECRET en Render."}
+    site, ck, cs = cfg
+    params = kwargs.pop("params", {}) or {}
+    params.setdefault("consumer_key", ck)
+    params.setdefault("consumer_secret", cs)
+    url = f"{site}/wp-json/wc/v3/{endpoint.lstrip('/')}"
+    try:
+        r = requests.request(method, url, params=params, timeout=35, **kwargs)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+        if r.status_code >= 400:
+            msg = data.get("message") if isinstance(data, dict) else str(data)
+            return {"ok": False, "status": r.status_code, "msg": msg or "Error WooCommerce", "data": data}
+        return {"ok": True, "status": r.status_code, "data": data, "site_url": site}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+def woo_payload_from_model(data: WooProduct):
+    payload = {
+        "name": data.name,
+        "sku": data.sku,
+        "status": data.status or "publish",
+        "regular_price": str(data.regular_price or "0"),
+        "sale_price": str(data.sale_price or ""),
+        "short_description": data.short_description or "",
+        "description": data.description or "",
+        "manage_stock": bool(data.manage_stock),
+    }
+    if data.stock_quantity is not None:
+        payload["stock_quantity"] = int(data.stock_quantity)
+    if data.images:
+        payload["images"] = data.images
+    return payload
+
+
+@app.get("/web/woocommerce/test")
+def woo_test():
+    r = woo_request("get", "products", params={"per_page": 1})
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "site_url": r.get("site_url"), "msg": "Conexion WooCommerce correcta"}
+
+
+@app.get("/web/woocommerce/products")
+def woo_products(search: str = ""):
+    params = {"per_page": 50, "orderby": "date", "order": "desc"}
+    if search:
+        params["search"] = search
+    r = woo_request("get", "products", params=params)
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "data": r.get("data", [])}
+
+
+@app.get("/web/woocommerce/products/{producto_id}")
+def woo_product(producto_id: int):
+    r = woo_request("get", f"products/{producto_id}")
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "data": r.get("data", {})}
+
+
+@app.post("/web/woocommerce/products")
+def woo_create_product(data: WooProduct):
+    r = woo_request("post", "products", json=woo_payload_from_model(data))
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "data": r.get("data", {})}
+
+
+@app.put("/web/woocommerce/products/{producto_id}")
+def woo_update_product(producto_id: int, data: WooProduct):
+    r = woo_request("put", f"products/{producto_id}", json=woo_payload_from_model(data))
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "data": r.get("data", {})}
+
+
+@app.post("/web/woocommerce/sync-product/{producto_id}")
+def woo_sync_product(producto_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url
+        FROM productos
+        WHERE id=%s
+    """, (producto_id,))
+    p = dict_fetchone(cur)
+    conn.close()
+    if not p:
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+
+    sku = f"ERP-{p['id']}"
+    payload = {
+        "name": p.get("nombre") or f"Producto {p['id']}",
+        "sku": sku,
+        "status": "publish",
+        "regular_price": str(float(p.get("precio_venta") or 0)),
+        "manage_stock": True,
+        "stock_quantity": int(p.get("stock") or 0),
+        "short_description": f"{p.get('marca','')} {p.get('modelo','')}".strip(),
+        "description": f"Categoria: {p.get('categoria','')}",
+    }
+    img = str(p.get("imagen_url") or "").strip()
+    if img.startswith(("http://", "https://")):
+        payload["images"] = [{"src": img}]
+
+    found = woo_request("get", "products", params={"sku": sku, "per_page": 1})
+    if not found.get("ok"):
+        return found
+    existing = found.get("data") or []
+    if existing:
+        r = woo_request("put", f"products/{existing[0]['id']}", json=payload)
+        action = "actualizado"
+    else:
+        r = woo_request("post", "products", json=payload)
+        action = "creado"
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "msg": f"Producto {action} en WooCommerce.", "data": r.get("data", {})}
 
 
 @app.get("/dashboard")
