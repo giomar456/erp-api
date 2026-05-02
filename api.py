@@ -129,6 +129,17 @@ class WooProduct(BaseModel):
     images: Optional[list] = None
 
 
+class Garantia(BaseModel):
+    cliente: str = ""
+    documento: str = ""
+    producto: str = ""
+    serie: str = ""
+    falla: str = ""
+    estado: str = "RECIBIDO"
+    solucion: str = ""
+    usuario: str = ""
+
+
 # ================= TEST CONEXION =================
 @app.get("/")
 def home():
@@ -300,6 +311,26 @@ def init():
             actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS garantias (
+            id SERIAL PRIMARY KEY,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            cliente TEXT,
+            documento TEXT,
+            producto TEXT,
+            serie TEXT,
+            falla TEXT,
+            estado TEXT DEFAULT 'RECIBIDO',
+            solucion TEXT DEFAULT '',
+            usuario TEXT DEFAULT ''
+        );
+        """)
+        for column_sql in [
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS solucion TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS usuario TEXT DEFAULT ''",
+        ]:
+            cur.execute(column_sql)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS auditoria (
@@ -1293,6 +1324,81 @@ def woo_sync_product(producto_id: int):
     if not r.get("ok"):
         return r
     return {"ok": True, "msg": f"Producto {action} en WooCommerce.", "data": r.get("data", {})}
+
+
+# ================= GARANTIAS =================
+@app.get("/garantias")
+def listar_garantias(q: str = ""):
+    conn = get_conn()
+    cur = conn.cursor()
+    filtro = f"%{q.strip()}%"
+    cur.execute("""
+        SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
+               COALESCE(cliente,'') AS cliente,
+               COALESCE(documento,'') AS documento,
+               COALESCE(producto,'') AS producto,
+               COALESCE(serie,'') AS serie,
+               COALESCE(falla,'') AS falla,
+               COALESCE(estado,'RECIBIDO') AS estado,
+               COALESCE(solucion,'') AS solucion,
+               COALESCE(usuario,'') AS usuario
+        FROM garantias
+        WHERE %s = '%%'
+           OR cliente ILIKE %s
+           OR documento ILIKE %s
+           OR producto ILIKE %s
+           OR serie ILIKE %s
+           OR falla ILIKE %s
+        ORDER BY fecha DESC, id DESC
+        LIMIT 300
+    """, (filtro, filtro, filtro, filtro, filtro, filtro))
+    data = dict_fetchall(cur)
+    conn.close()
+    return data
+
+
+@app.post("/garantias")
+def guardar_garantia(data: Garantia):
+    estado = (data.estado or "RECIBIDO").upper()
+    if estado not in ("RECIBIDO", "REVISION", "APROBADO", "RECHAZADO", "ENTREGADO"):
+        estado = "RECIBIDO"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO garantias (cliente, documento, producto, serie, falla, estado, solucion, usuario)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id
+    """, (
+        data.cliente, data.documento, data.producto, data.serie,
+        data.falla, estado, data.solucion, data.usuario
+    ))
+    garantia_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": garantia_id}
+
+
+@app.put("/garantias/{garantia_id}")
+def actualizar_garantia(garantia_id: int, data: Garantia):
+    estado = (data.estado or "RECIBIDO").upper()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE garantias
+        SET cliente=%s, documento=%s, producto=%s, serie=%s,
+            falla=%s, estado=%s, solucion=%s, usuario=%s
+        WHERE id=%s
+        RETURNING id
+    """, (
+        data.cliente, data.documento, data.producto, data.serie,
+        data.falla, estado, data.solucion, data.usuario, garantia_id
+    ))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Garantia no encontrada"}
+    return {"ok": True, "success": True}
 
 
 @app.get("/dashboard")
