@@ -4,7 +4,9 @@ from typing import List, Optional
 import psycopg2
 import os
 import json
-import requests
+import urllib.parse
+import urllib.request
+import urllib.error
 
 app = FastAPI()
 
@@ -1160,17 +1162,30 @@ def woo_request(method, endpoint, **kwargs):
     params = kwargs.pop("params", {}) or {}
     params.setdefault("consumer_key", ck)
     params.setdefault("consumer_secret", cs)
+    query = urllib.parse.urlencode(params)
     url = f"{site}/wp-json/wc/v3/{endpoint.lstrip('/')}"
+    if query:
+        url = f"{url}?{query}"
     try:
-        r = requests.request(method, url, params=params, timeout=35, **kwargs)
+        payload = kwargs.get("json")
+        body = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+            return {"ok": True, "status": resp.status, "data": data, "site_url": site}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
         try:
-            data = r.json()
+            data = json.loads(raw) if raw else {}
         except Exception:
-            data = {"raw": r.text}
-        if r.status_code >= 400:
-            msg = data.get("message") if isinstance(data, dict) else str(data)
-            return {"ok": False, "status": r.status_code, "msg": msg or "Error WooCommerce", "data": data}
-        return {"ok": True, "status": r.status_code, "data": data, "site_url": site}
+            data = {"raw": raw}
+        msg = data.get("message") if isinstance(data, dict) else str(data)
+        return {"ok": False, "status": e.code, "msg": msg or "Error WooCommerce", "data": data}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
