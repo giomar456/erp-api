@@ -957,6 +957,49 @@ def detalle_documento(documento_id: int):
     return data
 
 
+@app.delete("/documentos/{documento_id}")
+def eliminar_documento(documento_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT tipo, numero FROM ventas WHERE id=%s", (documento_id,))
+        venta = cur.fetchone()
+        if not venta:
+            conn.close()
+            return {"ok": False, "msg": "Documento no encontrado"}
+
+        tipo, numero = venta
+
+        cur.execute("""
+        SELECT producto_id, COALESCE(cantidad, 0)
+        FROM ventas_detalle
+        WHERE venta_id=%s AND producto_id IS NOT NULL
+        """, (documento_id,))
+        detalles = cur.fetchall()
+
+        for producto_id, cantidad in detalles:
+            cur.execute("""
+            UPDATE productos
+            SET stock = COALESCE(stock, 0) + %s
+            WHERE id = %s
+            """, (cantidad or 0, producto_id))
+
+        cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
+        cur.execute("""
+        DELETE FROM caja_movimientos
+        WHERE documento_tipo=%s AND documento_numero=%s
+        """, (tipo, numero))
+        cur.execute("DELETE FROM ventas WHERE id=%s", (documento_id,))
+
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
 @app.put("/documentos/{documento_id}/estado-pago")
 def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate):
     conn = get_conn()
