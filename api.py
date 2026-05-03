@@ -141,6 +141,7 @@ class WooProduct(BaseModel):
     manage_stock: bool = True
     stock_quantity: Optional[int] = None
     images: Optional[list] = None
+    categories: Optional[list] = None
 
 
 class Garantia(BaseModel):
@@ -436,7 +437,7 @@ def login(data: dict):
             return {"ok": False, "msg": "No tienes acceso a esta sucursal."}
         sucursal = user_branch
 
-    return {"ok": True, "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "sucursal": sucursal, "empresa": sucursal}
+    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "sucursal": sucursal, "empresa": sucursal}
 
 
 # ================= USUARIOS =================
@@ -1397,7 +1398,62 @@ def woo_payload_from_model(data: WooProduct):
         payload["stock_quantity"] = int(data.stock_quantity)
     if data.images:
         payload["images"] = data.images
+    if data.categories:
+        payload["categories"] = data.categories
     return payload
+
+
+def woo_category_for_name(name: str):
+    name = str(name or "").strip()
+    if not name:
+        return None
+    found = woo_request("get", "products/categories", params={"search": name, "per_page": 20})
+    if found.get("ok"):
+        for cat in found.get("data") or []:
+            if str(cat.get("name", "")).strip().lower() == name.lower():
+                return {"id": cat.get("id"), "name": cat.get("name")}
+    created = woo_request("post", "products/categories", json={"name": name})
+    if created.get("ok") and isinstance(created.get("data"), dict):
+        return {"id": created["data"].get("id"), "name": created["data"].get("name")}
+    return None
+
+
+def woo_payload_from_erp_product(p: dict):
+    sku = f"ERP-{p['id']}"
+    payload = {
+        "name": p.get("nombre") or f"Producto {p['id']}",
+        "sku": sku,
+        "status": "publish",
+        "regular_price": str(float(p.get("precio_venta") or 0)),
+        "manage_stock": True,
+        "stock_quantity": int(p.get("stock") or 0),
+        "short_description": f"{p.get('marca','')} {p.get('modelo','')}".strip(),
+        "description": f"Categoria: {p.get('categoria','')}",
+    }
+    img = str(p.get("imagen_url") or "").strip()
+    if img.startswith(("http://", "https://")):
+        payload["images"] = [{"src": img}]
+    cat = woo_category_for_name(p.get("categoria", ""))
+    if cat and cat.get("id"):
+        payload["categories"] = [{"id": int(cat["id"])}]
+    return sku, payload
+
+
+def woo_upsert_erp_product(p: dict):
+    sku, payload = woo_payload_from_erp_product(p)
+    found = woo_request("get", "products", params={"sku": sku, "per_page": 1})
+    if not found.get("ok"):
+        return found
+    existing = found.get("data") or []
+    if existing:
+        r = woo_request("put", f"products/{existing[0]['id']}", json=payload)
+        action = "actualizado"
+    else:
+        r = woo_request("post", "products", json=payload)
+        action = "creado"
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "action": action, "data": r.get("data", {})}
 
 
 def ensure_army_web(sucursal: str = DEFAULT_SUCURSAL):
@@ -1482,34 +1538,42 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
 
-    sku = f"ERP-{p['id']}"
-    payload = {
-        "name": p.get("nombre") or f"Producto {p['id']}",
-        "sku": sku,
-        "status": "publish",
-        "regular_price": str(float(p.get("precio_venta") or 0)),
-        "manage_stock": True,
-        "stock_quantity": int(p.get("stock") or 0),
-        "short_description": f"{p.get('marca','')} {p.get('modelo','')}".strip(),
-        "description": f"Categoria: {p.get('categoria','')}",
-    }
-    img = str(p.get("imagen_url") or "").strip()
-    if img.startswith(("http://", "https://")):
-        payload["images"] = [{"src": img}]
-
-    found = woo_request("get", "products", params={"sku": sku, "per_page": 1})
-    if not found.get("ok"):
-        return found
-    existing = found.get("data") or []
-    if existing:
-        r = woo_request("put", f"products/{existing[0]['id']}", json=payload)
-        action = "actualizado"
-    else:
-        r = woo_request("post", "products", json=payload)
-        action = "creado"
+    r = woo_upsert_erp_product(p)
     if not r.get("ok"):
         return r
-    return {"ok": True, "msg": f"Producto {action} en WooCommerce.", "data": r.get("data", {})}
+    return {"ok": True, "msg": f"Producto {r.get('action')} en WooCommerce.", "data": r.get("data", {})}
+
+
+@app.post("/web/woocommerce/sync-products")
+def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
+    sucursal = norm_sucursal(sucursal)
+    only_with_stock = bool((data or {}).get("only_with_stock", False))
+    conn = get_conn()
+    cur = conn.cursor()
+    sql = """
+        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url
+        FROM productos
+        WHERE COALESCE(sucursal,%s)=%s
+    """
+    params = [DEFAULT_SUCURSAL, sucursal]
+    if only_with_stock:
+        sql += " AND COALESCE(stock,0) > 0"
+    sql += " ORDER BY id LIMIT 300"
+    cur.execute(sql, params)
+    productos = dict_fetchall(cur)
+    conn.close()
+    ok = 0
+    errores = []
+    for p in productos:
+        r = woo_upsert_erp_product(p)
+        if r.get("ok"):
+            ok += 1
+        else:
+            errores.append({"id": p.get("id"), "nombre": p.get("nombre"), "msg": r.get("msg", "Error WooCommerce")})
+    return {"ok": True, "success": True, "total": len(productos), "sync_ok": ok, "errores": errores[:20]}
 
 
 # ================= GARANTIAS =================
