@@ -11,6 +11,14 @@ import urllib.error
 app = FastAPI()
 
 # ================= CONEXION (SIMPLE Y ESTABLE) =================
+DEFAULT_SUCURSAL = "computer_army"
+
+
+def norm_sucursal(value: str = ""):
+    value = (value or DEFAULT_SUCURSAL).strip().lower().replace(" ", "_")
+    return value or DEFAULT_SUCURSAL
+
+
 def get_conn():
     return psycopg2.connect(
         os.getenv("DATABASE_URL"),
@@ -56,6 +64,7 @@ class Venta(BaseModel):
     observacion: str = ""
     estado_pago: str = "PAGADO"
     metodo_pago: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class Cliente(BaseModel):
@@ -63,6 +72,7 @@ class Cliente(BaseModel):
     numero_documento: str
     nombre: str
     direccion: str
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class SerieProducto(BaseModel):
@@ -72,6 +82,7 @@ class SerieProducto(BaseModel):
     estado: str = "DISPONIBLE"
     fecha_ingreso: str = ""
     fecha_salida: Optional[str] = None
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class StockAjuste(BaseModel):
@@ -83,6 +94,7 @@ class Usuario(BaseModel):
     clave: str
     rol: str = "VENTAS"
     foto_url: Optional[str] = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class UsuarioRolUpdate(BaseModel):
@@ -98,6 +110,7 @@ class CajaMovimiento(BaseModel):
     documento_numero: str = ""
     estado_pago: str = "PAGADO"
     metodo_pago: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class EstadoPagoUpdate(BaseModel):
@@ -114,6 +127,7 @@ class Producto(BaseModel):
     precio_venta: float
     stock: int
     imagen_url: Optional[str] = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class WooProduct(BaseModel):
@@ -138,6 +152,7 @@ class Garantia(BaseModel):
     estado: str = "RECIBIDO"
     solucion: str = ""
     usuario: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 # ================= TEST CONEXION =================
@@ -172,16 +187,30 @@ def init():
         );
         """)
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto_url TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sucursales (
+            codigo TEXT PRIMARY KEY,
+            nombre TEXT,
+            activa BOOLEAN DEFAULT TRUE,
+            creada_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cur.execute("""
+        INSERT INTO sucursales (codigo, nombre, activa)
+        VALUES ('computer_army','COMPUTER ARMY',TRUE)
+        ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
+        """)
 
         for usuario, clave, rol in [
             ("Giomar", "43yk0rr21", "ADMIN"),
             ("Mily", "081508Pr", "ADMIN"),
         ]:
             cur.execute("""
-            INSERT INTO usuarios (usuario, clave, rol)
-            VALUES (%s,%s,%s)
+            INSERT INTO usuarios (usuario, clave, rol, sucursal)
+            VALUES (%s,%s,%s,'computer_army')
             ON CONFLICT (usuario)
-            DO UPDATE SET clave=EXCLUDED.clave, rol=EXCLUDED.rol
+            DO UPDATE SET clave=EXCLUDED.clave, rol=EXCLUDED.rol, sucursal='computer_army'
             """, (usuario, clave, rol))
 
         cur.execute("""
@@ -195,6 +224,8 @@ def init():
         );
         """)
         cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("ALTER TABLE clientes DROP CONSTRAINT IF EXISTS clientes_numero_documento_key")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS productos (
@@ -211,6 +242,7 @@ def init():
         """)
 
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS imagen_url TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS series (
@@ -230,6 +262,7 @@ def init():
             ('FACTURA','F001',1)
         ON CONFLICT (tipo) DO NOTHING;
         """)
+        cur.execute("ALTER TABLE series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS producto_series (
@@ -243,6 +276,7 @@ def init():
             creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
@@ -265,6 +299,7 @@ def init():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_pago TEXT DEFAULT 'PAGADO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
 
@@ -284,6 +319,7 @@ def init():
             "ALTER TABLE ventas_detalle ADD COLUMN IF NOT EXISTS marca TEXT",
             "ALTER TABLE ventas_detalle ADD COLUMN IF NOT EXISTS modelo TEXT",
             "ALTER TABLE ventas_detalle ADD COLUMN IF NOT EXISTS series_texto TEXT",
+            "ALTER TABLE ventas_detalle ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
 
@@ -303,6 +339,7 @@ def init():
         """)
 
         cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS app_config (
@@ -329,6 +366,7 @@ def init():
         for column_sql in [
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS solucion TEXT DEFAULT ''",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS usuario TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
 
@@ -375,34 +413,63 @@ def app_version():
 # ================= LOGIN =================
 @app.post("/login")
 def login(data: dict):
+    sucursal = norm_sucursal(data.get("sucursal") or data.get("empresa"))
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url
+        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
+               COALESCE(sucursal,%s) AS sucursal
         FROM usuarios
         WHERE lower(usuario)=lower(%s) AND clave=%s
     """,
-                (data["usuario"], data["clave"]))
+                (DEFAULT_SUCURSAL, data["usuario"], data["clave"]))
     user = dict_fetchone(cur)
 
     conn.close()
 
     if not user:
         return {"ok": False}
+    if str(user["usuario"]).strip().lower() != "giomar":
+        user_branch = norm_sucursal(user.get("sucursal"))
+        if user_branch != sucursal:
+            return {"ok": False, "msg": "No tienes acceso a esta sucursal."}
+        sucursal = user_branch
 
-    return {"ok": True, "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", "")}
+    return {"ok": True, "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "sucursal": sucursal, "empresa": sucursal}
 
 
 # ================= USUARIOS =================
 @app.get("/usuarios")
-def listar_usuarios():
+def listar_usuarios(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url FROM usuarios ORDER BY usuario")
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url, COALESCE(sucursal,%s) AS sucursal
+        FROM usuarios
+        WHERE COALESCE(sucursal,%s)=%s OR lower(usuario)='giomar'
+        ORDER BY usuario
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
     conn.close()
     return data
+
+
+@app.get("/usuarios/perfil")
+def perfil_usuario(usuario: str = ""):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT usuario, rol, COALESCE(foto_url,'') AS foto_url, COALESCE(sucursal,%s) AS sucursal
+        FROM usuarios
+        WHERE lower(usuario)=lower(%s)
+    """, (DEFAULT_SUCURSAL, usuario.strip()))
+    data = dict_fetchone(cur)
+    conn.close()
+    if not data:
+        return {"ok": False, "found": False}
+    return {"ok": True, "found": True, **data}
 
 
 @app.post("/usuarios")
@@ -413,6 +480,7 @@ def guardar_usuario(data: Usuario):
     clave = data.clave or ""
     rol = (data.rol or "VENTAS").upper()
     foto_url = data.foto_url or ""
+    sucursal = norm_sucursal(data.sucursal)
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
     if not usuario or not clave:
@@ -423,21 +491,74 @@ def guardar_usuario(data: Usuario):
     if existing:
         cur.execute("""
         UPDATE usuarios
-        SET usuario=%s, clave=%s, rol=%s,
+        SET usuario=%s, clave=%s, rol=%s, sucursal=%s,
             foto_url=CASE WHEN %s <> '' THEN %s ELSE COALESCE(foto_url,'') END
         WHERE id=%s
         RETURNING id
-        """, (usuario, clave, rol, foto_url, foto_url, existing[0]))
+        """, (usuario, clave, rol, sucursal, foto_url, foto_url, existing[0]))
     else:
         cur.execute("""
-        INSERT INTO usuarios (usuario, clave, rol, foto_url)
-        VALUES (%s,%s,%s,%s)
+        INSERT INTO usuarios (usuario, clave, rol, foto_url, sucursal)
+        VALUES (%s,%s,%s,%s,%s)
         RETURNING id
-        """, (usuario, clave, rol, foto_url))
+        """, (usuario, clave, rol, foto_url, sucursal))
     user_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "id": user_id}
+
+
+@app.get("/sucursales")
+def listar_sucursales():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT codigo, nombre, COALESCE(activa, TRUE) AS activa
+        FROM sucursales
+        WHERE COALESCE(activa, TRUE)=TRUE
+        ORDER BY nombre
+    """)
+    data = dict_fetchall(cur)
+    conn.close()
+    return data
+
+
+@app.post("/sucursales")
+def guardar_sucursal(data: dict):
+    usuario = str(data.get("usuario", "")).strip().lower()
+    if usuario != "giomar":
+        return {"ok": False, "msg": "Solo Giomar puede crear sucursales."}
+    codigo = norm_sucursal(data.get("codigo"))
+    nombre = str(data.get("nombre") or codigo.replace("_", " ").upper()).strip().upper()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sucursales (codigo, nombre, activa)
+        VALUES (%s,%s,TRUE)
+        ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
+        RETURNING codigo
+    """, (codigo, nombre))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "codigo": codigo, "nombre": nombre}
+
+
+@app.delete("/sucursales/{codigo}")
+def eliminar_sucursal(codigo: str, usuario: str = ""):
+    if str(usuario).strip().lower() != "giomar":
+        return {"ok": False, "msg": "Solo Giomar puede eliminar sucursales."}
+    codigo = norm_sucursal(codigo)
+    if codigo == DEFAULT_SUCURSAL:
+        return {"ok": False, "msg": "COMPUTER ARMY es la sucursal principal y no se puede eliminar."}
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE sucursales SET activa=FALSE WHERE codigo=%s RETURNING codigo", (codigo,))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Sucursal no encontrada."}
+    return {"ok": True, "success": True, "codigo": codigo}
 
 
 @app.put("/usuarios/{usuario_id}/foto")
@@ -463,6 +584,14 @@ def actualizar_foto_usuario(usuario_id: int, data: dict):
 def cambiar_rol_usuario(usuario_id: int, data: UsuarioRolUpdate):
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("SELECT usuario FROM usuarios WHERE id=%s", (usuario_id,))
+    current = cur.fetchone()
+    if not current:
+        conn.close()
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    if str(current[0]).strip().lower() == "giomar":
+        conn.close()
+        return {"ok": False, "msg": "Giomar es control maestro y no se puede cambiar su rol"}
     rol = (data.rol or "VENTAS").upper()
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
@@ -621,17 +750,26 @@ def guardar_config_documento(data: dict):
 def crear_cliente(data: Cliente):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
 
     cur.execute("""
-    INSERT INTO clientes (tipo_documento,numero_documento,nombre,direccion)
-    VALUES (%s,%s,%s,%s)
-    ON CONFLICT (numero_documento)
-    DO UPDATE SET tipo_documento=EXCLUDED.tipo_documento,
-                  nombre=EXCLUDED.nombre,
-                  direccion=EXCLUDED.direccion
-    RETURNING id
-    """, (data.tipo_documento, data.numero_documento,
-          data.nombre, data.direccion))
+    SELECT id FROM clientes
+    WHERE numero_documento=%s AND COALESCE(sucursal,%s)=%s
+    """, (data.numero_documento, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if row:
+        cur.execute("""
+        UPDATE clientes
+        SET tipo_documento=%s, nombre=%s, direccion=%s
+        WHERE id=%s
+        RETURNING id
+        """, (data.tipo_documento, data.nombre, data.direccion, row[0]))
+    else:
+        cur.execute("""
+        INSERT INTO clientes (tipo_documento,numero_documento,nombre,direccion,sucursal)
+        VALUES (%s,%s,%s,%s,%s)
+        RETURNING id
+        """, (data.tipo_documento, data.numero_documento, data.nombre, data.direccion, sucursal))
     cliente_id = cur.fetchone()[0]
 
     conn.commit()
@@ -641,15 +779,17 @@ def crear_cliente(data: Cliente):
 
 
 @app.get("/clientes")
-def listar_clientes():
+def listar_clientes(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
 
     cur.execute("""
-    SELECT id, tipo_documento, numero_documento, nombre, direccion
+    SELECT id, tipo_documento, numero_documento, nombre, direccion, COALESCE(sucursal,%s) AS sucursal
     FROM clientes
+    WHERE COALESCE(sucursal,%s)=%s
     ORDER BY id DESC
-    """)
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
 
     conn.close()
@@ -662,14 +802,15 @@ def listar_clientes():
 def crear_producto(data: Producto):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
 
     cur.execute("""
-    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,sucursal)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (data.nombre, data.categoria, data.marca,
           data.modelo, data.precio_compra,
-          data.precio_venta, data.stock, data.imagen_url or ""))
+          data.precio_venta, data.stock, data.imagen_url or "", sucursal))
     producto_id = cur.fetchone()[0]
 
     conn.commit()
@@ -679,15 +820,18 @@ def crear_producto(data: Producto):
 
 
 @app.get("/productos")
-def listar_productos():
+def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
 
     cur.execute("""
-    SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock, COALESCE(imagen_url, '') AS imagen_url
+    SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
+           COALESCE(imagen_url, '') AS imagen_url, COALESCE(sucursal,%s) AS sucursal
     FROM productos
+    WHERE COALESCE(sucursal,%s)=%s
     ORDER BY nombre
-    """)
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
 
     conn.close()
@@ -696,19 +840,20 @@ def listar_productos():
 
 
 @app.put("/productos/{producto_id}")
-def actualizar_producto(producto_id: int, data: Producto):
+def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal or sucursal)
     try:
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
             precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s
-        WHERE id=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
             data.nombre, data.categoria, data.marca, data.modelo,
-            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", producto_id
+            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", producto_id, DEFAULT_SUCURSAL, sucursal
         ))
         row = cur.fetchone()
         if not row:
@@ -724,12 +869,13 @@ def actualizar_producto(producto_id: int, data: Producto):
 
 
 @app.delete("/productos/{producto_id}")
-def eliminar_producto(producto_id: int):
+def eliminar_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
     try:
-        cur.execute("DELETE FROM producto_series WHERE producto_id=%s", (producto_id,))
-        cur.execute("DELETE FROM productos WHERE id=%s RETURNING id", (producto_id,))
+        cur.execute("DELETE FROM producto_series WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal))
+        cur.execute("DELETE FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (producto_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -744,9 +890,10 @@ def eliminar_producto(producto_id: int):
 
 
 @app.get("/series")
-def listar_series(q: str = ""):
+def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
     texto = f"%{(q or '').lower()}%"
     cur.execute("""
     SELECT
@@ -761,16 +908,17 @@ def listar_series(q: str = ""):
         ps.fecha_ingreso,
         ps.fecha_salida
     FROM producto_series ps
-    LEFT JOIN productos p ON p.id = ps.producto_id
-    WHERE %s = '%%'
+    LEFT JOIN productos p ON p.id = ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+    WHERE COALESCE(ps.sucursal,%s)=%s
+      AND (%s = '%%'
        OR LOWER(COALESCE(ps.serie,'')) LIKE %s
        OR LOWER(COALESCE(ps.proveedor,'')) LIKE %s
        OR LOWER(COALESCE(ps.estado,'')) LIKE %s
        OR LOWER(COALESCE(p.nombre,'')) LIKE %s
        OR LOWER(COALESCE(p.marca,'')) LIKE %s
-       OR LOWER(COALESCE(p.modelo,'')) LIKE %s
+       OR LOWER(COALESCE(p.modelo,'')) LIKE %s)
     ORDER BY ps.id DESC
-    """, (texto, texto, texto, texto, texto, texto, texto))
+    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto, texto, texto))
     data = dict_fetchall(cur)
     conn.close()
     return data
@@ -781,12 +929,13 @@ def guardar_serie_producto(data: SerieProducto):
     conn = get_conn()
     cur = conn.cursor()
     try:
+        sucursal = norm_sucursal(data.sucursal)
         serie = (data.serie or "").strip()
         if not serie:
             conn.close()
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
-        cur.execute("SELECT stock FROM productos WHERE id=%s", (data.producto_id,))
+        cur.execute("SELECT stock FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
         producto = cur.fetchone()
         if not producto:
             conn.close()
@@ -794,19 +943,20 @@ def guardar_serie_producto(data: SerieProducto):
 
         cur.execute("""
         INSERT INTO producto_series (
-            producto_id, serie, proveedor, estado, fecha_ingreso, fecha_salida
+            producto_id, serie, proveedor, estado, fecha_ingreso, fecha_salida, sucursal
         )
-        VALUES (%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (serie)
         DO UPDATE SET producto_id=EXCLUDED.producto_id,
                       proveedor=EXCLUDED.proveedor,
                       estado=EXCLUDED.estado,
                       fecha_ingreso=EXCLUDED.fecha_ingreso,
-                      fecha_salida=EXCLUDED.fecha_salida
+                      fecha_salida=EXCLUDED.fecha_salida,
+                      sucursal=EXCLUDED.sucursal
         RETURNING id
         """, (
             data.producto_id, serie, data.proveedor, data.estado,
-            data.fecha_ingreso, data.fecha_salida
+            data.fecha_ingreso, data.fecha_salida, sucursal
         ))
         serie_id = cur.fetchone()[0]
 
@@ -815,10 +965,10 @@ def guardar_serie_producto(data: SerieProducto):
             UPDATE productos
             SET stock = (
                 SELECT COUNT(*) FROM producto_series
-                WHERE producto_id=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
+                WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
             )
-            WHERE id=%s
-            """, (data.producto_id, data.producto_id))
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (data.producto_id, DEFAULT_SUCURSAL, sucursal, data.producto_id, DEFAULT_SUCURSAL, sucursal))
 
         conn.commit()
         conn.close()
@@ -830,12 +980,13 @@ def guardar_serie_producto(data: SerieProducto):
 
 
 @app.post("/productos/{producto_id}/ajustar-stock")
-def ajustar_stock(producto_id: int, data: StockAjuste):
+def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     try:
+        sucursal = norm_sucursal(sucursal)
         nuevo_stock = max(0, int(data.stock))
-        cur.execute("UPDATE productos SET stock=%s WHERE id=%s RETURNING id", (nuevo_stock, producto_id))
+        cur.execute("UPDATE productos SET stock=%s WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (nuevo_stock, producto_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -874,6 +1025,7 @@ def crear_venta(data: Venta):
     cur = conn.cursor()
 
     try:
+        sucursal = norm_sucursal(data.sucursal)
         cur.execute("SELECT id, serie, correlativo FROM series WHERE tipo=%s", (data.tipo,))
         row = cur.fetchone()
 
@@ -898,14 +1050,14 @@ def crear_venta(data: Venta):
         cur.execute("""
         INSERT INTO ventas (
             tipo, numero, cliente, documento_cliente, direccion_cliente,
-            subtotal, igv, total, observacion, usuario_emisor, estado, estado_pago, metodo_pago
+            subtotal, igv, total, observacion, usuario_emisor, estado, estado_pago, metodo_pago, sucursal
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s)
         RETURNING id
         """, (
             data.tipo, numero, data.cliente_nombre, documento_cliente,
             data.direccion_cliente, subtotal, igv, total,
-            data.observacion, data.usuario_emisor, estado_pago, metodo_pago
+            data.observacion, data.usuario_emisor, estado_pago, metodo_pago, sucursal
         ))
 
         venta_id = cur.fetchone()[0]
@@ -917,7 +1069,7 @@ def crear_venta(data: Venta):
             modelo = item.modelo
 
             if not descripcion:
-                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s", (producto_id,))
+                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal))
                 prod = cur.fetchone()
                 if prod:
                     descripcion = prod[0] or ""
@@ -927,31 +1079,31 @@ def crear_venta(data: Venta):
             cur.execute("""
             INSERT INTO ventas_detalle (
                 venta_id, producto_id, descripcion, marca, modelo,
-                series_texto, cantidad, precio, total
+                series_texto, cantidad, precio, total, sucursal
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 venta_id, producto_id, descripcion, marca, modelo,
                 item.series_texto or item.serie,
-                item.cantidad, item.precio, item.total
+                item.cantidad, item.precio, item.total, sucursal
             ))
 
             cur.execute("""
             UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
-            WHERE id = %s
-            """, (item.cantidad, producto_id))
+            WHERE id = %s AND COALESCE(sucursal,%s)=%s
+            """, (item.cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
 
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
         cur.execute("""
         INSERT INTO caja_movimientos (
-            tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago
+            tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             "INGRESO" if estado_pago == "PAGADO" else estado_pago,
             f"{data.tipo} {numero} - {data.cliente_nombre}",
-            total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago
+            total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago, sucursal
         ))
 
         conn.commit()
@@ -981,9 +1133,10 @@ def emitir_documento(data: Venta):
 
 
 @app.get("/documentos")
-def listar_documentos():
+def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
 
     cur.execute("""
     SELECT
@@ -1003,8 +1156,9 @@ def listar_documentos():
         COALESCE(estado_pago, 'PAGADO') AS estado_pago,
         COALESCE(metodo_pago, '') AS metodo_pago
     FROM ventas
+    WHERE COALESCE(sucursal,%s)=%s
     ORDER BY id DESC
-    """)
+    """, (DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
 
     conn.close()
@@ -1040,17 +1194,18 @@ def detalle_documento(documento_id: int):
 
 
 @app.delete("/documentos/{documento_id}")
-def eliminar_documento(documento_id: int):
+def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT tipo, numero FROM ventas WHERE id=%s", (documento_id,))
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("SELECT tipo, numero, COALESCE(sucursal,%s) FROM ventas WHERE id=%s AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
         venta = cur.fetchone()
         if not venta:
             conn.close()
             return {"ok": False, "msg": "Documento no encontrado"}
 
-        tipo, numero = venta
+        tipo, numero, sucursal = venta
 
         cur.execute("""
         SELECT producto_id, COALESCE(cantidad, 0)
@@ -1063,14 +1218,14 @@ def eliminar_documento(documento_id: int):
             cur.execute("""
             UPDATE productos
             SET stock = COALESCE(stock, 0) + %s
-            WHERE id = %s
-            """, (cantidad or 0, producto_id))
+            WHERE id = %s AND COALESCE(sucursal,%s)=%s
+            """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal))
 
         cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
         cur.execute("""
         DELETE FROM caja_movimientos
-        WHERE documento_tipo=%s AND documento_numero=%s
-        """, (tipo, numero))
+        WHERE documento_tipo=%s AND documento_numero=%s AND COALESCE(sucursal,%s)=%s
+        """, (tipo, numero, DEFAULT_SUCURSAL, sucursal))
         cur.execute("DELETE FROM ventas WHERE id=%s", (documento_id,))
 
         conn.commit()
@@ -1083,10 +1238,11 @@ def eliminar_documento(documento_id: int):
 
 
 @app.put("/documentos/{documento_id}/estado-pago")
-def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate):
+def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     try:
+        sucursal = norm_sucursal(sucursal)
         estado_pago = (data.estado_pago or "PAGADO").upper()
         if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
             estado_pago = "PAGADO"
@@ -1096,32 +1252,33 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate):
         cur.execute("""
         UPDATE ventas
         SET estado_pago=%s, metodo_pago=COALESCE(%s, metodo_pago, '')
-        WHERE id=%s
-        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, '')
-        """, (estado_pago, metodo_pago, documento_id))
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, ''), COALESCE(sucursal,%s)
+        """, (estado_pago, metodo_pago, documento_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL))
         row = cur.fetchone()
         if not row:
             conn.close()
             return {"ok": False, "msg": "Documento no encontrado"}
 
-        venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db = row
+        venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db, sucursal_db = row
 
         cur.execute("""
         UPDATE caja_movimientos
         SET tipo=%s, estado_pago=%s, metodo_pago=%s
         WHERE documento_tipo=%s AND documento_numero=%s
-        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, metodo_pago_db, tipo, numero))
+          AND COALESCE(sucursal,%s)=%s
+        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, metodo_pago_db, tipo, numero, DEFAULT_SUCURSAL, sucursal_db))
 
         if cur.rowcount == 0:
             cur.execute("""
             INSERT INTO caja_movimientos (
-                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago
+                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 "INGRESO" if estado_pago == "PAGADO" else estado_pago,
                 f"{tipo} {numero} - {cliente}",
-                total, usuario or "", tipo, numero, estado_pago, metodo_pago_db
+                total, usuario or "", tipo, numero, estado_pago, metodo_pago_db, sucursal_db
             ))
 
         conn.commit()
@@ -1134,18 +1291,21 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate):
 
 
 @app.get("/caja")
-def listar_caja():
+def listar_caja(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
     cur.execute("""
     SELECT id, fecha, tipo, detalle, monto, usuario,
            COALESCE(documento_tipo, '') AS documento_tipo,
            COALESCE(documento_numero, '') AS documento_numero,
            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
-           COALESCE(metodo_pago, '') AS metodo_pago
+           COALESCE(metodo_pago, '') AS metodo_pago,
+           COALESCE(sucursal,%s) AS sucursal
     FROM caja_movimientos
+    WHERE COALESCE(sucursal,%s)=%s
     ORDER BY id DESC
-    """)
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
     conn.close()
     return data
@@ -1155,19 +1315,20 @@ def listar_caja():
 def registrar_caja(data: CajaMovimiento):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
     estado_pago = (data.estado_pago or "PAGADO").upper()
     if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
         estado_pago = "PAGADO"
     metodo_pago = (data.metodo_pago or "").upper()
     cur.execute("""
     INSERT INTO caja_movimientos (
-        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago
+        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (
         data.tipo, data.detalle, data.monto, data.usuario,
-        data.documento_tipo, data.documento_numero, estado_pago, metodo_pago
+        data.documento_tipo, data.documento_numero, estado_pago, metodo_pago, sucursal
     ))
     movimiento_id = cur.fetchone()[0]
     conn.commit()
@@ -1239,8 +1400,17 @@ def woo_payload_from_model(data: WooProduct):
     return payload
 
 
+def ensure_army_web(sucursal: str = DEFAULT_SUCURSAL):
+    if norm_sucursal(sucursal) != DEFAULT_SUCURSAL:
+        return {"ok": False, "msg": "La pagina web/WooCommerce esta habilitada solo para COMPUTER ARMY."}
+    return None
+
+
 @app.get("/web/woocommerce/test")
-def woo_test():
+def woo_test(sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
     r = woo_request("get", "products", params={"per_page": 1})
     if not r.get("ok"):
         return r
@@ -1248,7 +1418,10 @@ def woo_test():
 
 
 @app.get("/web/woocommerce/products")
-def woo_products(search: str = ""):
+def woo_products(search: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
     params = {"per_page": 50, "orderby": "date", "order": "desc"}
     if search:
         params["search"] = search
@@ -1259,7 +1432,10 @@ def woo_products(search: str = ""):
 
 
 @app.get("/web/woocommerce/products/{producto_id}")
-def woo_product(producto_id: int):
+def woo_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
     r = woo_request("get", f"products/{producto_id}")
     if not r.get("ok"):
         return r
@@ -1267,7 +1443,10 @@ def woo_product(producto_id: int):
 
 
 @app.post("/web/woocommerce/products")
-def woo_create_product(data: WooProduct):
+def woo_create_product(data: WooProduct, sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
     r = woo_request("post", "products", json=woo_payload_from_model(data))
     if not r.get("ok"):
         return r
@@ -1275,7 +1454,10 @@ def woo_create_product(data: WooProduct):
 
 
 @app.put("/web/woocommerce/products/{producto_id}")
-def woo_update_product(producto_id: int, data: WooProduct):
+def woo_update_product(producto_id: int, data: WooProduct, sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
     r = woo_request("put", f"products/{producto_id}", json=woo_payload_from_model(data))
     if not r.get("ok"):
         return r
@@ -1283,14 +1465,18 @@ def woo_update_product(producto_id: int, data: WooProduct):
 
 
 @app.post("/web/woocommerce/sync-product/{producto_id}")
-def woo_sync_product(producto_id: int):
+def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
+    sucursal = norm_sucursal(sucursal)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url
         FROM productos
-        WHERE id=%s
-    """, (producto_id,))
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     p = dict_fetchone(cur)
     conn.close()
     if not p:
@@ -1328,9 +1514,10 @@ def woo_sync_product(producto_id: int):
 
 # ================= GARANTIAS =================
 @app.get("/garantias")
-def listar_garantias(q: str = ""):
+def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
     filtro = f"%{q.strip()}%"
     cur.execute("""
         SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
@@ -1343,15 +1530,16 @@ def listar_garantias(q: str = ""):
                COALESCE(solucion,'') AS solucion,
                COALESCE(usuario,'') AS usuario
         FROM garantias
-        WHERE %s = '%%'
+        WHERE COALESCE(sucursal,%s)=%s
+          AND (%s = '%%'
            OR cliente ILIKE %s
            OR documento ILIKE %s
            OR producto ILIKE %s
            OR serie ILIKE %s
-           OR falla ILIKE %s
+           OR falla ILIKE %s)
         ORDER BY fecha DESC, id DESC
         LIMIT 300
-    """, (filtro, filtro, filtro, filtro, filtro, filtro))
+    """, (DEFAULT_SUCURSAL, sucursal, filtro, filtro, filtro, filtro, filtro, filtro))
     data = dict_fetchall(cur)
     conn.close()
     return data
@@ -1364,13 +1552,14 @@ def guardar_garantia(data: Garantia):
         estado = "RECIBIDO"
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
     cur.execute("""
-        INSERT INTO garantias (cliente, documento, producto, serie, falla, estado, solucion, usuario)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO garantias (cliente, documento, producto, serie, falla, estado, solucion, usuario, sucursal)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING id
     """, (
         data.cliente, data.documento, data.producto, data.serie,
-        data.falla, estado, data.solucion, data.usuario
+        data.falla, estado, data.solucion, data.usuario, sucursal
     ))
     garantia_id = cur.fetchone()[0]
     conn.commit()
@@ -1383,15 +1572,16 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
     estado = (data.estado or "RECIBIDO").upper()
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
     cur.execute("""
         UPDATE garantias
         SET cliente=%s, documento=%s, producto=%s, serie=%s,
             falla=%s, estado=%s, solucion=%s, usuario=%s
-        WHERE id=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
     """, (
         data.cliente, data.documento, data.producto, data.serie,
-        data.falla, estado, data.solucion, data.usuario, garantia_id
+        data.falla, estado, data.solucion, data.usuario, garantia_id, DEFAULT_SUCURSAL, sucursal
     ))
     row = cur.fetchone()
     conn.commit()
@@ -1402,24 +1592,26 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
 
 
 @app.get("/dashboard")
-def dashboard():
+def dashboard(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
 
-    cur.execute("SELECT COUNT(*) FROM clientes")
+    cur.execute("SELECT COUNT(*) FROM clientes WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     clientes = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM productos")
+    cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     productos = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM ventas")
+    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     documentos = cur.fetchone()[0]
-    cur.execute("SELECT COALESCE(SUM(total),0) FROM ventas")
+    cur.execute("SELECT COALESCE(SUM(total),0) FROM ventas WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     total_ventas = float(cur.fetchone()[0] or 0)
     try:
         cur.execute("""
         SELECT COALESCE(SUM(CASE WHEN tipo='INGRESO' AND estado_pago='PAGADO' THEN monto ELSE 0 END),0)
              - COALESCE(SUM(CASE WHEN tipo='EGRESO' THEN monto ELSE 0 END),0)
         FROM caja_movimientos
-        """)
+        WHERE COALESCE(sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, sucursal))
         saldo_caja = float(cur.fetchone()[0] or 0)
     except Exception:
         saldo_caja = total_ventas
@@ -1428,18 +1620,20 @@ def dashboard():
         SELECT to_char(fecha::date, 'YYYY-MM-DD') AS dia, COALESCE(SUM(total), 0) AS total
         FROM ventas
         WHERE fecha >= CURRENT_DATE - INTERVAL '29 days'
+          AND COALESCE(sucursal,%s)=%s
         GROUP BY fecha::date
         ORDER BY fecha::date
-    """)
+    """, (DEFAULT_SUCURSAL, sucursal))
     ventas_por_dia = [{"dia": r[0], "total": float(r[1] or 0)} for r in cur.fetchall()]
 
     cur.execute("""
-        SELECT tipo, numero, COALESCE(cliente_nombre,''), COALESCE(total,0),
+        SELECT tipo, numero, COALESCE(cliente,''), COALESCE(total,0),
                COALESCE(estado_pago,'PAGADO'), COALESCE(usuario_emisor,'')
         FROM ventas
+        WHERE COALESCE(sucursal,%s)=%s
         ORDER BY fecha DESC, id DESC
         LIMIT 8
-    """)
+    """, (DEFAULT_SUCURSAL, sucursal))
     recientes = [
         {
             "tipo": r[0],
@@ -1456,18 +1650,20 @@ def dashboard():
         SELECT COALESCE(NULLIF(metodo_pago,''),'SIN METODO') AS metodo, COALESCE(SUM(total),0) AS total
         FROM ventas
         WHERE COALESCE(estado_pago,'PAGADO')='PAGADO'
+          AND COALESCE(sucursal,%s)=%s
         GROUP BY COALESCE(NULLIF(metodo_pago,''),'SIN METODO')
         ORDER BY total DESC
-    """)
+    """, (DEFAULT_SUCURSAL, sucursal))
     metodos_pago = [{"metodo": r[0], "total": float(r[1] or 0)} for r in cur.fetchall()]
 
     cur.execute("""
         SELECT id, nombre, categoria, marca, modelo, stock, precio_venta, COALESCE(imagen_url,'') AS imagen_url
         FROM productos
         WHERE COALESCE(stock,0) <= 5
+          AND COALESCE(sucursal,%s)=%s
         ORDER BY stock ASC, nombre ASC
         LIMIT 8
-    """)
+    """, (DEFAULT_SUCURSAL, sucursal))
     productos_bajos = [
         {
             "id": r[0],
@@ -1482,11 +1678,11 @@ def dashboard():
         for r in cur.fetchall()
     ]
 
-    cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(stock,0) <= 5")
+    cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(stock,0) <= 5 AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     stock_bajo = int(cur.fetchone()[0] or 0)
-    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA')")
+    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA') AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     facturas_cobrar = int(cur.fetchone()[0] or 0)
-    cur.execute("SELECT COUNT(*) FROM clientes WHERE creado_en >= CURRENT_DATE")
+    cur.execute("SELECT COUNT(*) FROM clientes WHERE creado_en >= CURRENT_DATE AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     clientes_hoy = int(cur.fetchone()[0] or 0)
 
     conn.close()
