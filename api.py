@@ -244,6 +244,8 @@ def init():
 
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS imagen_url TEXT DEFAULT ''")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS series (
@@ -1615,6 +1617,91 @@ def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "total": len(productos), "updated": updated, "errores": errores[:20]}
+
+
+@app.post("/web/woocommerce/import-products")
+def woo_import_products_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
+    sucursal = norm_sucursal(sucursal)
+    search = str((data or {}).get("search", "") or "").strip()
+    only_with_stock = bool((data or {}).get("only_with_stock", False))
+    created = 0
+    updated = 0
+    errores = []
+    page = 1
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        while page <= 10:
+            params = {"per_page": 100, "page": page, "orderby": "date", "order": "desc"}
+            if search:
+                params["search"] = search
+            r = woo_request("get", "products", params=params)
+            if not r.get("ok"):
+                conn.rollback()
+                conn.close()
+                return r
+            productos_web = r.get("data") or []
+            if not productos_web:
+                break
+            for item in productos_web:
+                try:
+                    stock = item.get("stock_quantity")
+                    stock = int(stock or 0)
+                    if only_with_stock and stock <= 0:
+                        continue
+                    images = item.get("images") or []
+                    image_url = images[0].get("src", "") if images and isinstance(images[0], dict) else ""
+                    categories = item.get("categories") or []
+                    categoria = categories[0].get("name", "WEB") if categories and isinstance(categories[0], dict) else "WEB"
+                    sku = str(item.get("sku") or "").strip()
+                    woo_id = int(item.get("id") or 0)
+                    name = str(item.get("name") or f"Producto web {woo_id}").strip()
+                    price_text = item.get("regular_price") or item.get("price") or "0"
+                    try:
+                        price = float(price_text or 0)
+                    except Exception:
+                        price = 0
+                    cur.execute("""
+                        SELECT id FROM productos
+                        WHERE COALESCE(sucursal,%s)=%s
+                          AND (woo_id=%s OR (%s <> '' AND sku_woo=%s) OR LOWER(nombre)=LOWER(%s))
+                        ORDER BY id
+                        LIMIT 1
+                    """, (DEFAULT_SUCURSAL, sucursal, woo_id, sku, sku, name))
+                    row = cur.fetchone()
+                    if row:
+                        cur.execute("""
+                            UPDATE productos
+                            SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
+                                precio_venta=%s, stock=%s, imagen_url=%s,
+                                woo_id=%s, sku_woo=%s
+                            WHERE id=%s
+                        """, (name, categoria, "", "", price, stock, image_url, woo_id, sku, row[0]))
+                        updated += 1
+                    else:
+                        cur.execute("""
+                            INSERT INTO productos (
+                                nombre, categoria, marca, modelo, precio_compra, precio_venta,
+                                stock, imagen_url, sucursal, woo_id, sku_woo
+                            )
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (name, categoria, "", "", 0, price, stock, image_url, sucursal, woo_id, sku))
+                        created += 1
+                except Exception as e:
+                    errores.append({"woo_id": item.get("id"), "nombre": item.get("name"), "msg": str(e)})
+            if len(productos_web) < 100:
+                break
+            page += 1
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "created": created, "updated": updated, "errores": errores[:20]}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
 
 
 # ================= GARANTIAS =================
