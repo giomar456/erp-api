@@ -1576,6 +1576,47 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     return {"ok": True, "success": True, "total": len(productos), "sync_ok": ok, "errores": errores[:20]}
 
 
+@app.post("/web/woocommerce/sync-images")
+def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
+    denied = ensure_army_web(sucursal)
+    if denied:
+        return denied
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, nombre, COALESCE(imagen_url,'') AS imagen_url
+        FROM productos
+        WHERE COALESCE(sucursal,%s)=%s
+        ORDER BY id
+        LIMIT 500
+    """, (DEFAULT_SUCURSAL, sucursal))
+    productos = dict_fetchall(cur)
+    updated = 0
+    errores = []
+    for p in productos:
+        sku = f"ERP-{p['id']}"
+        found = woo_request("get", "products", params={"sku": sku, "per_page": 1})
+        if not found.get("ok"):
+            errores.append({"id": p.get("id"), "msg": found.get("msg", "Error WooCommerce")})
+            continue
+        items = found.get("data") or []
+        if not items:
+            continue
+        images = items[0].get("images") or []
+        image_url = images[0].get("src", "") if images and isinstance(images[0], dict) else ""
+        if image_url:
+            cur.execute("""
+                UPDATE productos
+                SET imagen_url=%s
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (image_url, p["id"], DEFAULT_SUCURSAL, sucursal))
+            updated += 1
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "total": len(productos), "updated": updated, "errores": errores[:20]}
+
+
 # ================= GARANTIAS =================
 @app.get("/garantias")
 def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
