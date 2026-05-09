@@ -13,6 +13,22 @@ app = FastAPI()
 # ================= CONEXION (SIMPLE Y ESTABLE) =================
 DEFAULT_SUCURSAL = "computer_army"
 
+DEFAULT_FEATURES = {
+    "dashboard": True,
+    "ventas": True,
+    "clientes": True,
+    "productos": True,
+    "inventario": True,
+    "compras": True,
+    "contabilidad": True,
+    "caja": True,
+    "usuarios": True,
+    "garantias": True,
+    "auditoria": True,
+    "pagina_web": True,
+    "ajustes": True,
+}
+
 
 def norm_sucursal(value: str = ""):
     value = (value or DEFAULT_SUCURSAL).strip().lower().replace(" ", "_")
@@ -741,6 +757,76 @@ def eliminar_sucursal(codigo: str, usuario: str = ""):
     if not row:
         return {"ok": False, "msg": "Sucursal no encontrada."}
     return {"ok": True, "success": True, "codigo": codigo}
+
+
+@app.get("/sucursales/{codigo}/permisos")
+def obtener_permisos_sucursal(codigo: str):
+    codigo = norm_sucursal(codigo)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sucursal_permisos (
+        sucursal TEXT PRIMARY KEY,
+        permisos TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("SELECT permisos FROM sucursal_permisos WHERE sucursal=%s", (codigo,))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    permisos = dict(DEFAULT_FEATURES)
+    if codigo != DEFAULT_SUCURSAL:
+        permisos["pagina_web"] = False
+    if row and row[0]:
+        try:
+            custom = json.loads(row[0])
+            if isinstance(custom, dict):
+                for k, v in custom.items():
+                    if k in permisos:
+                        permisos[k] = bool(v)
+        except Exception:
+            pass
+    if codigo == DEFAULT_SUCURSAL:
+        permisos["pagina_web"] = True
+    return {"ok": True, "success": True, "sucursal": codigo, "permisos": permisos}
+
+
+@app.post("/sucursales/{codigo}/permisos")
+def guardar_permisos_sucursal(codigo: str, data: dict):
+    usuario = str(data.get("usuario", "")).strip().lower()
+    if usuario != "giomar":
+        return {"ok": False, "success": False, "msg": "Solo Giomar puede modificar permisos de sucursales."}
+    codigo = norm_sucursal(codigo)
+    permisos = dict(DEFAULT_FEATURES)
+    if codigo != DEFAULT_SUCURSAL:
+        permisos["pagina_web"] = False
+    incoming = data.get("permisos", {})
+    if isinstance(incoming, dict):
+        for k, v in incoming.items():
+            if k in permisos:
+                permisos[k] = bool(v)
+    if codigo == DEFAULT_SUCURSAL:
+        permisos["pagina_web"] = True
+        permisos["ajustes"] = True
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sucursal_permisos (
+        sucursal TEXT PRIMARY KEY,
+        permisos TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("""
+    INSERT INTO sucursal_permisos (sucursal, permisos, actualizado)
+    VALUES (%s,%s,CURRENT_TIMESTAMP)
+    ON CONFLICT (sucursal)
+    DO UPDATE SET permisos=EXCLUDED.permisos, actualizado=CURRENT_TIMESTAMP
+    """, (codigo, json.dumps(permisos, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "sucursal": codigo, "permisos": permisos}
 
 
 @app.put("/usuarios/{usuario_id}/foto")
