@@ -285,6 +285,7 @@ class Producto(BaseModel):
     precio_venta: float
     stock: int
     imagen_url: Optional[str] = ""
+    observacion: Optional[str] = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -882,9 +883,10 @@ def listar_auditoria(q: str = "", limit: int = 1000):
 
 # ================= CONFIGURACION CENTRAL =================
 @app.get("/config/documento")
-def obtener_config_documento():
+def obtener_config_documento(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    clave = f"documento:{norm_sucursal(sucursal)}"
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_config (
         clave TEXT PRIMARY KEY,
@@ -892,8 +894,11 @@ def obtener_config_documento():
         actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("SELECT valor FROM app_config WHERE clave=%s", ("documento",))
+    cur.execute("SELECT valor FROM app_config WHERE clave=%s", (clave,))
     row = cur.fetchone()
+    if not row:
+        cur.execute("SELECT valor FROM app_config WHERE clave=%s", ("documento",))
+        row = cur.fetchone()
     conn.commit()
     conn.close()
     if not row or not row[0]:
@@ -908,6 +913,8 @@ def obtener_config_documento():
 def guardar_config_documento(data: dict):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL)
+    clave = f"documento:{sucursal}"
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_config (
         clave TEXT PRIMARY KEY,
@@ -920,7 +927,7 @@ def guardar_config_documento(data: dict):
     VALUES (%s,%s,CURRENT_TIMESTAMP)
     ON CONFLICT (clave)
     DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
-    """, ("documento", json.dumps(data, ensure_ascii=False)))
+    """, (clave, json.dumps(data, ensure_ascii=False)))
     conn.commit()
     conn.close()
     return {"ok": True, "success": True}
@@ -1009,14 +1016,15 @@ def crear_producto(data: Producto):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
 
     cur.execute("""
-    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,sucursal)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,sucursal)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (data.nombre, data.categoria, data.marca,
           data.modelo, data.precio_compra,
-          data.precio_venta, data.stock, data.imagen_url or "", sucursal))
+          data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", sucursal))
     producto_id = cur.fetchone()[0]
 
     conn.commit()
@@ -1030,10 +1038,13 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
 
     cur.execute("""
     SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
-           COALESCE(imagen_url, '') AS imagen_url, COALESCE(sucursal,%s) AS sucursal
+           COALESCE(imagen_url, '') AS imagen_url,
+           COALESCE(observacion, '') AS observacion,
+           COALESCE(sucursal,%s) AS sucursal
     FROM productos
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY nombre
@@ -1051,15 +1062,16 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal or sucursal)
     try:
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
-            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s
+            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
             data.nombre, data.categoria, data.marca, data.modelo,
-            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", producto_id, DEFAULT_SUCURSAL, sucursal
+            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", producto_id, DEFAULT_SUCURSAL, sucursal
         ))
         row = cur.fetchone()
         if not row:
@@ -1448,6 +1460,7 @@ def transferir_stock(data: StockTransferencia):
     conn = get_conn()
     cur = conn.cursor()
     try:
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
         origen = norm_sucursal(data.sucursal_origen)
         destino = norm_sucursal(data.sucursal_destino)
         cantidad = int(data.cantidad or 0)
@@ -1461,6 +1474,7 @@ def transferir_stock(data: StockTransferencia):
         cur.execute("""
         SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta,
                COALESCE(stock,0) AS stock, COALESCE(imagen_url,'') AS imagen_url,
+               COALESCE(observacion,'') AS observacion,
                COALESCE(woo_id,0) AS woo_id, COALESCE(sku_woo,'') AS sku_woo
         FROM productos
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
@@ -1501,25 +1515,26 @@ def transferir_stock(data: StockTransferencia):
             SET stock = COALESCE(stock,0) + %s,
                 categoria=%s, marca=%s, modelo=%s,
                 precio_compra=%s, precio_venta=%s,
-                imagen_url=CASE WHEN COALESCE(imagen_url,'')='' THEN %s ELSE imagen_url END
+                imagen_url=CASE WHEN COALESCE(imagen_url,'')='' THEN %s ELSE imagen_url END,
+                observacion=CASE WHEN COALESCE(observacion,'')='' THEN %s ELSE observacion END
             WHERE id=%s
             """, (
                 cantidad, producto.get("categoria"), producto.get("marca"), producto.get("modelo"),
                 producto.get("precio_compra"), producto.get("precio_venta"),
-                producto.get("imagen_url") or "", destino_id,
+                producto.get("imagen_url") or "", producto.get("observacion") or "", destino_id,
             ))
         else:
             cur.execute("""
             INSERT INTO productos (
                 nombre, categoria, marca, modelo, precio_compra, precio_venta,
-                stock, imagen_url, sucursal, woo_id, sku_woo
+                stock, imagen_url, observacion, sucursal, woo_id, sku_woo
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
             """, (
                 producto.get("nombre"), producto.get("categoria"), producto.get("marca"), producto.get("modelo"),
                 producto.get("precio_compra"), producto.get("precio_venta"),
-                cantidad, producto.get("imagen_url") or "", destino,
+                cantidad, producto.get("imagen_url") or "", producto.get("observacion") or "", destino,
                 producto.get("woo_id") or None, producto.get("sku_woo") or "",
             ))
             destino_id = cur.fetchone()[0]
