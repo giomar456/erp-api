@@ -62,10 +62,10 @@ def http_get_json(url, headers=None, timeout=12):
 
 def normalizar_dni(data, numero, source):
     payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
-    nombres = first_value(payload, "nombres", "nombre")
-    paterno = first_value(payload, "apellidoPaterno", "apellido_paterno", "paterno", "ape_paterno")
-    materno = first_value(payload, "apellidoMaterno", "apellido_materno", "materno", "ape_materno")
-    nombre = first_value(payload, "nombreCompleto", "nombre_completo", "razonSocial", "razon_social")
+    nombres = first_value(payload, "nombres", "nombre", "first_name")
+    paterno = first_value(payload, "apellidoPaterno", "apellido_paterno", "paterno", "ape_paterno", "first_last_name")
+    materno = first_value(payload, "apellidoMaterno", "apellido_materno", "materno", "ape_materno", "second_last_name")
+    nombre = first_value(payload, "nombreCompleto", "nombre_completo", "full_name", "razonSocial", "razon_social")
     if not nombre:
         nombre = " ".join(x for x in [paterno, materno, nombres] if x).strip()
     if not nombre:
@@ -166,15 +166,25 @@ def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
         return local
 
     last_error = ""
+    provider_configured = False
     for provider in (consulta_documento_custom, consulta_documento_apis_net_pe):
         try:
+            if provider == consulta_documento_custom:
+                provider_configured = provider_configured or bool(os.getenv(f"DOC_LOOKUP_{tipo}_URL", "").strip())
+            if provider == consulta_documento_apis_net_pe:
+                provider_configured = provider_configured or bool(os.getenv("APIS_NET_PE_TOKEN", "").strip())
             result = provider(tipo, numero)
             if result and result.get("found"):
                 return result
         except Exception as e:
             last_error = str(e)
 
-    msg = last_error or "No se encontraron datos. Configura APIS_NET_PE_TOKEN o DOC_LOOKUP_DNI_URL/DOC_LOOKUP_RUC_URL en Render."
+    if last_error:
+        msg = last_error
+    elif provider_configured:
+        msg = "El proveedor respondio, pero no devolvio datos legibles para este documento."
+    else:
+        msg = "No se encontraron datos. Configura APIS_NET_PE_TOKEN o DOC_LOOKUP_DNI_URL/DOC_LOOKUP_RUC_URL en Render."
     return {"ok": False, "success": False, "found": False, "tipo_documento": tipo, "numero_documento": numero, "msg": msg}
 
 
