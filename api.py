@@ -39,6 +39,145 @@ def dict_fetchone(cur):
     return dict(zip(cols, row))
 
 
+def only_digits(value):
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def first_value(data, *keys):
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def http_get_json(url, headers=None, timeout=12):
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "ignore")
+        return json.loads(raw) if raw else {}
+
+
+def normalizar_dni(data, numero, source):
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    nombres = first_value(payload, "nombres", "nombre")
+    paterno = first_value(payload, "apellidoPaterno", "apellido_paterno", "paterno", "ape_paterno")
+    materno = first_value(payload, "apellidoMaterno", "apellido_materno", "materno", "ape_materno")
+    nombre = first_value(payload, "nombreCompleto", "nombre_completo", "razonSocial", "razon_social")
+    if not nombre:
+        nombre = " ".join(x for x in [paterno, materno, nombres] if x).strip()
+    if not nombre:
+        return None
+    return {
+        "ok": True,
+        "success": True,
+        "found": True,
+        "source": source,
+        "tipo_documento": "DNI",
+        "numero_documento": numero,
+        "nombre": nombre.upper(),
+        "direccion": first_value(payload, "direccion", "domicilio", "direccionCompleta"),
+    }
+
+
+def normalizar_ruc(data, numero, source):
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    nombre = first_value(payload, "razonSocial", "razon_social", "nombre", "nombre_o_razon_social")
+    direccion = first_value(payload, "direccion", "direccionFiscal", "domicilioFiscal", "domicilio_fiscal")
+    if not nombre:
+        return None
+    return {
+        "ok": True,
+        "success": True,
+        "found": True,
+        "source": source,
+        "tipo_documento": "RUC",
+        "numero_documento": numero,
+        "nombre": nombre.upper(),
+        "razon_social": nombre.upper(),
+        "direccion": direccion.upper(),
+        "estado": first_value(payload, "estado", "estadoContribuyente", "estado_contribuyente"),
+        "condicion": first_value(payload, "condicion", "condicionContribuyente", "condicion_contribuyente"),
+    }
+
+
+def buscar_cliente_db(documento, sucursal=DEFAULT_SUCURSAL):
+    documento = only_digits(documento)
+    sucursal = norm_sucursal(sucursal)
+    if not documento:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT id, tipo_documento, numero_documento, nombre, direccion, COALESCE(sucursal,%s) AS sucursal
+    FROM clientes
+    WHERE numero_documento=%s AND COALESCE(sucursal,%s)=%s
+    LIMIT 1
+    """, (DEFAULT_SUCURSAL, documento, DEFAULT_SUCURSAL, sucursal))
+    row = dict_fetchone(cur)
+    conn.close()
+    if not row:
+        return None
+    row.update({"ok": True, "success": True, "found": True, "source": "clientes"})
+    return row
+
+
+def consulta_documento_custom(tipo, numero):
+    template = os.getenv(f"DOC_LOOKUP_{tipo}_URL", "").strip()
+    if not template:
+        return None
+    token = os.getenv("DOC_LOOKUP_TOKEN", "").strip()
+    header_name = os.getenv("DOC_LOOKUP_AUTH_HEADER", "Authorization").strip() or "Authorization"
+    header_prefix = os.getenv("DOC_LOOKUP_AUTH_PREFIX", "Bearer ")
+    headers = {"Accept": "application/json"}
+    if token:
+        headers[header_name] = f"{header_prefix}{token}"
+    url = template.format(
+        numero=urllib.parse.quote(numero),
+        documento=urllib.parse.quote(numero),
+        tipo=urllib.parse.quote(tipo),
+    )
+    data = http_get_json(url, headers=headers)
+    return normalizar_dni(data, numero, "custom") if tipo == "DNI" else normalizar_ruc(data, numero, "custom")
+
+
+def consulta_documento_apis_net_pe(tipo, numero):
+    token = os.getenv("APIS_NET_PE_TOKEN", "").strip()
+    if not token:
+        return None
+    base = os.getenv("APIS_NET_PE_BASE", "https://api.apis.net.pe/v2").strip().rstrip("/")
+    endpoint = "reniec/dni" if tipo == "DNI" else "sunat/ruc"
+    url = f"{base}/{endpoint}?numero={urllib.parse.quote(numero)}"
+    data = http_get_json(url, headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
+    return normalizar_dni(data, numero, "apis_net_pe") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe")
+
+
+def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
+    numero = only_digits(numero)
+    tipo = "DNI" if len(numero) == 8 else "RUC" if len(numero) == 11 else ""
+    if not tipo:
+        return {"ok": False, "success": False, "found": False, "msg": "Ingresa 8 digitos para DNI o 11 para RUC."}
+
+    local = buscar_cliente_db(numero, sucursal)
+    if local:
+        local["tipo_documento"] = tipo
+        return local
+
+    last_error = ""
+    for provider in (consulta_documento_custom, consulta_documento_apis_net_pe):
+        try:
+            result = provider(tipo, numero)
+            if result and result.get("found"):
+                return result
+        except Exception as e:
+            last_error = str(e)
+
+    msg = last_error or "No se encontraron datos. Configura APIS_NET_PE_TOKEN o DOC_LOOKUP_DNI_URL/DOC_LOOKUP_RUC_URL en Render."
+    return {"ok": False, "success": False, "found": False, "tipo_documento": tipo, "numero_documento": numero, "msg": msg}
+
+
 # ================= MODELOS =================
 class ItemVenta(BaseModel):
     id: int
@@ -778,6 +917,31 @@ def guardar_config_documento(data: dict):
 
 
 # ================= CLIENTES =================
+@app.get("/consulta/documento/{numero}")
+def consulta_documento(numero: str, sucursal: str = DEFAULT_SUCURSAL):
+    return consulta_documento_impl(numero, sucursal)
+
+
+@app.get("/consulta/dni/{dni}")
+def consulta_dni(dni: str, sucursal: str = DEFAULT_SUCURSAL):
+    return consulta_documento_impl(dni, sucursal)
+
+
+@app.get("/consulta/ruc/{ruc}")
+def consulta_ruc(ruc: str, sucursal: str = DEFAULT_SUCURSAL):
+    return consulta_documento_impl(ruc, sucursal)
+
+
+@app.get("/clientes/{documento}")
+def buscar_cliente(documento: str, sucursal: str = DEFAULT_SUCURSAL):
+    row = buscar_cliente_db(documento, sucursal)
+    if row:
+        return row
+    documento = only_digits(documento)
+    tipo = "DNI" if len(documento) == 8 else "RUC" if len(documento) == 11 else ""
+    return {"ok": False, "success": False, "found": False, "tipo_documento": tipo, "numero_documento": documento}
+
+
 @app.post("/clientes")
 def crear_cliente(data: Cliente):
     conn = get_conn()
