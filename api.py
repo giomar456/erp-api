@@ -290,6 +290,8 @@ class CajaMovimiento(BaseModel):
 class EstadoPagoUpdate(BaseModel):
     estado_pago: str
     metodo_pago: Optional[str] = None
+    monto_pagado: Optional[float] = None
+    observacion_pago: Optional[str] = ""
 
 
 class EstadoSunatUpdate(BaseModel):
@@ -487,6 +489,9 @@ def init():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_pago TEXT DEFAULT 'PAGADO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS monto_pagado NUMERIC DEFAULT 0",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS saldo_pago NUMERIC DEFAULT 0",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_pago TEXT DEFAULT ''",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_estado TEXT DEFAULT 'PENDIENTE'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_modo TEXT DEFAULT 'MANUAL'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_fecha TIMESTAMP",
@@ -789,8 +794,7 @@ def obtener_permisos_sucursal(codigo: str):
     conn.commit()
     conn.close()
     permisos = dict(DEFAULT_FEATURES)
-    if codigo != DEFAULT_SUCURSAL:
-        permisos["pagina_web"] = False
+    permisos["pagina_web"] = False
     if row and row[0]:
         try:
             custom = json.loads(row[0])
@@ -800,8 +804,6 @@ def obtener_permisos_sucursal(codigo: str):
                         permisos[k] = bool(v)
         except Exception:
             pass
-    if codigo == DEFAULT_SUCURSAL:
-        permisos["pagina_web"] = True
     return {"ok": True, "success": True, "sucursal": codigo, "permisos": permisos}
 
 
@@ -812,16 +814,12 @@ def guardar_permisos_sucursal(codigo: str, data: dict):
         return {"ok": False, "success": False, "msg": "Solo Giomar puede modificar permisos de sucursales."}
     codigo = norm_sucursal(codigo)
     permisos = dict(DEFAULT_FEATURES)
-    if codigo != DEFAULT_SUCURSAL:
-        permisos["pagina_web"] = False
+    permisos["pagina_web"] = False
     incoming = data.get("permisos", {})
     if isinstance(incoming, dict):
         for k, v in incoming.items():
             if k in permisos:
                 permisos[k] = bool(v)
-    if codigo == DEFAULT_SUCURSAL:
-        permisos["pagina_web"] = True
-        permisos["ajustes"] = True
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -1472,6 +1470,9 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
         COALESCE(estado, 'EMITIDO') AS estado,
         COALESCE(estado_pago, 'PAGADO') AS estado_pago,
         COALESCE(metodo_pago, '') AS metodo_pago,
+        COALESCE(monto_pagado, CASE WHEN COALESCE(estado_pago,'PAGADO')='PAGADO' THEN COALESCE(total,0) ELSE 0 END) AS monto_pagado,
+        COALESCE(saldo_pago, GREATEST(COALESCE(total,0) - COALESCE(monto_pagado,0), 0)) AS saldo_pago,
+        COALESCE(observacion_pago, '') AS observacion_pago,
         COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
         COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
         sunat_fecha
@@ -1738,19 +1739,38 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             estado_pago = "PAGADO"
 
         metodo_pago = data.metodo_pago.upper() if data.metodo_pago else None
+        cur.execute("SELECT COALESCE(total,0) FROM ventas WHERE id=%s AND COALESCE(sucursal,%s)=%s", (documento_id, DEFAULT_SUCURSAL, sucursal))
+        total_row = cur.fetchone()
+        total_doc = float(total_row[0] or 0) if total_row else 0.0
+        monto_pagado = data.monto_pagado
+        if monto_pagado is None:
+            monto_pagado = total_doc if estado_pago == "PAGADO" else 0
+        monto_pagado = max(0.0, float(monto_pagado or 0))
+        saldo_pago = max(0.0, round(total_doc - monto_pagado, 2))
+        if monto_pagado >= total_doc and total_doc > 0:
+            estado_pago = "PAGADO"
+            saldo_pago = 0.0
+        elif monto_pagado > 0:
+            estado_pago = "CREDITO"
+        elif estado_pago == "PAGADO" and total_doc <= 0:
+            saldo_pago = 0.0
 
         cur.execute("""
         UPDATE ventas
-        SET estado_pago=%s, metodo_pago=COALESCE(%s, metodo_pago, '')
+        SET estado_pago=%s,
+            metodo_pago=COALESCE(%s, metodo_pago, ''),
+            monto_pagado=%s,
+            saldo_pago=%s,
+            observacion_pago=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, ''), COALESCE(sucursal,%s)
-        """, (estado_pago, metodo_pago, documento_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL))
+        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, ''), COALESCE(sucursal,%s), COALESCE(monto_pagado,0), COALESCE(saldo_pago,0)
+        """, (estado_pago, metodo_pago, monto_pagado, saldo_pago, data.observacion_pago or "", documento_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL))
         row = cur.fetchone()
         if not row:
             conn.close()
             return {"ok": False, "msg": "Documento no encontrado"}
 
-        venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db, sucursal_db = row
+        venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db, sucursal_db, monto_pagado_db, saldo_pago_db = row
 
         cur.execute("""
         UPDATE caja_movimientos
@@ -1768,12 +1788,20 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             """, (
                 "INGRESO" if estado_pago == "PAGADO" else estado_pago,
                 f"{tipo} {numero} - {cliente}",
-                total, usuario or "", tipo, numero, estado_pago, metodo_pago_db, sucursal_db
+                monto_pagado_db, usuario or "", tipo, numero, estado_pago, metodo_pago_db, sucursal_db
             ))
 
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": venta_id, "estado_pago": estado_pago, "metodo_pago": metodo_pago_db}
+        return {
+            "ok": True,
+            "success": True,
+            "id": venta_id,
+            "estado_pago": estado_pago,
+            "metodo_pago": metodo_pago_db,
+            "monto_pagado": float(monto_pagado_db or 0),
+            "saldo_pago": float(saldo_pago_db or 0),
+        }
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -1871,20 +1899,78 @@ def registrar_caja(data: CajaMovimiento):
     return {"ok": True, "id": movimiento_id}
 
 
-# ================= WOOCOMMERCE CENTRAL =================
-def woo_config():
-    site = (os.getenv("WC_STORE_URL") or os.getenv("WOOCOMMERCE_URL") or os.getenv("WP_URL") or "").strip().rstrip("/")
-    ck = (os.getenv("WC_CONSUMER_KEY") or os.getenv("WOOCOMMERCE_CONSUMER_KEY") or "").strip()
-    cs = (os.getenv("WC_CONSUMER_SECRET") or os.getenv("WOOCOMMERCE_CONSUMER_SECRET") or "").strip()
+# ================= WOOCOMMERCE POR SUCURSAL =================
+def web_config_for_sucursal(sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS app_config (
+        clave TEXT PRIMARY KEY,
+        valor TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("SELECT valor FROM app_config WHERE clave=%s", (f"web:{sucursal}",))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row or not row[0]:
+        return {}
+    try:
+        data = json.loads(row[0])
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_web_config_for_sucursal(sucursal: str, data: dict):
+    sucursal = norm_sucursal(sucursal)
+    clean = {
+        "wc_store_url": str(data.get("wc_store_url") or data.get("store_url") or "").strip().rstrip("/"),
+        "wc_consumer_key": str(data.get("wc_consumer_key") or data.get("consumer_key") or "").strip(),
+        "wc_consumer_secret": str(data.get("wc_consumer_secret") or data.get("consumer_secret") or "").strip(),
+        "woo_auto_sync": bool(data.get("woo_auto_sync", False)),
+    }
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS app_config (
+        clave TEXT PRIMARY KEY,
+        valor TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("""
+    INSERT INTO app_config (clave, valor, actualizado)
+    VALUES (%s,%s,CURRENT_TIMESTAMP)
+    ON CONFLICT (clave)
+    DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
+    """, (f"web:{sucursal}", json.dumps(clean, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+    return clean
+
+
+def woo_config(sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    web_cfg = web_config_for_sucursal(sucursal)
+    site = (web_cfg.get("wc_store_url") or "").strip().rstrip("/")
+    ck = (web_cfg.get("wc_consumer_key") or "").strip()
+    cs = (web_cfg.get("wc_consumer_secret") or "").strip()
+    if not site and sucursal == DEFAULT_SUCURSAL:
+        site = (os.getenv("WC_STORE_URL") or os.getenv("WOOCOMMERCE_URL") or os.getenv("WP_URL") or "").strip().rstrip("/")
+        ck = (os.getenv("WC_CONSUMER_KEY") or os.getenv("WOOCOMMERCE_CONSUMER_KEY") or "").strip()
+        cs = (os.getenv("WC_CONSUMER_SECRET") or os.getenv("WOOCOMMERCE_CONSUMER_SECRET") or "").strip()
     if not site or not ck or not cs:
         return None
     return site, ck, cs
 
 
-def woo_request(method, endpoint, **kwargs):
-    cfg = woo_config()
+def woo_request(method, endpoint, sucursal: str = DEFAULT_SUCURSAL, **kwargs):
+    cfg = woo_config(sucursal)
     if not cfg:
-        return {"ok": False, "msg": "Faltan variables WC_STORE_URL, WC_CONSUMER_KEY y WC_CONSUMER_SECRET en Render."}
+        return {"ok": False, "msg": "Configura URL WooCommerce, Consumer Key y Consumer Secret para esta sucursal."}
     site, ck, cs = cfg
     params = kwargs.pop("params", {}) or {}
     params.setdefault("consumer_key", ck)
@@ -1937,22 +2023,22 @@ def woo_payload_from_model(data: WooProduct):
     return payload
 
 
-def woo_category_for_name(name: str):
+def woo_category_for_name(name: str, sucursal: str = DEFAULT_SUCURSAL):
     name = str(name or "").strip()
     if not name:
         return None
-    found = woo_request("get", "products/categories", params={"search": name, "per_page": 20})
+    found = woo_request("get", "products/categories", sucursal=sucursal, params={"search": name, "per_page": 20})
     if found.get("ok"):
         for cat in found.get("data") or []:
             if str(cat.get("name", "")).strip().lower() == name.lower():
                 return {"id": cat.get("id"), "name": cat.get("name")}
-    created = woo_request("post", "products/categories", json={"name": name})
+    created = woo_request("post", "products/categories", sucursal=sucursal, json={"name": name})
     if created.get("ok") and isinstance(created.get("data"), dict):
         return {"id": created["data"].get("id"), "name": created["data"].get("name")}
     return None
 
 
-def woo_payload_from_erp_product(p: dict):
+def woo_payload_from_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
     sku = f"ERP-{p['id']}"
     payload = {
         "name": p.get("nombre") or f"Producto {p['id']}",
@@ -1967,41 +2053,49 @@ def woo_payload_from_erp_product(p: dict):
     img = str(p.get("imagen_url") or "").strip()
     if img.startswith(("http://", "https://")):
         payload["images"] = [{"src": img}]
-    cat = woo_category_for_name(p.get("categoria", ""))
+    cat = woo_category_for_name(p.get("categoria", ""), sucursal=sucursal)
     if cat and cat.get("id"):
         payload["categories"] = [{"id": int(cat["id"])}]
     return sku, payload
 
 
-def woo_upsert_erp_product(p: dict):
-    sku, payload = woo_payload_from_erp_product(p)
-    found = woo_request("get", "products", params={"sku": sku, "per_page": 1})
+def woo_upsert_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
+    sku, payload = woo_payload_from_erp_product(p, sucursal=sucursal)
+    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
     if not found.get("ok"):
         return found
     existing = found.get("data") or []
     if existing:
-        r = woo_request("put", f"products/{existing[0]['id']}", json=payload)
+        r = woo_request("put", f"products/{existing[0]['id']}", sucursal=sucursal, json=payload)
         action = "actualizado"
     else:
-        r = woo_request("post", "products", json=payload)
+        r = woo_request("post", "products", sucursal=sucursal, json=payload)
         action = "creado"
     if not r.get("ok"):
         return r
     return {"ok": True, "action": action, "data": r.get("data", {})}
 
 
-def ensure_army_web(sucursal: str = DEFAULT_SUCURSAL):
-    if norm_sucursal(sucursal) != DEFAULT_SUCURSAL:
-        return {"ok": False, "msg": "La pagina web/WooCommerce esta habilitada solo para COMPUTER ARMY."}
-    return None
+@app.get("/web/config")
+def obtener_web_config(sucursal: str = DEFAULT_SUCURSAL):
+    data = web_config_for_sucursal(sucursal)
+    public = dict(data)
+    if public.get("wc_consumer_secret"):
+        public["wc_consumer_secret_masked"] = True
+    return {"ok": True, "success": True, "data": public}
+
+
+@app.post("/web/config")
+def guardar_web_config(data: dict, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(data.get("sucursal") or data.get("empresa") or sucursal)
+    clean = save_web_config_for_sucursal(sucursal, data)
+    return {"ok": True, "success": True, "sucursal": sucursal, "data": clean}
 
 
 @app.get("/web/woocommerce/test")
 def woo_test(sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
-    r = woo_request("get", "products", params={"per_page": 1})
+    sucursal = norm_sucursal(sucursal)
+    r = woo_request("get", "products", sucursal=sucursal, params={"per_page": 1})
     if not r.get("ok"):
         return r
     return {"ok": True, "site_url": r.get("site_url"), "msg": "Conexion WooCommerce correcta"}
@@ -2009,13 +2103,11 @@ def woo_test(sucursal: str = DEFAULT_SUCURSAL):
 
 @app.get("/web/woocommerce/products")
 def woo_products(search: str = "", sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
+    sucursal = norm_sucursal(sucursal)
     params = {"per_page": 50, "orderby": "date", "order": "desc"}
     if search:
         params["search"] = search
-    r = woo_request("get", "products", params=params)
+    r = woo_request("get", "products", sucursal=sucursal, params=params)
     if not r.get("ok"):
         return r
     return {"ok": True, "data": r.get("data", [])}
@@ -2023,10 +2115,8 @@ def woo_products(search: str = "", sucursal: str = DEFAULT_SUCURSAL):
 
 @app.get("/web/woocommerce/products/{producto_id}")
 def woo_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
-    r = woo_request("get", f"products/{producto_id}")
+    sucursal = norm_sucursal(sucursal)
+    r = woo_request("get", f"products/{producto_id}", sucursal=sucursal)
     if not r.get("ok"):
         return r
     return {"ok": True, "data": r.get("data", {})}
@@ -2034,10 +2124,8 @@ def woo_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
 
 @app.post("/web/woocommerce/products")
 def woo_create_product(data: WooProduct, sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
-    r = woo_request("post", "products", json=woo_payload_from_model(data))
+    sucursal = norm_sucursal(sucursal)
+    r = woo_request("post", "products", sucursal=sucursal, json=woo_payload_from_model(data))
     if not r.get("ok"):
         return r
     return {"ok": True, "data": r.get("data", {})}
@@ -2045,10 +2133,8 @@ def woo_create_product(data: WooProduct, sucursal: str = DEFAULT_SUCURSAL):
 
 @app.put("/web/woocommerce/products/{producto_id}")
 def woo_update_product(producto_id: int, data: WooProduct, sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
-    r = woo_request("put", f"products/{producto_id}", json=woo_payload_from_model(data))
+    sucursal = norm_sucursal(sucursal)
+    r = woo_request("put", f"products/{producto_id}", sucursal=sucursal, json=woo_payload_from_model(data))
     if not r.get("ok"):
         return r
     return {"ok": True, "data": r.get("data", {})}
@@ -2056,9 +2142,6 @@ def woo_update_product(producto_id: int, data: WooProduct, sucursal: str = DEFAU
 
 @app.post("/web/woocommerce/sync-product/{producto_id}")
 def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
     sucursal = norm_sucursal(sucursal)
     conn = get_conn()
     cur = conn.cursor()
@@ -2072,7 +2155,7 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
 
-    r = woo_upsert_erp_product(p)
+    r = woo_upsert_erp_product(p, sucursal=sucursal)
     if not r.get("ok"):
         return r
     return {"ok": True, "msg": f"Producto {r.get('action')} en WooCommerce.", "data": r.get("data", {})}
@@ -2080,9 +2163,6 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
 
 @app.post("/web/woocommerce/sync-products")
 def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
     sucursal = norm_sucursal(sucursal)
     only_with_stock = bool((data or {}).get("only_with_stock", False))
     conn = get_conn()
@@ -2102,7 +2182,7 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     ok = 0
     errores = []
     for p in productos:
-        r = woo_upsert_erp_product(p)
+        r = woo_upsert_erp_product(p, sucursal=sucursal)
         if r.get("ok"):
             ok += 1
         else:
@@ -2112,9 +2192,6 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
 
 @app.post("/web/woocommerce/sync-images")
 def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
     sucursal = norm_sucursal(sucursal)
     conn = get_conn()
     cur = conn.cursor()
@@ -2130,7 +2207,7 @@ def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
     errores = []
     for p in productos:
         sku = f"ERP-{p['id']}"
-        found = woo_request("get", "products", params={"sku": sku, "per_page": 1})
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
         if not found.get("ok"):
             errores.append({"id": p.get("id"), "msg": found.get("msg", "Error WooCommerce")})
             continue
@@ -2153,9 +2230,6 @@ def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
 
 @app.post("/web/woocommerce/import-products")
 def woo_import_products_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
-    denied = ensure_army_web(sucursal)
-    if denied:
-        return denied
     sucursal = norm_sucursal(sucursal)
     search = str((data or {}).get("search", "") or "").strip()
     only_with_stock = bool((data or {}).get("only_with_stock", False))
@@ -2170,7 +2244,7 @@ def woo_import_products_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURS
             params = {"per_page": 100, "page": page, "orderby": "date", "order": "desc"}
             if search:
                 params["search"] = search
-            r = woo_request("get", "products", params=params)
+            r = woo_request("get", "products", sucursal=sucursal, params=params)
             if not r.get("ok"):
                 conn.rollback()
                 conn.close()
