@@ -292,6 +292,11 @@ class EstadoPagoUpdate(BaseModel):
     metodo_pago: Optional[str] = None
 
 
+class EstadoSunatUpdate(BaseModel):
+    sunat_estado: str = "PROCESO"
+    sunat_modo: str = "MANUAL"
+
+
 class Producto(BaseModel):
     nombre: str
     categoria: str
@@ -477,6 +482,9 @@ def init():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_pago TEXT DEFAULT 'PAGADO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_estado TEXT DEFAULT 'PENDIENTE'",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_modo TEXT DEFAULT 'MANUAL'",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_fecha TIMESTAMP",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
@@ -1458,7 +1466,10 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
         COALESCE(usuario_emisor, '') AS usuario_emisor,
         COALESCE(estado, 'EMITIDO') AS estado,
         COALESCE(estado_pago, 'PAGADO') AS estado_pago,
-        COALESCE(metodo_pago, '') AS metodo_pago
+        COALESCE(metodo_pago, '') AS metodo_pago,
+        COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
+        COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
+        sunat_fecha
     FROM ventas
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY id DESC
@@ -1709,6 +1720,51 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
         conn.commit()
         conn.close()
         return {"ok": True, "success": True, "id": venta_id, "estado_pago": estado_pago, "metodo_pago": metodo_pago_db}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
+@app.put("/documentos/{documento_id}/sunat")
+def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        estado = (data.sunat_estado or "PROCESO").upper()
+        if estado not in ("PENDIENTE", "PROCESO", "ACEPTADO", "RECHAZADO"):
+            estado = "PROCESO"
+        modo = (data.sunat_modo or "MANUAL").upper()
+        if modo not in ("MANUAL", "NO_ENVIAR"):
+            modo = "MANUAL"
+
+        cur.execute("""
+        UPDATE ventas
+        SET sunat_estado=%s,
+            sunat_modo=%s,
+            sunat_fecha=CASE WHEN %s IN ('PROCESO','ACEPTADO','RECHAZADO') THEN CURRENT_TIMESTAMP ELSE sunat_fecha END
+        WHERE id=%s
+          AND tipo IN ('BOLETA','FACTURA')
+          AND COALESCE(sucursal,%s)=%s
+        RETURNING id, tipo, numero, sunat_estado, sunat_modo, sunat_fecha
+        """, (estado, modo, estado, documento_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "msg": "Documento no encontrado o no es boleta/factura"}
+        conn.commit()
+        conn.close()
+        return {
+            "ok": True,
+            "success": True,
+            "id": row[0],
+            "tipo": row[1],
+            "numero": row[2],
+            "sunat_estado": row[3],
+            "sunat_modo": row[4],
+            "sunat_fecha": row[5],
+        }
     except Exception as e:
         conn.rollback()
         conn.close()
