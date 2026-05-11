@@ -297,6 +297,11 @@ class EstadoSunatUpdate(BaseModel):
     sunat_modo: str = "MANUAL"
 
 
+class DocumentoDetalleSeriesUpdate(BaseModel):
+    series_texto: str = ""
+    usuario: str = ""
+
+
 class Producto(BaseModel):
     nombre: str
     categoria: str
@@ -1506,6 +1511,55 @@ def detalle_documento(documento_id: int):
 
     conn.close()
     return data
+
+
+@app.put("/documentos/detalle/{detalle_id}/series")
+def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleSeriesUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        series_texto = (data.series_texto or "").strip()
+        cur.execute("""
+        UPDATE ventas_detalle
+        SET series_texto=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id, venta_id, producto_id
+        """, (series_texto, detalle_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "msg": "Detalle no encontrado"}
+
+        _, venta_id, producto_id = row
+        cur.execute("SELECT tipo, numero FROM ventas WHERE id=%s", (venta_id,))
+        doc = cur.fetchone() or ("DOCUMENTO", str(venta_id))
+        doc_ref = f"{doc[0]} {doc[1]}"
+
+        raw_series = re.split(r"[,;\n\r]+", series_texto)
+        series = [s.strip() for s in raw_series if s.strip()]
+        for serie in series:
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=COALESCE(fecha_salida, TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD'))
+            WHERE UPPER(serie)=UPPER(%s)
+              AND producto_id=%s
+              AND COALESCE(sucursal,%s)=%s
+            """, (serie, producto_id, DEFAULT_SUCURSAL, sucursal))
+
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (data.usuario or "", "", sucursal, "SERIES DOCUMENTO ACTUALIZADAS", f"{doc_ref} - {series_texto}"))
+
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": detalle_id, "series_texto": series_texto}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
 
 
 @app.delete("/documentos/{documento_id}")
