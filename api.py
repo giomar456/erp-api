@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
+from decimal import Decimal
+from datetime import date, datetime
 import psycopg2
 import os
 import json
@@ -53,6 +55,21 @@ def dict_fetchone(cur):
         return None
     cols = [c[0] for c in cur.description]
     return dict(zip(cols, row))
+
+
+def _jsonable_row(row: dict) -> dict:
+    """Convierte Decimal/datetime a tipos JSON-serializables (evita 500 en respuestas FastAPI)."""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, Decimal):
+            out[k] = float(v)
+        elif isinstance(v, datetime):
+            out[k] = v.strftime("%Y-%m-%d %H:%M:%S")
+        elif isinstance(v, date):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
 
 
 def only_digits(value):
@@ -359,8 +376,8 @@ def test_conn():
         return {"ok": False, "error": str(e)}
 
 
-@app.get("/init")
-def init():
+def migrate_schema():
+    """Crea tablas y columnas nuevas (idempotente). Se ejecuta al arranque y desde GET /init."""
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -599,6 +616,12 @@ def init():
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/init")
+def init_http():
+    """Misma migracion que al arranque del servidor; puedes llamarla manual tras un deploy."""
+    return migrate_schema()
 
 
 # ================= AUTO UPDATE =================
@@ -1449,69 +1472,87 @@ def emitir_documento(data: Venta):
 
 @app.get("/documentos")
 def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
-    conn = get_conn()
-    cur = conn.cursor()
-    sucursal = norm_sucursal(sucursal)
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        sucursal = norm_sucursal(sucursal)
 
-    cur.execute("""
-    SELECT
-        id,
-        tipo,
-        numero,
-        cliente AS cliente_nombre,
-        COALESCE(documento_cliente, '') AS documento_cliente,
-        COALESCE(direccion_cliente, '') AS direccion_cliente,
-        fecha AS fecha_emision,
-        COALESCE(subtotal, total, 0) AS subtotal,
-        COALESCE(igv, 0) AS igv,
-        COALESCE(total, 0) AS total,
-        COALESCE(observacion, '') AS observacion,
-        COALESCE(usuario_emisor, '') AS usuario_emisor,
-        COALESCE(estado, 'EMITIDO') AS estado,
-        COALESCE(estado_pago, 'PAGADO') AS estado_pago,
-        COALESCE(metodo_pago, '') AS metodo_pago,
-        COALESCE(monto_pagado, CASE WHEN COALESCE(estado_pago,'PAGADO')='PAGADO' THEN COALESCE(total,0) ELSE 0 END) AS monto_pagado,
-        COALESCE(saldo_pago, GREATEST(COALESCE(total,0) - COALESCE(monto_pagado,0), 0)) AS saldo_pago,
-        COALESCE(observacion_pago, '') AS observacion_pago,
-        COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
-        COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
-        sunat_fecha
-    FROM ventas
-    WHERE COALESCE(sucursal,%s)=%s
-    ORDER BY id DESC
-    """, (DEFAULT_SUCURSAL, sucursal))
-    data = dict_fetchall(cur)
-
-    conn.close()
-    return data
+        cur.execute("""
+        SELECT
+            id,
+            tipo,
+            numero,
+            cliente AS cliente_nombre,
+            COALESCE(documento_cliente, '') AS documento_cliente,
+            COALESCE(direccion_cliente, '') AS direccion_cliente,
+            fecha AS fecha_emision,
+            COALESCE(subtotal, total, 0) AS subtotal,
+            COALESCE(igv, 0) AS igv,
+            COALESCE(total, 0) AS total,
+            COALESCE(observacion, '') AS observacion,
+            COALESCE(usuario_emisor, '') AS usuario_emisor,
+            COALESCE(estado, 'EMITIDO') AS estado,
+            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
+            COALESCE(metodo_pago, '') AS metodo_pago,
+            COALESCE(monto_pagado, CASE WHEN COALESCE(estado_pago,'PAGADO')='PAGADO' THEN COALESCE(total,0) ELSE 0 END) AS monto_pagado,
+            COALESCE(saldo_pago, GREATEST(COALESCE(total,0) - COALESCE(monto_pagado,0), 0)) AS saldo_pago,
+            COALESCE(observacion_pago, '') AS observacion_pago,
+            COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
+            COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
+            sunat_fecha
+        FROM ventas
+        WHERE COALESCE(sucursal,%s)=%s
+        ORDER BY id DESC
+        """, (DEFAULT_SUCURSAL, sucursal))
+        data = dict_fetchall(cur)
+        return [_jsonable_row(r) for r in data]
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @app.get("/documentos/{documento_id}")
 def detalle_documento(documento_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
 
-    cur.execute("""
-    SELECT
-        vd.id,
-        vd.venta_id AS documento_id,
-        vd.producto_id,
-        COALESCE(vd.descripcion, p.nombre, '') AS descripcion,
-        COALESCE(vd.marca, p.marca, '') AS marca,
-        COALESCE(vd.modelo, p.modelo, '') AS modelo,
-        COALESCE(vd.series_texto, '') AS series_texto,
-        vd.cantidad,
-        vd.precio AS precio_unitario,
-        vd.total
-    FROM ventas_detalle vd
-    LEFT JOIN productos p ON p.id = vd.producto_id
-    WHERE vd.venta_id = %s
-    ORDER BY vd.id
-    """, (documento_id,))
-    data = dict_fetchall(cur)
-
-    conn.close()
-    return data
+        cur.execute("""
+        SELECT
+            vd.id,
+            vd.venta_id AS documento_id,
+            vd.producto_id,
+            COALESCE(vd.descripcion, p.nombre, '') AS descripcion,
+            COALESCE(vd.marca, p.marca, '') AS marca,
+            COALESCE(vd.modelo, p.modelo, '') AS modelo,
+            COALESCE(vd.series_texto, '') AS series_texto,
+            vd.cantidad,
+            vd.precio AS precio_unitario,
+            vd.total
+        FROM ventas_detalle vd
+        LEFT JOIN productos p ON p.id = vd.producto_id
+        WHERE vd.venta_id = %s
+        ORDER BY vd.id
+        """, (documento_id,))
+        data = dict_fetchall(cur)
+        return [_jsonable_row(r) for r in data]
+    except Exception:
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @app.put("/documentos/detalle/{detalle_id}/series")
@@ -2499,3 +2540,19 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         "facturas_cobrar": facturas_cobrar,
         "clientes_hoy": clientes_hoy,
     }
+
+
+@app.on_event("startup")
+def _erp_run_migrations_at_boot():
+    """Asegura columnas (monto_pagado, sunat_*, etc.) antes de atender /documentos."""
+    result = migrate_schema()
+    if not result.get("ok"):
+        import logging
+        logging.getLogger("uvicorn.error").error("migrate_schema al arranque: %s", result.get("error", result))
+
+
+if __name__ == "__main__":
+    import sys
+    out = migrate_schema()
+    print(json.dumps(out, ensure_ascii=False))
+    sys.exit(0 if out.get("ok") else 1)
