@@ -627,11 +627,23 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    version = os.getenv("APP_VERSION", "1.0.0")
-    download_url = os.getenv("APP_DOWNLOAD_URL", "")
-    exe_name = os.getenv("APP_EXE_NAME", "erp_sql_pro_v20.exe")
-    notes = os.getenv("APP_UPDATE_NOTES", "")
+    latest_version = "1.0.4"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.4/Setup_ERP_SQL_PRO_V20_v1.0.4.exe"
+    latest_name = "Setup_ERP_SQL_PRO_V20_v1.0.4.exe"
+    latest_notes = "Actualizacion G&F ERP v1.0.4: comprobantes de pago, edicion de proformas y sonidos en documentos."
+
+    version = os.getenv("APP_VERSION", latest_version)
+    download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
+    exe_name = os.getenv("APP_EXE_NAME", latest_name)
+    notes = os.getenv("APP_UPDATE_NOTES", latest_notes)
     force_update = os.getenv("APP_FORCE_UPDATE", "false").lower() in ("1", "true", "yes", "si")
+
+    if version in ("", "1.0.0", "1.0.1", "1.0.2", "1.0.3") or not download_url or "/v1.0.1/" in download_url:
+        version = latest_version
+        download_url = latest_url
+        exe_name = latest_name
+        notes = latest_notes
+
     android_version = os.getenv("ANDROID_APP_VERSION", version)
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GF_ERP_ANDROID.apk")
@@ -647,7 +659,6 @@ def app_version():
         "android_url": android_download_url,
         "android_name": android_apk_name
     }
-
 
 # ================= LOGIN =================
 @app.post("/login")
