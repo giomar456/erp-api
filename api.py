@@ -306,6 +306,7 @@ class Venta(BaseModel):
     direccion_cliente: str = ""
     usuario_emisor: str = ""
     observacion: str = ""
+    fecha_vencimiento: str = ""
     estado_pago: str = "PAGADO"
     metodo_pago: str = ""
     sucursal: str = DEFAULT_SUCURSAL
@@ -589,6 +590,7 @@ def migrate_schema():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS subtotal NUMERIC DEFAULT 0",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS igv NUMERIC DEFAULT 0",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion TEXT",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS usuario_emisor TEXT",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_pago TEXT DEFAULT 'PAGADO'",
@@ -666,6 +668,12 @@ def migrate_schema():
             "ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]:
             cur.execute(column_sql)
+
+        cur.execute("""
+        UPDATE ventas
+        SET fecha_vencimiento = COALESCE(fecha_vencimiento, DATE(fecha))
+        WHERE UPPER(COALESCE(tipo,''))='PROFORMA'
+        """)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS compras (
@@ -763,10 +771,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.7"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.7/erp_sql_pro_v20_v1.0.7.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.7.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.7: guarda el comprobante de pago de Caja en el servidor y permite verlo desde cualquier PC."
+    latest_version = "1.0.8"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.8/erp_sql_pro_v20_v1.0.8.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.8.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.8: proformas editables con vencimiento del dia, series editables en inventario y Caja filtrada por calendario."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -780,9 +788,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", version)
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.3")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GF_ERP_ANDROID.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP: auto-update, sonido de caja en segundo plano y mejoras para telefono/tablet DeX.")
     return {
         "ok": True,
         "success": True,
@@ -793,7 +802,8 @@ def app_version():
         "force_update": force_update,
         "android_version": android_version,
         "android_url": android_download_url,
-        "android_name": android_apk_name
+        "android_name": android_apk_name,
+        "android_notes": android_notes
     }
 
 # ================= LOGIN =================
@@ -1464,6 +1474,105 @@ def guardar_serie_producto(data: SerieProducto):
         return {"ok": False, "msg": str(e)}
 
 
+@app.put("/series/{serie_id}")
+def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.sucursal or sucursal)
+        serie = (data.serie or "").strip()
+        if not serie:
+            conn.close()
+            return {"ok": False, "msg": "La serie no puede estar vacia"}
+
+        cur.execute("""
+        SELECT producto_id FROM producto_series
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (serie_id, DEFAULT_SUCURSAL, sucursal))
+        old = cur.fetchone()
+        if not old:
+            conn.close()
+            return {"ok": False, "msg": "Serie no encontrada"}
+        producto_anterior = old[0]
+
+        cur.execute("SELECT id FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
+        if not cur.fetchone():
+            conn.close()
+            return {"ok": False, "msg": "Producto no encontrado"}
+
+        cur.execute("""
+        UPDATE producto_series
+        SET producto_id=%s,
+            serie=%s,
+            proveedor=%s,
+            estado=%s,
+            fecha_ingreso=%s,
+            fecha_salida=%s,
+            sucursal=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id
+        """, (
+            data.producto_id, serie, data.proveedor, data.estado,
+            data.fecha_ingreso, data.fecha_salida, sucursal,
+            serie_id, DEFAULT_SUCURSAL, sucursal
+        ))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "msg": "Serie no encontrada"}
+
+        for producto_id in {producto_anterior, data.producto_id}:
+            cur.execute("""
+            UPDATE productos
+            SET stock = (
+                SELECT COUNT(*) FROM producto_series
+                WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
+            )
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
+
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": serie_id}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
+@app.delete("/series/{serie_id}")
+def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        DELETE FROM producto_series
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING producto_id
+        """, (serie_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "msg": "Serie no encontrada"}
+        producto_id = row[0]
+        cur.execute("""
+        UPDATE productos
+        SET stock = (
+            SELECT COUNT(*) FROM producto_series
+            WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
+        )
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": serie_id}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
 @app.post("/productos/{producto_id}/ajustar-stock")
 def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -1531,18 +1640,21 @@ def crear_venta(data: Venta):
         if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
             estado_pago = "PAGADO"
         metodo_pago = (data.metodo_pago or "").upper()
+        fecha_vencimiento = data.fecha_vencimiento or None
+        if (data.tipo or "").upper() == "PROFORMA" and not fecha_vencimiento:
+            fecha_vencimiento = date.today().isoformat()
 
         cur.execute("""
         INSERT INTO ventas (
             tipo, numero, cliente, documento_cliente, direccion_cliente,
-            subtotal, igv, total, observacion, usuario_emisor, estado, estado_pago, metodo_pago, sucursal
+            subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor, estado, estado_pago, metodo_pago, sucursal
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s)
         RETURNING id
         """, (
             data.tipo, numero, data.cliente_nombre, documento_cliente,
             data.direccion_cliente, subtotal, igv, total,
-            data.observacion, data.usuario_emisor, estado_pago, metodo_pago, sucursal
+            data.observacion, fecha_vencimiento, data.usuario_emisor, estado_pago, metodo_pago, sucursal
         ))
 
         venta_id = cur.fetchone()[0]
@@ -1603,6 +1715,7 @@ def crear_venta(data: Venta):
             "subtotal": subtotal,
             "igv": igv,
             "total": total,
+            "fecha_vencimiento": fecha_vencimiento or "",
             "estado_pago": estado_pago,
             "metodo_pago": metodo_pago
         }
@@ -1618,12 +1731,13 @@ def emitir_documento(data: Venta):
 
 
 @app.get("/documentos")
-def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
+def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = ""):
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
         sucursal = norm_sucursal(sucursal)
+        filtro_fecha = (fecha or "").strip()
 
         cur.execute("""
         SELECT
@@ -1634,6 +1748,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
             COALESCE(documento_cliente, '') AS documento_cliente,
             COALESCE(direccion_cliente, '') AS direccion_cliente,
             fecha AS fecha_emision,
+            COALESCE(TO_CHAR(fecha_vencimiento, 'YYYY-MM-DD'), '') AS fecha_vencimiento,
             COALESCE(subtotal, total, 0) AS subtotal,
             COALESCE(igv, 0) AS igv,
             COALESCE(total, 0) AS total,
@@ -1654,8 +1769,9 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
             sunat_fecha
         FROM ventas
         WHERE COALESCE(sucursal,%s)=%s
+          AND (%s='' OR TO_CHAR(fecha, 'YYYY-MM-DD')=%s)
         ORDER BY id DESC
-        """, (DEFAULT_SUCURSAL, sucursal))
+        """, (DEFAULT_SUCURSAL, sucursal, filtro_fecha, filtro_fecha))
         data = dict_fetchall(cur)
         return [_jsonable_row(r) for r in data]
     except Exception as e:
@@ -1686,6 +1802,7 @@ def detalle_documento(documento_id: int):
             COALESCE(documento_cliente, '') AS documento_cliente,
             COALESCE(direccion_cliente, '') AS direccion_cliente,
             fecha AS fecha_emision,
+            COALESCE(TO_CHAR(fecha_vencimiento, 'YYYY-MM-DD'), '') AS fecha_vencimiento,
             COALESCE(subtotal, total, 0) AS subtotal,
             COALESCE(igv, 0) AS igv,
             COALESCE(total, 0) AS total,
@@ -1748,6 +1865,136 @@ def detalle_documento(documento_id: int):
                 conn.close()
             except Exception:
                 pass
+
+
+@app.put("/documentos/{documento_id}")
+def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.get("sucursal") or sucursal)
+        cur.execute("""
+        SELECT tipo, numero, COALESCE(sucursal,%s)
+        FROM ventas
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
+        doc = cur.fetchone()
+        if not doc:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Documento no encontrado"}
+        tipo_actual, numero_actual, sucursal_doc = doc
+        if str(tipo_actual or "").upper() != "PROFORMA":
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Solo se puede editar PROFORMA desde este editor"}
+
+        items = data.get("items") or data.get("detalle") or []
+        if not isinstance(items, list) or not items:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "La proforma debe tener productos"}
+
+        total = round(sum(float((i or {}).get("total") or 0) for i in items), 2)
+        if total <= 0:
+            total = round(sum(float((i or {}).get("cantidad") or 0) * float((i or {}).get("precio") or (i or {}).get("precio_unitario") or 0) for i in items), 2)
+        subtotal = float(data.get("subtotal") or total)
+        igv = float(data.get("igv") or 0)
+        fecha_vencimiento = data.get("fecha_vencimiento") or date.today().isoformat()
+
+        documento_cliente = data.get("numero_documento_cliente") or ""
+        tipo_cliente = data.get("tipo_documento_cliente") or ""
+        if tipo_cliente and documento_cliente:
+            documento_cliente = f"{tipo_cliente}: {documento_cliente}"
+        elif data.get("documento_cliente"):
+            documento_cliente = data.get("documento_cliente")
+
+        cur.execute("""
+        UPDATE ventas
+        SET cliente=%s,
+            documento_cliente=%s,
+            direccion_cliente=%s,
+            subtotal=%s,
+            igv=%s,
+            total=%s,
+            observacion=%s,
+            fecha_vencimiento=%s,
+            usuario_emisor=COALESCE(NULLIF(%s,''), usuario_emisor),
+            sucursal=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id
+        """, (
+            data.get("cliente_nombre") or "USUARIO X",
+            documento_cliente,
+            data.get("direccion_cliente") or "",
+            subtotal,
+            igv,
+            total,
+            data.get("observacion") or "",
+            fecha_vencimiento,
+            data.get("usuario_emisor") or "",
+            sucursal_doc,
+            documento_id,
+            DEFAULT_SUCURSAL,
+            sucursal,
+        ))
+        if not cur.fetchone():
+            conn.close()
+            return {"ok": False, "success": False, "msg": "No se pudo actualizar la proforma"}
+
+        cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
+        for item in items:
+            producto_id = item.get("producto_id") or item.get("id")
+            try:
+                producto_id = int(producto_id) if str(producto_id or "").strip() else None
+            except Exception:
+                producto_id = None
+            cantidad = int(float(item.get("cantidad") or 0))
+            precio = float(item.get("precio") or item.get("precio_unitario") or 0)
+            item_total = float(item.get("total") or (cantidad * precio))
+            descripcion = item.get("nombre") or item.get("descripcion") or ""
+            marca = item.get("marca") or ""
+            modelo = item.get("modelo") or ""
+            if producto_id and not descripcion:
+                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal_doc))
+                prod = cur.fetchone()
+                if prod:
+                    descripcion = prod[0] or ""
+                    marca = marca or (prod[1] or "")
+                    modelo = modelo or (prod[2] or "")
+            cur.execute("""
+            INSERT INTO ventas_detalle (
+                venta_id, producto_id, descripcion, marca, modelo,
+                series_texto, cantidad, precio, total, sucursal
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                documento_id, producto_id, descripcion, marca, modelo,
+                item.get("series_texto") or item.get("serie") or "",
+                cantidad, precio, item_total, sucursal_doc
+            ))
+
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (data.get("usuario_emisor") or "", "", sucursal_doc, "PROFORMA ACTUALIZADA", f"{tipo_actual} {numero_actual} - {total}"))
+
+        conn.commit()
+        conn.close()
+        return {
+            "ok": True,
+            "success": True,
+            "id": documento_id,
+            "numero": numero_actual,
+            "total": total,
+            "fecha_vencimiento": fecha_vencimiento,
+        }
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.patch("/documentos/{documento_id}")
+def actualizar_documento_patch(documento_id: int, data: dict, sucursal: str = DEFAULT_SUCURSAL):
+    return actualizar_documento(documento_id, data, sucursal)
 
 
 @app.put("/documentos/detalle/{detalle_id}/series")
@@ -2825,8 +3072,15 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
     stock_bajo = int(cur.fetchone()[0] or 0)
     cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA') AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     facturas_cobrar = int(cur.fetchone()[0] or 0)
+    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(sunat_estado,'PENDIENTE') IN ('PENDIENTE','PROCESO') AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
+    documentos_pendientes = int(cur.fetchone()[0] or 0)
     cur.execute("SELECT COUNT(*) FROM clientes WHERE creado_en >= CURRENT_DATE AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     clientes_hoy = int(cur.fetchone()[0] or 0)
+    try:
+        cur.execute("SELECT COUNT(*) FROM compras WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
+        compras_pendientes = int(cur.fetchone()[0] or 0)
+    except Exception:
+        compras_pendientes = 0
 
     conn.close()
     return {
@@ -2842,6 +3096,8 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         "productos_bajos": productos_bajos,
         "stock_bajo": stock_bajo,
         "facturas_cobrar": facturas_cobrar,
+        "documentos_pendientes": documentos_pendientes,
+        "compras_pendientes": compras_pendientes,
         "clientes_hoy": clientes_hoy,
     }
 
