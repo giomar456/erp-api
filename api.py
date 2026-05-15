@@ -358,6 +358,25 @@ class CajaMovimiento(BaseModel):
     sucursal: str = DEFAULT_SUCURSAL
 
 
+class Proveedor(BaseModel):
+    nombre: str
+    ruc: str = ""
+    telefono: str = ""
+    direccion: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
+class Compra(BaseModel):
+    proveedor_nombre: str = ""
+    proveedor: str = ""
+    comprobante: str = ""
+    total: float = 0
+    usuario_registro: str = ""
+    usuario: str = ""
+    detalle: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
 class EstadoPagoUpdate(BaseModel):
     estado_pago: str
     metodo_pago: Optional[str] = None
@@ -619,6 +638,49 @@ def migrate_schema():
 
         cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''")
         cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS proveedores (
+            id SERIAL PRIMARY KEY,
+            nombre TEXT,
+            ruc TEXT DEFAULT '',
+            telefono TEXT DEFAULT '',
+            direccion TEXT DEFAULT '',
+            sucursal TEXT DEFAULT 'computer_army',
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        for column_sql in [
+            "ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS ruc TEXT DEFAULT ''",
+            "ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS telefono TEXT DEFAULT ''",
+            "ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS direccion TEXT DEFAULT ''",
+            "ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
+            "ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            cur.execute(column_sql)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS compras (
+            id SERIAL PRIMARY KEY,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            proveedor_nombre TEXT,
+            comprobante TEXT DEFAULT '',
+            total NUMERIC DEFAULT 0,
+            usuario_registro TEXT DEFAULT '',
+            detalle TEXT DEFAULT '',
+            sucursal TEXT DEFAULT 'computer_army'
+        );
+        """)
+        for column_sql in [
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS proveedor_nombre TEXT",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS comprobante TEXT DEFAULT ''",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS total NUMERIC DEFAULT 0",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS usuario_registro TEXT DEFAULT ''",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS detalle TEXT DEFAULT ''",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
+        ]:
+            cur.execute(column_sql)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS app_config (
@@ -2093,6 +2155,85 @@ def registrar_caja(data: CajaMovimiento):
     conn.commit()
     conn.close()
     return {"ok": True, "id": movimiento_id}
+
+
+# ================= COMPRAS / PROVEEDORES =================
+@app.get("/proveedores")
+def listar_proveedores(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    SELECT id, nombre, COALESCE(ruc,'') AS ruc, COALESCE(telefono,'') AS telefono,
+           COALESCE(direccion,'') AS direccion, COALESCE(sucursal,%s) AS sucursal,
+           creado_en
+    FROM proveedores
+    WHERE COALESCE(sucursal,%s)=%s
+    ORDER BY nombre ASC, id DESC
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
+    data = [_jsonable_row(r) for r in dict_fetchall(cur)]
+    conn.close()
+    return data
+
+
+@app.post("/proveedores")
+def guardar_proveedor(data: Proveedor):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
+    nombre = (data.nombre or "").strip()
+    if not nombre:
+        conn.close()
+        return {"ok": False, "msg": "Proveedor requerido"}
+    cur.execute("""
+    INSERT INTO proveedores (nombre, ruc, telefono, direccion, sucursal)
+    VALUES (%s,%s,%s,%s,%s)
+    RETURNING id
+    """, (nombre, data.ruc or "", data.telefono or "", data.direccion or "", sucursal))
+    proveedor_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": proveedor_id}
+
+
+@app.get("/compras")
+def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    SELECT id, fecha, COALESCE(proveedor_nombre,'') AS proveedor_nombre,
+           COALESCE(comprobante,'') AS comprobante, COALESCE(total,0) AS total,
+           COALESCE(usuario_registro,'') AS usuario_registro,
+           COALESCE(detalle,'') AS detalle, COALESCE(sucursal,%s) AS sucursal
+    FROM compras
+    WHERE COALESCE(sucursal,%s)=%s
+    ORDER BY fecha DESC, id DESC
+    LIMIT 500
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
+    data = [_jsonable_row(r) for r in dict_fetchall(cur)]
+    conn.close()
+    return data
+
+
+@app.post("/compras")
+def guardar_compra(data: Compra):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
+    proveedor = (data.proveedor_nombre or data.proveedor or "").strip()
+    cur.execute("""
+    INSERT INTO compras (proveedor_nombre, comprobante, total, usuario_registro, detalle, sucursal)
+    VALUES (%s,%s,%s,%s,%s,%s)
+    RETURNING id
+    """, (
+        proveedor, data.comprobante or "", float(data.total or 0),
+        data.usuario_registro or data.usuario or "", data.detalle or "", sucursal
+    ))
+    compra_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": compra_id}
 
 
 # ================= WOOCOMMERCE POR SUCURSAL =================
