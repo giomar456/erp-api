@@ -771,10 +771,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.8"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.8/erp_sql_pro_v20_v1.0.8.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.8.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.8: proformas editables con vencimiento del dia, series editables en inventario y Caja filtrada por calendario."
+    latest_version = "1.0.9"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.9/erp_sql_pro_v20_v1.0.9.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.9.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.9: mejora contraste de interfaz oscura y panel sincronizado con ventas reales."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -2986,41 +2986,63 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    tipos_venta_sql = "('BOLETA','FACTURA','NOTA DE VENTA')"
 
     cur.execute("SELECT COUNT(*) FROM clientes WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     clientes = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     productos = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
+    cur.execute(f"""
+        SELECT COUNT(*) FROM ventas
+        WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND COALESCE(sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, sucursal))
     documentos = cur.fetchone()[0]
-    cur.execute("SELECT COALESCE(SUM(total),0) FROM ventas WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
+    cur.execute(f"""
+        SELECT COALESCE(SUM(total),0)
+        FROM ventas
+        WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND fecha >= date_trunc('month', CURRENT_DATE)
+          AND COALESCE(sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, sucursal))
     total_ventas = float(cur.fetchone()[0] or 0)
     try:
-        cur.execute("""
-        SELECT COALESCE(SUM(CASE WHEN tipo='INGRESO' AND estado_pago='PAGADO' THEN monto ELSE 0 END),0)
-             - COALESCE(SUM(CASE WHEN tipo='EGRESO' THEN monto ELSE 0 END),0)
-        FROM caja_movimientos
-        WHERE COALESCE(sucursal,%s)=%s
+        cur.execute(f"""
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN COALESCE(estado_pago,'PAGADO')='PAGADO'
+                    THEN COALESCE(NULLIF(monto_pagado,0), total, 0)
+                WHEN COALESCE(monto_pagado,0) > 0
+                    THEN monto_pagado
+                ELSE 0
+            END
+        ),0)
+        FROM ventas
+        WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND fecha >= date_trunc('month', CURRENT_DATE)
+          AND COALESCE(sucursal,%s)=%s
         """, (DEFAULT_SUCURSAL, sucursal))
         saldo_caja = float(cur.fetchone()[0] or 0)
     except Exception:
         saldo_caja = total_ventas
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT to_char(fecha::date, 'YYYY-MM-DD') AS dia, COALESCE(SUM(total), 0) AS total
         FROM ventas
         WHERE fecha >= CURRENT_DATE - INTERVAL '29 days'
+          AND UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
           AND COALESCE(sucursal,%s)=%s
         GROUP BY fecha::date
         ORDER BY fecha::date
     """, (DEFAULT_SUCURSAL, sucursal))
     ventas_por_dia = [{"dia": r[0], "total": float(r[1] or 0)} for r in cur.fetchall()]
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT tipo, numero, COALESCE(cliente,''), COALESCE(total,0),
                COALESCE(estado_pago,'PAGADO'), COALESCE(usuario_emisor,'')
         FROM ventas
-        WHERE COALESCE(sucursal,%s)=%s
+        WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND COALESCE(sucursal,%s)=%s
         ORDER BY fecha DESC, id DESC
         LIMIT 8
     """, (DEFAULT_SUCURSAL, sucursal))
@@ -3036,10 +3058,13 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         for r in cur.fetchall()
     ]
 
-    cur.execute("""
-        SELECT COALESCE(NULLIF(metodo_pago,''),'SIN METODO') AS metodo, COALESCE(SUM(total),0) AS total
+    cur.execute(f"""
+        SELECT COALESCE(NULLIF(metodo_pago,''),'SIN METODO') AS metodo,
+               COALESCE(SUM(COALESCE(NULLIF(monto_pagado,0), total, 0)),0) AS total
         FROM ventas
         WHERE COALESCE(estado_pago,'PAGADO')='PAGADO'
+          AND UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND fecha >= date_trunc('month', CURRENT_DATE)
           AND COALESCE(sucursal,%s)=%s
         GROUP BY COALESCE(NULLIF(metodo_pago,''),'SIN METODO')
         ORDER BY total DESC
@@ -3070,9 +3095,19 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
 
     cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(stock,0) <= 5 AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     stock_bajo = int(cur.fetchone()[0] or 0)
-    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA') AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
+    cur.execute(f"""
+        SELECT COUNT(*) FROM ventas
+        WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA')
+          AND UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND COALESCE(sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, sucursal))
     facturas_cobrar = int(cur.fetchone()[0] or 0)
-    cur.execute("SELECT COUNT(*) FROM ventas WHERE COALESCE(sunat_estado,'PENDIENTE') IN ('PENDIENTE','PROCESO') AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
+    cur.execute("""
+        SELECT COUNT(*) FROM ventas
+        WHERE COALESCE(sunat_estado,'PENDIENTE') IN ('PENDIENTE','PROCESO')
+          AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA')
+          AND COALESCE(sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, sucursal))
     documentos_pendientes = int(cur.fetchone()[0] or 0)
     cur.execute("SELECT COUNT(*) FROM clientes WHERE creado_en >= CURRENT_DATE AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     clientes_hoy = int(cur.fetchone()[0] or 0)
