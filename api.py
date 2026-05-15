@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 from decimal import Decimal
 from datetime import date, datetime
+import base64
+import binascii
 import psycopg2
 import os
 import json
@@ -14,6 +16,7 @@ app = FastAPI()
 
 # ================= CONEXION (SIMPLE Y ESTABLE) =================
 DEFAULT_SUCURSAL = "computer_army"
+MAX_COMPROBANTE_PAGO_BYTES = 15 * 1024 * 1024
 
 DEFAULT_FEATURES = {
     "dashboard": True,
@@ -84,6 +87,57 @@ def first_value(data, *keys):
         if value not in (None, ""):
             return str(value).strip()
     return ""
+
+
+def normalizar_comprobante_pago(data):
+    nombre = (data.comprobante_pago_nombre or "").strip()
+    referencia = (data.comprobante_pago or "").strip()
+    mime = (data.comprobante_pago_mime or "").strip() or "application/octet-stream"
+    tamano = data.comprobante_pago_tamano
+    raw_b64 = (data.comprobante_pago_base64 or "").strip()
+    data_url = (data.comprobante_pago_data_url or "").strip()
+
+    if data_url.startswith("data:") and "," in data_url:
+        header, encoded = data_url.split(",", 1)
+        raw_b64 = raw_b64 or encoded.strip()
+        if ";base64" in header:
+            mime_from_url = header[5:].split(";", 1)[0].strip()
+            if mime_from_url:
+                mime = mime_from_url
+
+    if not raw_b64:
+        return {
+            "comprobante_pago": referencia or None,
+            "comprobante_pago_nombre": nombre or None,
+            "comprobante_pago_mime": None,
+            "comprobante_pago_tamano": None,
+            "comprobante_pago_base64": None,
+            "comprobante_pago_data_url": None,
+        }
+
+    try:
+        decoded = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("Comprobante de pago invalido o corrupto.")
+
+    if len(decoded) > MAX_COMPROBANTE_PAGO_BYTES:
+        raise ValueError("Comprobante de pago mayor a 15 MB.")
+
+    if not nombre and referencia:
+        nombre = os.path.basename(referencia.replace("\\", "/"))
+    if not nombre:
+        nombre = "comprobante_pago"
+    tamano = int(tamano or len(decoded))
+    data_url = f"data:{mime};base64,{raw_b64}"
+
+    return {
+        "comprobante_pago": referencia or nombre,
+        "comprobante_pago_nombre": nombre,
+        "comprobante_pago_mime": mime,
+        "comprobante_pago_tamano": tamano,
+        "comprobante_pago_base64": raw_b64,
+        "comprobante_pago_data_url": data_url,
+    }
 
 
 def http_get_json(url, headers=None, timeout=12):
@@ -309,6 +363,12 @@ class EstadoPagoUpdate(BaseModel):
     metodo_pago: Optional[str] = None
     monto_pagado: Optional[float] = None
     observacion_pago: Optional[str] = ""
+    comprobante_pago: Optional[str] = ""
+    comprobante_pago_nombre: Optional[str] = ""
+    comprobante_pago_mime: Optional[str] = ""
+    comprobante_pago_tamano: Optional[int] = None
+    comprobante_pago_base64: Optional[str] = ""
+    comprobante_pago_data_url: Optional[str] = ""
 
 
 class EstadoSunatUpdate(BaseModel):
@@ -509,6 +569,12 @@ def migrate_schema():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS monto_pagado NUMERIC DEFAULT 0",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS saldo_pago NUMERIC DEFAULT 0",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_pago TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS comprobante_pago TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS comprobante_pago_nombre TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS comprobante_pago_mime TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS comprobante_pago_tamano NUMERIC DEFAULT 0",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS comprobante_pago_base64 TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS comprobante_pago_data_url TEXT DEFAULT ''",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_estado TEXT DEFAULT 'PENDIENTE'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_modo TEXT DEFAULT 'MANUAL'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_fecha TIMESTAMP",
@@ -627,10 +693,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.6"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.6/erp_sql_pro_v20_v1.0.6.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.6.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.6: corrige el error de actualizacion Tcl/Tk y mantiene plantilla ARMY y Caja con comprobantes."
+    latest_version = "1.0.7"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.7/erp_sql_pro_v20_v1.0.7.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.7.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.7: guarda el comprobante de pago de Caja en el servidor y permite verlo desde cualquier PC."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1509,6 +1575,10 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL):
             COALESCE(monto_pagado, CASE WHEN COALESCE(estado_pago,'PAGADO')='PAGADO' THEN COALESCE(total,0) ELSE 0 END) AS monto_pagado,
             COALESCE(saldo_pago, GREATEST(COALESCE(total,0) - COALESCE(monto_pagado,0), 0)) AS saldo_pago,
             COALESCE(observacion_pago, '') AS observacion_pago,
+            COALESCE(comprobante_pago, '') AS comprobante_pago,
+            COALESCE(comprobante_pago_nombre, '') AS comprobante_pago_nombre,
+            COALESCE(comprobante_pago_mime, '') AS comprobante_pago_mime,
+            COALESCE(comprobante_pago_tamano, 0) AS comprobante_pago_tamano,
             COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
             COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
             sunat_fecha
@@ -1539,6 +1609,41 @@ def detalle_documento(documento_id: int):
 
         cur.execute("""
         SELECT
+            id,
+            tipo,
+            numero,
+            cliente AS cliente_nombre,
+            COALESCE(documento_cliente, '') AS documento_cliente,
+            COALESCE(direccion_cliente, '') AS direccion_cliente,
+            fecha AS fecha_emision,
+            COALESCE(subtotal, total, 0) AS subtotal,
+            COALESCE(igv, 0) AS igv,
+            COALESCE(total, 0) AS total,
+            COALESCE(observacion, '') AS observacion,
+            COALESCE(usuario_emisor, '') AS usuario_emisor,
+            COALESCE(estado, 'EMITIDO') AS estado,
+            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
+            COALESCE(metodo_pago, '') AS metodo_pago,
+            COALESCE(monto_pagado, CASE WHEN COALESCE(estado_pago,'PAGADO')='PAGADO' THEN COALESCE(total,0) ELSE 0 END) AS monto_pagado,
+            COALESCE(saldo_pago, GREATEST(COALESCE(total,0) - COALESCE(monto_pagado,0), 0)) AS saldo_pago,
+            COALESCE(observacion_pago, '') AS observacion_pago,
+            COALESCE(comprobante_pago, '') AS comprobante_pago,
+            COALESCE(comprobante_pago_nombre, '') AS comprobante_pago_nombre,
+            COALESCE(comprobante_pago_mime, '') AS comprobante_pago_mime,
+            COALESCE(comprobante_pago_tamano, 0) AS comprobante_pago_tamano,
+            COALESCE(comprobante_pago_base64, '') AS comprobante_pago_base64,
+            COALESCE(comprobante_pago_data_url, '') AS comprobante_pago_data_url,
+            COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
+            COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
+            sunat_fecha
+        FROM ventas
+        WHERE id=%s
+        LIMIT 1
+        """, (documento_id,))
+        documento = dict_fetchone(cur) or {}
+
+        cur.execute("""
+        SELECT
             vd.id,
             vd.venta_id AS documento_id,
             vd.producto_id,
@@ -1555,9 +1660,18 @@ def detalle_documento(documento_id: int):
         ORDER BY vd.id
         """, (documento_id,))
         data = dict_fetchall(cur)
-        return [_jsonable_row(r) for r in data]
+        detalle = [_jsonable_row(r) for r in data]
+        documento = _jsonable_row(documento) if documento else {}
+        return {
+            "ok": True,
+            "success": True,
+            "documento": documento,
+            "data": detalle,
+            "detalle": detalle,
+            **{k: v for k, v in documento.items() if k.startswith("comprobante_pago")},
+        }
     except Exception:
-        return []
+        return {"ok": False, "success": False, "data": [], "detalle": []}
     finally:
         if conn is not None:
             try:
@@ -1807,22 +1921,42 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
         elif estado_pago == "PAGADO" and total_doc <= 0:
             saldo_pago = 0.0
 
+        comprobante = normalizar_comprobante_pago(data)
+
         cur.execute("""
         UPDATE ventas
         SET estado_pago=%s,
             metodo_pago=COALESCE(%s, metodo_pago, ''),
             monto_pagado=%s,
             saldo_pago=%s,
-            observacion_pago=%s
+            observacion_pago=%s,
+            comprobante_pago=COALESCE(%s, comprobante_pago, ''),
+            comprobante_pago_nombre=COALESCE(%s, comprobante_pago_nombre, ''),
+            comprobante_pago_mime=COALESCE(%s, comprobante_pago_mime, ''),
+            comprobante_pago_tamano=COALESCE(%s, comprobante_pago_tamano, 0),
+            comprobante_pago_base64=COALESCE(%s, comprobante_pago_base64, ''),
+            comprobante_pago_data_url=COALESCE(%s, comprobante_pago_data_url, '')
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, ''), COALESCE(sucursal,%s), COALESCE(monto_pagado,0), COALESCE(saldo_pago,0)
-        """, (estado_pago, metodo_pago, monto_pagado, saldo_pago, data.observacion_pago or "", documento_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL))
+        RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, ''), COALESCE(sucursal,%s), COALESCE(monto_pagado,0), COALESCE(saldo_pago,0),
+                  COALESCE(comprobante_pago,''), COALESCE(comprobante_pago_nombre,''), COALESCE(comprobante_pago_mime,''), COALESCE(comprobante_pago_tamano,0),
+                  COALESCE(comprobante_pago_base64,''), COALESCE(comprobante_pago_data_url,'')
+        """, (
+            estado_pago, metodo_pago, monto_pagado, saldo_pago, data.observacion_pago or "",
+            comprobante["comprobante_pago"], comprobante["comprobante_pago_nombre"], comprobante["comprobante_pago_mime"],
+            comprobante["comprobante_pago_tamano"], comprobante["comprobante_pago_base64"], comprobante["comprobante_pago_data_url"],
+            documento_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL
+        ))
         row = cur.fetchone()
         if not row:
             conn.close()
             return {"ok": False, "msg": "Documento no encontrado"}
 
-        venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db, sucursal_db, monto_pagado_db, saldo_pago_db = row
+        (
+            venta_id, tipo, numero, cliente, total, usuario, metodo_pago_db, sucursal_db,
+            monto_pagado_db, saldo_pago_db, comprobante_pago_db, comprobante_nombre_db,
+            comprobante_mime_db, comprobante_tamano_db, comprobante_base64_db,
+            comprobante_data_url_db
+        ) = row
 
         cur.execute("""
         UPDATE caja_movimientos
@@ -1853,7 +1987,17 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             "metodo_pago": metodo_pago_db,
             "monto_pagado": float(monto_pagado_db or 0),
             "saldo_pago": float(saldo_pago_db or 0),
+            "comprobante_pago": comprobante_pago_db,
+            "comprobante_pago_nombre": comprobante_nombre_db,
+            "comprobante_pago_mime": comprobante_mime_db,
+            "comprobante_pago_tamano": float(comprobante_tamano_db or 0),
+            "comprobante_pago_base64": comprobante_base64_db,
+            "comprobante_pago_data_url": comprobante_data_url_db,
         }
+    except ValueError as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": str(e)}
     except Exception as e:
         conn.rollback()
         conn.close()
