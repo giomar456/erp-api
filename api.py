@@ -771,10 +771,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.10"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.10/erp_sql_pro_v20_v1.0.10.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.10.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.10: corrige deploy de Render, mejora contraste y sincroniza Panel con ventas reales."
+    latest_version = "1.0.12"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.12/erp_sql_pro_v20_v1.0.12.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.12.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.12: interfaz blanco/azul, sonido real de caja y comprobantes/PDF reforzados."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -788,7 +788,7 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.3")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.4")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID.apk")
     android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP: auto-update, sonido de caja en segundo plano y mejoras para telefono/tablet DeX.")
