@@ -909,10 +909,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.14")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.15")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.14: Inventario muestra movimientos del producto con ventas, boletas, garantias y transferencias; mantiene imagen por archivo y estado AGOTADO.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.15: Ventas procesa PROFORMA sin descontar stock/caja y agrega vista previa para compartir o descargar con formato de impresion.")
     return {
         "ok": True,
         "success": True,
@@ -1914,8 +1914,12 @@ def crear_venta(data: Venta):
         metodo_pago = (data.metodo_pago or "").upper()
         fecha_emision = parse_fecha_emision(data.fecha_emision)
         fecha_vencimiento = data.fecha_vencimiento or None
-        if (data.tipo or "").upper() == "PROFORMA" and not fecha_vencimiento:
+        es_proforma = (data.tipo or "").upper() == "PROFORMA"
+        if es_proforma and not fecha_vencimiento:
             fecha_vencimiento = fecha_emision.date().isoformat()
+        if es_proforma:
+            estado_pago = "DEUDA"
+            metodo_pago = ""
 
         cur.execute("""
         INSERT INTO ventas (
@@ -1958,24 +1962,26 @@ def crear_venta(data: Venta):
                 item.cantidad, item.precio, item.total, sucursal
             ))
 
-            cur.execute("""
-            UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
-            WHERE id = %s AND COALESCE(sucursal,%s)=%s
-            """, (item.cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+            if not es_proforma:
+                cur.execute("""
+                UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
+                WHERE id = %s AND COALESCE(sucursal,%s)=%s
+                """, (item.cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
 
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
-        cur.execute("""
-        INSERT INTO caja_movimientos (
-            fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            fecha_emision,
-            "INGRESO" if estado_pago == "PAGADO" else estado_pago,
-            f"{data.tipo} {numero} - {data.cliente_nombre}",
-            total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago, sucursal
-        ))
+        if not es_proforma:
+            cur.execute("""
+            INSERT INTO caja_movimientos (
+                fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                fecha_emision,
+                "INGRESO" if estado_pago == "PAGADO" else estado_pago,
+                f"{data.tipo} {numero} - {data.cliente_nombre}",
+                total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago, sucursal
+            ))
 
         conn.commit()
         conn.close()
