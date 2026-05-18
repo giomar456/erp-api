@@ -892,10 +892,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.18"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.18/erp_sql_pro_v20_v1.0.18.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.18.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.18: iconos y sonidos en PC, Ventas oculta marca/modelo y permite editar productos agregados."
+    latest_version = "1.0.19"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.19/erp_sql_pro_v20_v1.0.19.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.19.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.19: proformas/PDF con descripciones largas en varias lineas sin cortar ni invadir columnas."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -909,10 +909,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.12")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.14")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP: auto-update, sonido de caja en segundo plano y mejoras para telefono/tablet DeX.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.14: Inventario muestra movimientos del producto con ventas, boletas, garantias y transferencias; mantiene imagen por archivo y estado AGOTADO.")
     return {
         "ok": True,
         "success": True,
@@ -1576,7 +1576,14 @@ def guardar_serie_producto(data: SerieProducto):
         ))
         serie_id = cur.fetchone()[0]
 
-        if (data.estado or "").upper() == "DISPONIBLE":
+        estado_serie = (data.estado or "").upper()
+        if estado_serie == "AGOTADO":
+            cur.execute("""
+            UPDATE productos
+            SET stock = 0
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (data.producto_id, DEFAULT_SUCURSAL, sucursal))
+        elif estado_serie == "DISPONIBLE":
             cur.execute("""
             UPDATE productos
             SET stock = (
@@ -1642,15 +1649,23 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
             conn.close()
             return {"ok": False, "msg": "Serie no encontrada"}
 
+        estado_serie = (data.estado or "").upper()
         for producto_id in {producto_anterior, data.producto_id}:
-            cur.execute("""
-            UPDATE productos
-            SET stock = (
-                SELECT COUNT(*) FROM producto_series
-                WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
-            )
-            WHERE id=%s AND COALESCE(sucursal,%s)=%s
-            """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
+            if producto_id == data.producto_id and estado_serie == "AGOTADO":
+                cur.execute("""
+                UPDATE productos
+                SET stock = 0
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+                """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+            else:
+                cur.execute("""
+                UPDATE productos
+                SET stock = (
+                    SELECT COUNT(*) FROM producto_series
+                    WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s AND UPPER(COALESCE(estado,''))='DISPONIBLE'
+                )
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+                """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
 
         conn.commit()
         conn.close()
@@ -1713,6 +1728,142 @@ def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_S
         conn.rollback()
         conn.close()
         return {"ok": False, "msg": str(e)}
+
+
+@app.get("/productos/{producto_id}/movimientos")
+def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        SELECT id, COALESCE(nombre,''), COALESCE(categoria,''), COALESCE(marca,''), COALESCE(modelo,'')
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+        producto = cur.fetchone()
+        if not producto:
+            conn.close()
+            return {"ok": False, "data": [], "msg": "Producto no encontrado"}
+
+        _, nombre, categoria, marca, modelo = producto
+        movimientos = []
+
+        cur.execute("""
+        SELECT
+            v.id AS documento_id,
+            to_char(v.fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
+            COALESCE(v.tipo,'') AS tipo,
+            COALESCE(v.numero,'') AS numero,
+            COALESCE(v.cliente,'') AS cliente,
+            COALESCE(vd.descripcion, '') AS descripcion,
+            COALESCE(vd.series_texto, '') AS serie,
+            COALESCE(vd.cantidad, 0) AS cantidad,
+            COALESCE(vd.total, 0) AS total
+        FROM ventas_detalle vd
+        JOIN ventas v ON v.id = vd.venta_id
+        WHERE vd.producto_id=%s
+          AND COALESCE(vd.sucursal,%s)=%s
+          AND COALESCE(v.sucursal,%s)=%s
+        ORDER BY v.fecha DESC, v.id DESC
+        LIMIT 80
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+        for row in dict_fetchall(cur):
+            movimientos.append({
+                "origen": "VENTA",
+                "fecha": row.get("fecha"),
+                "titulo": f"{row.get('tipo') or 'DOC'} {row.get('numero') or ''}".strip(),
+                "detalle": f"{row.get('cliente') or 'Cliente'} - Cant. {row.get('cantidad') or 0}",
+                "documento": row.get("numero"),
+                "documento_tipo": row.get("tipo"),
+                "serie": row.get("serie"),
+                "cantidad": row.get("cantidad"),
+                "total": row.get("total"),
+            })
+
+        cur.execute("""
+        SELECT COALESCE(serie,'') AS serie
+        FROM producto_series
+        WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s AND COALESCE(serie,'')<>''
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+        series_rows = [str(r.get("serie") or "").strip() for r in dict_fetchall(cur) if str(r.get("serie") or "").strip()]
+
+        garantia_params = [DEFAULT_SUCURSAL, sucursal, f"%{nombre}%"]
+        serie_filter = ""
+        if series_rows:
+            serie_filter = " OR UPPER(COALESCE(serie,'')) = ANY(%s)"
+            garantia_params.append([s.upper() for s in series_rows])
+        cur.execute(f"""
+        SELECT
+            id,
+            to_char(fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
+            COALESCE(cliente,'') AS cliente,
+            COALESCE(documento,'') AS documento,
+            COALESCE(producto,'') AS producto,
+            COALESCE(serie,'') AS serie,
+            COALESCE(falla,'') AS falla,
+            COALESCE(estado,'RECIBIDO') AS estado
+        FROM garantias
+        WHERE COALESCE(sucursal,%s)=%s
+          AND (producto ILIKE %s{serie_filter})
+        ORDER BY fecha DESC, id DESC
+        LIMIT 60
+        """, tuple(garantia_params))
+        for row in dict_fetchall(cur):
+            movimientos.append({
+                "origen": "GARANTIA",
+                "fecha": row.get("fecha"),
+                "titulo": f"Garantia {row.get('estado') or ''}".strip(),
+                "detalle": f"{row.get('cliente') or 'Cliente'} - {row.get('falla') or 'Sin falla'}",
+                "documento": row.get("documento"),
+                "serie": row.get("serie"),
+                "estado": row.get("estado"),
+            })
+
+        cur.execute("""
+        SELECT
+            to_char(fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
+            COALESCE(cantidad,0) AS cantidad,
+            COALESCE(sucursal_origen,'') AS sucursal_origen,
+            COALESCE(sucursal_destino,'') AS sucursal_destino,
+            COALESCE(usuario,'') AS usuario,
+            COALESCE(nota,'') AS nota
+        FROM stock_transferencias
+        WHERE producto_id=%s
+          AND (COALESCE(sucursal_origen,'')=%s OR COALESCE(sucursal_destino,'')=%s)
+        ORDER BY fecha DESC, id DESC
+        LIMIT 40
+        """, (producto_id, sucursal, sucursal))
+        for row in dict_fetchall(cur):
+            movimientos.append({
+                "origen": "TRANSFERENCIA",
+                "fecha": row.get("fecha"),
+                "titulo": f"Transferencia x{row.get('cantidad') or 0}",
+                "detalle": f"{row.get('sucursal_origen') or '-'} -> {row.get('sucursal_destino') or '-'}",
+                "usuario": row.get("usuario"),
+                "nota": row.get("nota"),
+                "cantidad": row.get("cantidad"),
+            })
+
+        movimientos.sort(key=lambda x: str(x.get("fecha") or ""), reverse=True)
+        conn.close()
+        return {
+            "ok": True,
+            "success": True,
+            "producto": {
+                "id": producto_id,
+                "nombre": nombre,
+                "categoria": categoria,
+                "marca": marca,
+                "modelo": modelo,
+            },
+            "data": movimientos[:120],
+            "movimientos": movimientos[:120],
+        }
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "data": [], "msg": str(e)}
 
 
 # ================= SERIES =================
