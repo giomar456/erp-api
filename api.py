@@ -894,10 +894,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.19"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.19/erp_sql_pro_v20_v1.0.19.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.19.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.19: proformas/PDF con descripciones largas en varias lineas sin cortar ni invadir columnas."
+    latest_version = "1.0.21"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.21/erp_sql_pro_v20_v1.0.21.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.21.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.21: vuelve a Render con tus datos reales y conserva las mejoras recientes de PC."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -911,10 +911,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.15")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.17")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.15: Ventas procesa PROFORMA sin descontar stock/caja y agrega vista previa para compartir o descargar con formato de impresion.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID_v1.17.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.17: documentos con plantilla real de Computer Army, Render, logo/RUC reales, descarga y compartir PDF.")
     return {
         "ok": True,
         "success": True,
