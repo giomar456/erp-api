@@ -85,10 +85,12 @@ def norm_sucursal(value: str = ""):
 
 
 def get_conn():
-    return psycopg2.connect(
-        os.getenv("DATABASE_URL"),
-        sslmode="require"
-    )
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL no configurado")
+    if "sslmode=" in database_url.lower():
+        return psycopg2.connect(database_url)
+    return psycopg2.connect(database_url, sslmode=os.getenv("DB_SSLMODE", "require"))
 
 
 def dict_fetchall(cur):
