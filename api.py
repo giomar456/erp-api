@@ -243,6 +243,27 @@ def cargar_comprobantes_json(value):
         return []
 
 
+def comprobante_metadata_liviana(item):
+    if not isinstance(item, dict):
+        return None
+    nombre = item.get("nombre") or item.get("name") or item.get("comprobante_pago_nombre") or item.get("comprobante_pago") or "Comprobante"
+    mime = item.get("mime") or item.get("comprobante_pago_mime") or "application/octet-stream"
+    tamano = item.get("tamano", item.get("size", item.get("comprobante_pago_tamano", 0)))
+    return {
+        "nombre": nombre,
+        "comprobante_pago_nombre": nombre,
+        "mime": mime,
+        "comprobante_pago_mime": mime,
+        "tamano": tamano or 0,
+        "comprobante_pago_tamano": tamano or 0,
+        "tiene_archivo": bool(item.get("data_url") or item.get("base64") or item.get("comprobante_pago_data_url") or item.get("comprobante_pago_base64")),
+    }
+
+
+def comprobantes_metadata_liviana(value):
+    return [x for x in (comprobante_metadata_liviana(item) for item in cargar_comprobantes_json(value)) if x]
+
+
 def normalizar_comprobantes_pago(data, existentes=None):
     recibidos = []
     for item in getattr(data, "comprobantes_pago", None) or []:
@@ -911,10 +932,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.20")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.21")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.20_PLANTILLA_COMPACTA_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.20: plantilla PDF compacta para que entren hasta 12 productos por hoja; mantiene descargar, compartir y cerrar.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.21_PRODUCTOS_CATEGORIAS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.21: mejora Productos en DeX/telefono con lista larga, filtro por categoria, agregar categoria y editor en ventana.")
     return {
         "ok": True,
         "success": True,
@@ -2060,7 +2081,9 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = ""):
         rows = []
         for r in data:
             row = _jsonable_row(r)
-            row["comprobantes_pago"] = cargar_comprobantes_json(row.get("comprobantes_pago_json"))
+            row["comprobantes_pago"] = comprobantes_metadata_liviana(row.get("comprobantes_pago_json"))
+            row["comprobantes_pago_count"] = len(row["comprobantes_pago"])
+            row["comprobantes_pago_json"] = ""
             rows.append(row)
         return rows
     except Exception as e:
