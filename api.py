@@ -894,10 +894,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.22"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.22/erp_sql_pro_v20_v1.0.22.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.22.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.22: corrige apertura/impresion PDF en PCs sin lector asociado y adapta botones a resoluciones pequeñas."
+    latest_version = "1.0.23"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.23/erp_sql_pro_v20_v1.0.23.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.23.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.23: aplica visor PDF interno a ventas, documentos, caja y editor de plantillas; mantiene imprimir y descargar sin depender de abrir un lector externo."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -911,10 +911,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.17")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.18")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_ANDROID_v1.17.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.17: documentos con plantilla real de Computer Army, Render, logo/RUC reales, descarga y compartir PDF.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.18_VISOR_BOTONES_PDF_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.18: visor PDF con botones visibles para imprimir, compartir, descargar y cerrar.")
     return {
         "ok": True,
         "success": True,
