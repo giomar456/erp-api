@@ -1036,10 +1036,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.27"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.27/erp_sql_pro_v20_v1.0.27.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.27.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.27: Caja PC permite pago parcial por doble clic, con montos separados por metodo y saldo automatico."
+    latest_version = "1.0.29"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.29/erp_sql_pro_v20_v1.0.29.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.29.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.29: Caja PC permite pago parcial por doble clic y comprobantes de pago ilimitados por documento."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1053,10 +1053,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.23")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.24")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.23_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.23: proformas no descuentan stock, ventas validan series, Productos gestiona series y Ajustes descarga backup local.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.24_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.24: recuerda usuario y clave, abre Caja desde notificacion de documento emitido y usa alerta liviana de boletas.")
     return {
         "ok": True,
         "success": True,
@@ -2286,6 +2286,46 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = ""):
         import traceback
         traceback.print_exc()
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.get("/documentos/ultimo")
+def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        SELECT
+            id,
+            tipo,
+            numero,
+            cliente AS cliente_nombre,
+            fecha AS fecha_emision,
+            COALESCE(total, 0) AS total,
+            COALESCE(usuario_emisor, '') AS usuario_emisor,
+            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
+            COALESCE(metodo_pago, '') AS metodo_pago
+        FROM ventas
+        WHERE COALESCE(sucursal,%s)=%s
+          AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA','NOTA DE VENTA')
+        ORDER BY id DESC
+        LIMIT 1
+        """, (DEFAULT_SUCURSAL, sucursal))
+        row = dict_fetchone(cur)
+        if not row:
+            return {"ok": True, "success": True, "data": None}
+        data = _jsonable_row(row)
+        data["key"] = f"{data.get('id')}-{data.get('numero')}-{data.get('total')}"
+        return {"ok": True, "success": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "success": False, "msg": str(e)}
     finally:
         if conn is not None:
             try:
