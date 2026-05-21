@@ -351,29 +351,28 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
 
     for serie in selected:
         row = registered.get(serie)
-        if row and row.get("estado") not in ("DISPONIBLE", "RESERVADO"):
-            return f"{prod_nombre}: la serie {serie} esta en estado {row.get('estado')}."
-        if row:
+        if not row:
             cur.execute("""
-            UPDATE producto_series
-            SET estado='VENDIDO',
-                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
-            WHERE id=%s
-            """, (row.get("id"),))
-        else:
-            cur.execute("""
-            SELECT producto_id, UPPER(COALESCE(estado,'DISPONIBLE')) AS estado
-            FROM producto_series
-            WHERE UPPER(serie)=UPPER(%s) AND COALESCE(sucursal,%s)=%s
+            SELECT ps.producto_id,
+                   COALESCE(p.nombre,'') AS producto_nombre,
+                   UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado
+            FROM producto_series ps
+            LEFT JOIN productos p ON p.id=ps.producto_id
+            WHERE UPPER(ps.serie)=UPPER(%s) AND COALESCE(ps.sucursal,%s)=%s
             LIMIT 1
             """, (serie, DEFAULT_SUCURSAL, sucursal))
             other = dict_fetchone(cur)
             if other:
-                return f"{prod_nombre}: la serie {serie} ya existe en otro producto o estado {other.get('estado')}."
-            cur.execute("""
-            INSERT INTO producto_series (producto_id, serie, proveedor, estado, fecha_ingreso, fecha_salida, sucursal)
-            VALUES (%s,%s,%s,'VENDIDO',TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),%s)
-            """, (producto_id, serie, "VENTA", sucursal))
+                return f"{prod_nombre}: la serie {serie} pertenece a otro producto ({other.get('producto_nombre')}) o esta en estado {other.get('estado')}."
+            return f"{prod_nombre}: la serie {serie} no esta registrada para este producto. Corrige series antes de pasar a Caja."
+        if row and row.get("estado") not in ("DISPONIBLE", "RESERVADO"):
+            return f"{prod_nombre}: la serie {serie} esta en estado {row.get('estado')}."
+        cur.execute("""
+        UPDATE producto_series
+        SET estado='VENDIDO',
+            fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+        WHERE id=%s
+        """, (row.get("id"),))
 
     if registered_count:
         sync_producto_stock_from_series(cur, producto_id, sucursal)
@@ -602,6 +601,17 @@ class StockTransferencia(BaseModel):
     sucursal_destino: str = DEFAULT_SUCURSAL
     usuario: str = ""
     nota: str = ""
+
+
+class InventarioConteoCreate(BaseModel):
+    categoria: str
+    usuario: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
+class InventarioConteoScan(BaseModel):
+    serie: str
+    usuario: str = ""
 
 
 class Usuario(BaseModel):
@@ -837,6 +847,32 @@ def migrate_schema():
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventario_conteos (
+            id SERIAL PRIMARY KEY,
+            categoria TEXT,
+            usuario TEXT,
+            sucursal TEXT DEFAULT 'computer_army',
+            estado TEXT DEFAULT 'ABIERTO',
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            cerrado_en TIMESTAMP
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventario_conteo_scans (
+            id SERIAL PRIMARY KEY,
+            conteo_id INT REFERENCES inventario_conteos(id) ON DELETE CASCADE,
+            serie TEXT,
+            producto_id INT,
+            producto_nombre TEXT,
+            estado TEXT,
+            usuario TEXT,
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cur.execute("ALTER TABLE inventario_conteos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("ALTER TABLE inventario_conteo_scans ADD COLUMN IF NOT EXISTS usuario TEXT DEFAULT ''")
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id SERIAL PRIMARY KEY,
             tipo TEXT,
@@ -1036,10 +1072,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.29"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.29/erp_sql_pro_v20_v1.0.29.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.29.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.29: Caja PC permite pago parcial por doble clic y comprobantes de pago ilimitados por documento."
+    latest_version = "1.0.30"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.30/erp_sql_pro_v20_v1.0.30.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.30.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.30: validacion estricta de series en ventas e inventariado por categoria con pistoleo de series."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1053,10 +1089,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.24")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.25")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.24_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.24: recuerda usuario y clave, abre Caja desde notificacion de documento emitido y usa alerta liviana de boletas.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.25_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.25: inventariado por categoria con pistoleo de series y validacion estricta de series.")
     return {
         "ok": True,
         "success": True,
@@ -1853,6 +1889,224 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
         return {"ok": False, "msg": str(e)}
 
 
+def resumen_inventario_conteo(cur, conteo_id, sucursal):
+    cur.execute("""
+    SELECT id, categoria, usuario, sucursal, estado, creado_en, cerrado_en
+    FROM inventario_conteos
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (conteo_id, DEFAULT_SUCURSAL, sucursal))
+    conteo = dict_fetchone(cur)
+    if not conteo:
+        return None
+    categoria = str(conteo.get("categoria") or "").strip()
+    cur.execute("""
+    SELECT ps.id, ps.producto_id, COALESCE(p.nombre,'') AS producto_nombre,
+           COALESCE(p.categoria,'') AS categoria, ps.serie, COALESCE(ps.estado,'DISPONIBLE') AS estado
+    FROM producto_series ps
+    LEFT JOIN productos p ON p.id=ps.producto_id
+    WHERE COALESCE(ps.sucursal,%s)=%s
+      AND (%s='' OR LOWER(COALESCE(p.categoria,''))=LOWER(%s))
+      AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+    ORDER BY p.nombre, ps.serie
+    """, (DEFAULT_SUCURSAL, sucursal, categoria, categoria))
+    esperadas = dict_fetchall(cur)
+    cur.execute("""
+    SELECT id, serie, producto_id, producto_nombre, estado, usuario, creado_en
+    FROM inventario_conteo_scans
+    WHERE conteo_id=%s
+    ORDER BY id DESC
+    """, (conteo_id,))
+    scans = dict_fetchall(cur)
+    ok_series = {str(s.get("serie") or "").upper() for s in scans if str(s.get("estado") or "").upper() == "OK"}
+    faltantes = [s for s in esperadas if str(s.get("serie") or "").upper() not in ok_series]
+    por_producto = {}
+    for item in esperadas:
+        pid = str(item.get("producto_id") or "")
+        row = por_producto.setdefault(pid, {
+            "producto_id": item.get("producto_id"),
+            "producto_nombre": item.get("producto_nombre"),
+            "categoria": item.get("categoria"),
+            "sistema": 0,
+            "fisico": 0,
+            "diferencia": 0,
+        })
+        row["sistema"] += 1
+    for item in scans:
+        if str(item.get("estado") or "").upper() != "OK":
+            continue
+        pid = str(item.get("producto_id") or "")
+        row = por_producto.setdefault(pid, {
+            "producto_id": item.get("producto_id"),
+            "producto_nombre": item.get("producto_nombre"),
+            "categoria": categoria,
+            "sistema": 0,
+            "fisico": 0,
+            "diferencia": 0,
+        })
+        row["fisico"] += 1
+    for row in por_producto.values():
+        row["diferencia"] = int(row.get("fisico") or 0) - int(row.get("sistema") or 0)
+    scans_json = [_jsonable_row(x) for x in scans]
+    faltantes_json = [_jsonable_row(x) for x in faltantes]
+    return {
+        "ok": True,
+        "success": True,
+        "conteo": _jsonable_row(conteo),
+        "resumen": {
+            "sistema": len(esperadas),
+            "fisico": len(ok_series),
+            "faltantes": len(faltantes),
+            "errores": len([s for s in scans if str(s.get("estado") or "").upper() != "OK"]),
+        },
+        "productos": list(por_producto.values()),
+        "scans": scans_json,
+        "faltantes": faltantes_json,
+    }
+
+
+@app.post("/inventario/conteos")
+def crear_inventario_conteo(data: InventarioConteoCreate):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.sucursal)
+        categoria = (data.categoria or "").strip()
+        if not categoria or categoria.upper() == "TODAS":
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Selecciona una categoria para comenzar inventario."}
+        cur.execute("""
+        INSERT INTO inventario_conteos (categoria, usuario, sucursal, estado)
+        VALUES (%s,%s,%s,'ABIERTO')
+        RETURNING id
+        """, (categoria, data.usuario or "", sucursal))
+        conteo_id = cur.fetchone()[0]
+        conn.commit()
+        result = resumen_inventario_conteo(cur, conteo_id, sucursal)
+        conn.close()
+        return result
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.get("/inventario/conteos/{conteo_id}")
+def obtener_inventario_conteo(conteo_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        result = resumen_inventario_conteo(cur, conteo_id, sucursal)
+        conn.close()
+        return result or {"ok": False, "success": False, "msg": "Conteo no encontrado"}
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.post("/inventario/conteos/{conteo_id}/scan")
+def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        serie = (data.serie or "").strip().upper()
+        if not serie:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Escanea o ingresa una serie."}
+        cur.execute("""
+        SELECT id, categoria, estado
+        FROM inventario_conteos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (conteo_id, DEFAULT_SUCURSAL, sucursal))
+        conteo = dict_fetchone(cur)
+        if not conteo:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Conteo no encontrado."}
+        if str(conteo.get("estado") or "").upper() != "ABIERTO":
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Este inventario ya esta cerrado."}
+        cur.execute("""
+        SELECT id FROM inventario_conteo_scans
+        WHERE conteo_id=%s AND UPPER(serie)=UPPER(%s)
+        LIMIT 1
+        """, (conteo_id, serie))
+        if cur.fetchone():
+            conn.close()
+            return {"ok": False, "success": False, "estado": "DUPLICADA", "msg": f"Serie {serie} ya fue contada."}
+        cur.execute("""
+        SELECT ps.producto_id, COALESCE(p.nombre,'') AS producto_nombre,
+               COALESCE(p.categoria,'') AS categoria,
+               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id
+        WHERE UPPER(ps.serie)=UPPER(%s) AND COALESCE(ps.sucursal,%s)=%s
+        LIMIT 1
+        """, (serie, DEFAULT_SUCURSAL, sucursal))
+        row = dict_fetchone(cur)
+        estado_scan = "NO_REGISTRADA"
+        producto_id = None
+        producto_nombre = ""
+        if row:
+            producto_id = row.get("producto_id")
+            producto_nombre = row.get("producto_nombre") or ""
+            if str(row.get("categoria") or "").lower() != str(conteo.get("categoria") or "").lower():
+                estado_scan = "FUERA_CATEGORIA"
+            elif str(row.get("estado") or "").upper() not in ("DISPONIBLE", "RESERVADO"):
+                estado_scan = str(row.get("estado") or "NO_DISPONIBLE").upper()
+            else:
+                estado_scan = "OK"
+        cur.execute("""
+        INSERT INTO inventario_conteo_scans (conteo_id, serie, producto_id, producto_nombre, estado, usuario)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        RETURNING id
+        """, (conteo_id, serie, producto_id, producto_nombre, estado_scan, data.usuario or ""))
+        scan_id = cur.fetchone()[0]
+        conn.commit()
+        result = resumen_inventario_conteo(cur, conteo_id, sucursal) or {}
+        result.update({
+            "scan": {
+                "id": scan_id,
+                "serie": serie,
+                "producto_id": producto_id,
+                "producto_nombre": producto_nombre,
+                "estado": estado_scan,
+            },
+            "msg": "Serie contada." if estado_scan == "OK" else f"Revisar serie {serie}: {estado_scan}",
+        })
+        conn.close()
+        return result
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.post("/inventario/conteos/{conteo_id}/cerrar")
+def cerrar_inventario_conteo(conteo_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        UPDATE inventario_conteos
+        SET estado='CERRADO', cerrado_en=timezone('America/Lima', now())
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id
+        """, (conteo_id, DEFAULT_SUCURSAL, sucursal))
+        if not cur.fetchone():
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Conteo no encontrado."}
+        conn.commit()
+        result = resumen_inventario_conteo(cur, conteo_id, sucursal)
+        conn.close()
+        return result
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
 @app.post("/productos/{producto_id}/ajustar-stock")
 def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -2030,6 +2284,8 @@ def exportar_backup(sucursal: str = DEFAULT_SUCURSAL):
             "usuarios",
             "auditoria",
             "stock_transferencias",
+            "inventario_conteos",
+            "inventario_conteo_scans",
             "app_config",
         ]
         data = {
@@ -2051,6 +2307,14 @@ def exportar_backup(sucursal: str = DEFAULT_SUCURSAL):
                     WHERE COALESCE(sucursal_origen,'')=%s OR COALESCE(sucursal_destino,'')=%s
                     ORDER BY id
                     """, (sucursal, sucursal))
+                elif table == "inventario_conteo_scans":
+                    cur.execute("""
+                    SELECT s.*
+                    FROM inventario_conteo_scans s
+                    LEFT JOIN inventario_conteos c ON c.id=s.conteo_id
+                    WHERE COALESCE(c.sucursal,%s)=%s
+                    ORDER BY s.id
+                    """, (DEFAULT_SUCURSAL, sucursal))
                 elif table == "ventas_detalle":
                     cur.execute("""
                     SELECT vd.*
