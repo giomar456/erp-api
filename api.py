@@ -289,6 +289,102 @@ def normalizar_pagos_detalle(items=None, metodo_pago=None, monto_pagado=None):
     return pagos, total, metodo_resumen, json.dumps(pagos, ensure_ascii=False) if pagos else ""
 
 
+STOCK_DOC_TYPES = {"BOLETA", "FACTURA"}
+TEST_PRODUCT_MARKERS = ("PRUEBA", "RANDOM", "GENERICO", "GENÉRICO", "COTIZACION", "COTIZACIÓN")
+
+
+def split_series_text(value):
+    raw = re.split(r"[,;\n\r|]+", str(value or ""))
+    return [s.strip().upper() for s in raw if s and s.strip()]
+
+
+def is_test_product_name(*values):
+    text = " ".join(str(v or "") for v in values).upper()
+    return any(marker in text for marker in TEST_PRODUCT_MARKERS)
+
+
+def sync_producto_stock_from_series(cur, producto_id, sucursal):
+    cur.execute("""
+    UPDATE productos
+    SET stock = (
+        SELECT COUNT(*) FROM producto_series
+        WHERE producto_id=%s
+          AND COALESCE(sucursal,%s)=%s
+          AND UPPER(COALESCE(estado,''))='DISPONIBLE'
+    )
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
+
+
+def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
+    cantidad = max(0, int(float(cantidad or 0)))
+    if cantidad <= 0 or not producto_id:
+        return None
+
+    cur.execute("""
+    SELECT COALESCE(nombre,''), COALESCE(marca,''), COALESCE(modelo,''), COALESCE(stock,0)
+    FROM productos
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    LIMIT 1
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    prod = cur.fetchone()
+    if not prod:
+        return f"Producto {producto_id} no encontrado."
+
+    prod_nombre, prod_marca, prod_modelo, stock_actual = prod
+    if is_test_product_name(prod_nombre, nombre_doc, marca_doc, modelo_doc):
+        return None
+
+    cur.execute("""
+    SELECT id, UPPER(COALESCE(serie,'')) AS serie, UPPER(COALESCE(estado,'DISPONIBLE')) AS estado
+    FROM producto_series
+    WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    registered = {str(r.get("serie") or "").strip().upper(): r for r in dict_fetchall(cur) if str(r.get("serie") or "").strip()}
+    registered_count = len(registered)
+    selected = split_series_text(series_texto)
+
+    if len(selected) != cantidad:
+        return f"{prod_nombre}: selecciona o ingresa {cantidad} serie(s) antes de emitir boleta/factura."
+    if len(set(selected)) != len(selected):
+        return f"{prod_nombre}: hay series repetidas en el documento."
+
+    for serie in selected:
+        row = registered.get(serie)
+        if row and row.get("estado") not in ("DISPONIBLE", "RESERVADO"):
+            return f"{prod_nombre}: la serie {serie} esta en estado {row.get('estado')}."
+        if row:
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+            WHERE id=%s
+            """, (row.get("id"),))
+        else:
+            cur.execute("""
+            SELECT producto_id, UPPER(COALESCE(estado,'DISPONIBLE')) AS estado
+            FROM producto_series
+            WHERE UPPER(serie)=UPPER(%s) AND COALESCE(sucursal,%s)=%s
+            LIMIT 1
+            """, (serie, DEFAULT_SUCURSAL, sucursal))
+            other = dict_fetchone(cur)
+            if other:
+                return f"{prod_nombre}: la serie {serie} ya existe en otro producto o estado {other.get('estado')}."
+            cur.execute("""
+            INSERT INTO producto_series (producto_id, serie, proveedor, estado, fecha_ingreso, fecha_salida, sucursal)
+            VALUES (%s,%s,%s,'VENDIDO',TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),%s)
+            """, (producto_id, serie, "VENTA", sucursal))
+
+    if registered_count:
+        sync_producto_stock_from_series(cur, producto_id, sucursal)
+    else:
+        cur.execute("""
+        UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
+        WHERE id = %s AND COALESCE(sucursal,%s)=%s
+        """, (cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+    return None
+
+
 def normalizar_comprobantes_pago(data, existentes=None):
     recibidos = []
     for item in getattr(data, "comprobantes_pago", None) or []:
@@ -940,10 +1036,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.25"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.25/erp_sql_pro_v20_v1.0.25.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.25.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.25: agrega pagos por metodo en Caja, comprobantes ilimitados y conserva listados livianos para reducir consumo de Render."
+    latest_version = "1.0.26"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.26/erp_sql_pro_v20_v1.0.26.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.26.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.26: proformas no descuentan stock, boletas/facturas validan series, Productos permite gestionar series y agrega backup local."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -957,10 +1053,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.22")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.23")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.22_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.22: Productos muestra series y movimientos con boleta/documento; Caja permite pagos por metodo y comprobantes ilimitados.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.23_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.23: proformas no descuentan stock, ventas validan series, Productos gestiona series y Ajustes descarga backup local.")
     return {
         "ok": True,
         "success": True,
@@ -1814,6 +1910,7 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         WHERE vd.producto_id=%s
           AND COALESCE(vd.sucursal,%s)=%s
           AND COALESCE(v.sucursal,%s)=%s
+          AND UPPER(COALESCE(v.tipo,'')) IN ('BOLETA','FACTURA')
         ORDER BY v.fecha DESC, v.id DESC
         LIMIT 80
         """, (producto_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
@@ -1914,6 +2011,66 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         return {"ok": False, "data": [], "msg": str(e)}
 
 
+@app.get("/backup/export")
+def exportar_backup(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        tables = [
+            "productos",
+            "producto_series",
+            "ventas",
+            "ventas_detalle",
+            "caja_movimientos",
+            "clientes",
+            "compras",
+            "proveedores",
+            "garantias",
+            "usuarios",
+            "auditoria",
+            "stock_transferencias",
+            "app_config",
+        ]
+        data = {
+            "ok": True,
+            "success": True,
+            "sucursal": sucursal,
+            "generado": lima_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "tablas": {},
+        }
+        for table in tables:
+            try:
+                if table == "app_config":
+                    cur.execute("SELECT * FROM app_config ORDER BY clave")
+                elif table == "auditoria":
+                    cur.execute("SELECT * FROM auditoria WHERE COALESCE(empresa,%s)=%s ORDER BY id", (DEFAULT_SUCURSAL, sucursal))
+                elif table == "stock_transferencias":
+                    cur.execute("""
+                    SELECT * FROM stock_transferencias
+                    WHERE COALESCE(sucursal_origen,'')=%s OR COALESCE(sucursal_destino,'')=%s
+                    ORDER BY id
+                    """, (sucursal, sucursal))
+                elif table == "ventas_detalle":
+                    cur.execute("""
+                    SELECT vd.*
+                    FROM ventas_detalle vd
+                    LEFT JOIN ventas v ON v.id=vd.venta_id
+                    WHERE COALESCE(vd.sucursal,%s)=%s OR COALESCE(v.sucursal,%s)=%s
+                    ORDER BY vd.id
+                    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+                else:
+                    cur.execute(f"SELECT * FROM {table} WHERE COALESCE(sucursal,%s)=%s ORDER BY 1", (DEFAULT_SUCURSAL, sucursal))
+                data["tablas"][table] = dict_fetchall(cur)
+            except Exception as table_error:
+                data["tablas"][table] = {"error": str(table_error)}
+        conn.close()
+        return data
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
 # ================= SERIES =================
 @app.get("/series/{tipo}")
 def get_serie(tipo: str):
@@ -1962,7 +2119,9 @@ def crear_venta(data: Venta):
         metodo_pago = (data.metodo_pago or "").upper()
         fecha_emision = parse_fecha_emision(data.fecha_emision)
         fecha_vencimiento = data.fecha_vencimiento or None
-        es_proforma = (data.tipo or "").upper() == "PROFORMA"
+        doc_tipo_upper = (data.tipo or "").upper()
+        es_proforma = doc_tipo_upper == "PROFORMA"
+        mueve_stock = doc_tipo_upper in STOCK_DOC_TYPES
         if es_proforma and not fecha_vencimiento:
             fecha_vencimiento = fecha_emision.date().isoformat()
         if es_proforma:
@@ -2010,15 +2169,25 @@ def crear_venta(data: Venta):
                 item.cantidad, item.precio, item.total, sucursal
             ))
 
-            if not es_proforma:
-                cur.execute("""
-                UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
-                WHERE id = %s AND COALESCE(sucursal,%s)=%s
-                """, (item.cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+            if mueve_stock:
+                serie_error = validar_y_marcar_series_venta(
+                    cur,
+                    producto_id,
+                    descripcion,
+                    marca,
+                    modelo,
+                    item.cantidad,
+                    item.series_texto or item.serie,
+                    sucursal,
+                )
+                if serie_error:
+                    conn.rollback()
+                    conn.close()
+                    return {"ok": False, "success": False, "msg": serie_error}
 
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
-        if not es_proforma:
+        if mueve_stock:
             cur.execute("""
             INSERT INTO caja_movimientos (
                 fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
@@ -2404,18 +2573,30 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         tipo, numero, sucursal = venta
 
         cur.execute("""
-        SELECT producto_id, COALESCE(cantidad, 0)
+        SELECT producto_id, COALESCE(cantidad, 0), COALESCE(series_texto, '')
         FROM ventas_detalle
         WHERE venta_id=%s AND producto_id IS NOT NULL
         """, (documento_id,))
         detalles = cur.fetchall()
 
-        for producto_id, cantidad in detalles:
-            cur.execute("""
-            UPDATE productos
-            SET stock = COALESCE(stock, 0) + %s
-            WHERE id = %s AND COALESCE(sucursal,%s)=%s
-            """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal))
+        if str(tipo or "").upper() in STOCK_DOC_TYPES:
+            for producto_id, cantidad, series_texto in detalles:
+                series = split_series_text(series_texto)
+                if series:
+                    cur.execute("""
+                    UPDATE producto_series
+                    SET estado='DISPONIBLE', fecha_salida=NULL
+                    WHERE producto_id=%s
+                      AND COALESCE(sucursal,%s)=%s
+                      AND UPPER(serie)=ANY(%s)
+                    """, (producto_id, DEFAULT_SUCURSAL, sucursal, series))
+                    sync_producto_stock_from_series(cur, producto_id, sucursal)
+                else:
+                    cur.execute("""
+                    UPDATE productos
+                    SET stock = COALESCE(stock, 0) + %s
+                    WHERE id = %s AND COALESCE(sucursal,%s)=%s
+                    """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal))
 
         cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
         cur.execute("""
@@ -2784,6 +2965,39 @@ def listar_proveedores(sucursal: str = DEFAULT_SUCURSAL):
     ORDER BY nombre ASC, id DESC
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = [_jsonable_row(r) for r in dict_fetchall(cur)]
+    conn.close()
+    return data
+
+
+@app.get("/productos/{producto_id}/series")
+def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    SELECT
+        ps.id,
+        ps.producto_id,
+        p.nombre AS producto_nombre,
+        p.marca,
+        p.modelo,
+        ps.serie,
+        ps.proveedor,
+        ps.estado,
+        ps.fecha_ingreso,
+        ps.fecha_salida
+    FROM producto_series ps
+    LEFT JOIN productos p ON p.id = ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+    WHERE ps.producto_id=%s AND COALESCE(ps.sucursal,%s)=%s
+    ORDER BY
+        CASE UPPER(COALESCE(ps.estado,'DISPONIBLE'))
+            WHEN 'DISPONIBLE' THEN 0
+            WHEN 'RESERVADO' THEN 1
+            ELSE 2
+        END,
+        ps.id DESC
+    """, (DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
+    data = dict_fetchall(cur)
     conn.close()
     return data
 
