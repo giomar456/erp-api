@@ -586,6 +586,7 @@ class SerieProducto(BaseModel):
     serie: str
     proveedor: str = ""
     estado: str = "DISPONIBLE"
+    almacen: str = "TIENDA"
     fecha_ingreso: str = ""
     fecha_salida: Optional[str] = None
     sucursal: str = DEFAULT_SUCURSAL
@@ -693,6 +694,7 @@ class Producto(BaseModel):
     stock: int
     imagen_url: Optional[str] = ""
     observacion: Optional[str] = ""
+    almacen: Optional[str] = "TIENDA"
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -812,6 +814,7 @@ def migrate_schema():
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS series (
@@ -846,6 +849,7 @@ def migrate_schema():
         );
         """)
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS inventario_conteos (
@@ -1073,10 +1077,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.33"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.33/erp_sql_pro_v20_v1.0.33.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.33.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.33: actualizador PC reforzado con reintentos y log de diagnostico."
+    latest_version = "1.0.34"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.34/erp_sql_pro_v20_v1.0.34.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.34.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.34: logo unificado Computer Army, proveedor fijo en series y division por almacen."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1090,10 +1094,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.27")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.28")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.27_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.27: series flexibles para productos sin registro e impresion automatica con S/N.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.28_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.28: logo unificado, proveedor fijo en series y division por almacen.")
     return {
         "ok": True,
         "success": True,
@@ -1596,14 +1600,15 @@ def crear_producto(data: Producto):
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal)
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
 
     cur.execute("""
-    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,sucursal)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (data.nombre, data.categoria, data.marca,
           data.modelo, data.precio_compra,
-          data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", sucursal))
+          data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), sucursal))
     producto_id = cur.fetchone()[0]
 
     conn.commit()
@@ -1618,11 +1623,13 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
 
     cur.execute("""
     SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
            COALESCE(imagen_url, '') AS imagen_url,
            COALESCE(observacion, '') AS observacion,
+           COALESCE(almacen, 'TIENDA') AS almacen,
            COALESCE(sucursal,%s) AS sucursal
     FROM productos
     WHERE COALESCE(sucursal,%s)=%s
@@ -1642,15 +1649,16 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
     sucursal = norm_sucursal(data.sucursal or sucursal)
     try:
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
-            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s
+            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
             data.nombre, data.categoria, data.marca, data.modelo,
-            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", producto_id, DEFAULT_SUCURSAL, sucursal
+            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), producto_id, DEFAULT_SUCURSAL, sucursal
         ))
         row = cur.fetchone()
         if not row:
@@ -1692,6 +1700,7 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     texto = f"%{(q or '').lower()}%"
+    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("""
     SELECT
         ps.id,
@@ -1702,6 +1711,7 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
         ps.serie,
         ps.proveedor,
         ps.estado,
+        COALESCE(ps.almacen, 'TIENDA') AS almacen,
         ps.fecha_ingreso,
         ps.fecha_salida
     FROM producto_series ps
@@ -1710,12 +1720,13 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
       AND (%s = '%%'
        OR LOWER(COALESCE(ps.serie,'')) LIKE %s
        OR LOWER(COALESCE(ps.proveedor,'')) LIKE %s
+       OR LOWER(COALESCE(ps.almacen,'')) LIKE %s
        OR LOWER(COALESCE(ps.estado,'')) LIKE %s
        OR LOWER(COALESCE(p.nombre,'')) LIKE %s
        OR LOWER(COALESCE(p.marca,'')) LIKE %s
        OR LOWER(COALESCE(p.modelo,'')) LIKE %s)
     ORDER BY ps.id DESC
-    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto, texto, texto))
+    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto, texto, texto, texto))
     data = dict_fetchall(cur)
     conn.close()
     return data
@@ -1728,6 +1739,7 @@ def guardar_serie_producto(data: SerieProducto):
     try:
         sucursal = norm_sucursal(data.sucursal)
         serie = (data.serie or "").strip()
+        almacen = (data.almacen or "TIENDA").strip().upper()
         if not serie:
             conn.close()
             return {"ok": False, "msg": "La serie no puede estar vacia"}
@@ -1738,21 +1750,23 @@ def guardar_serie_producto(data: SerieProducto):
             conn.close()
             return {"ok": False, "msg": "Producto no encontrado"}
 
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("""
         INSERT INTO producto_series (
-            producto_id, serie, proveedor, estado, fecha_ingreso, fecha_salida, sucursal
+            producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (serie)
         DO UPDATE SET producto_id=EXCLUDED.producto_id,
                       proveedor=EXCLUDED.proveedor,
                       estado=EXCLUDED.estado,
+                      almacen=EXCLUDED.almacen,
                       fecha_ingreso=EXCLUDED.fecha_ingreso,
                       fecha_salida=EXCLUDED.fecha_salida,
                       sucursal=EXCLUDED.sucursal
         RETURNING id
         """, (
-            data.producto_id, serie, data.proveedor, data.estado,
+            data.producto_id, serie, data.proveedor, data.estado, almacen,
             data.fecha_ingreso, data.fecha_salida, sucursal
         ))
         serie_id = cur.fetchone()[0]
@@ -1790,6 +1804,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
     try:
         sucursal = norm_sucursal(data.sucursal or sucursal)
         serie = (data.serie or "").strip()
+        almacen = (data.almacen or "TIENDA").strip().upper()
         if not serie:
             conn.close()
             return {"ok": False, "msg": "La serie no puede estar vacia"}
@@ -1809,19 +1824,21 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
             conn.close()
             return {"ok": False, "msg": "Producto no encontrado"}
 
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("""
         UPDATE producto_series
         SET producto_id=%s,
             serie=%s,
             proveedor=%s,
             estado=%s,
+            almacen=%s,
             fecha_ingreso=%s,
             fecha_salida=%s,
             sucursal=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
-            data.producto_id, serie, data.proveedor, data.estado,
+            data.producto_id, serie, data.proveedor, data.estado, almacen,
             data.fecha_ingreso, data.fecha_salida, sucursal,
             serie_id, DEFAULT_SUCURSAL, sucursal
         ))
@@ -3279,6 +3296,7 @@ def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("""
     SELECT
         ps.id,
@@ -3289,6 +3307,7 @@ def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         ps.serie,
         ps.proveedor,
         ps.estado,
+        COALESCE(ps.almacen, 'TIENDA') AS almacen,
         ps.fecha_ingreso,
         ps.fecha_salida
     FROM producto_series ps
