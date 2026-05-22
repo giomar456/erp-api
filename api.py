@@ -1077,10 +1077,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.34"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.34/erp_sql_pro_v20_v1.0.34.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.34.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.34: logo unificado Computer Army, proveedor fijo en series y division por almacen."
+    latest_version = "1.0.35"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.35/erp_sql_pro_v20_v1.0.35.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.35.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.35: corrige iconos, letras con ñ y logo Computer Army en documentos."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1094,10 +1094,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.28")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.29")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.28_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.28: logo unificado, proveedor fijo en series y division por almacen.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.29_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.29: corrige logo en documentos y textos del sistema.")
     return {
         "ok": True,
         "success": True,
