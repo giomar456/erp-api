@@ -344,6 +344,13 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
     registered_count = len(registered)
     selected = split_series_text(series_texto)
 
+    if not registered_count:
+        cur.execute("""
+        UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
+        WHERE id = %s AND COALESCE(sucursal,%s)=%s
+        """, (cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+        return None
+
     if len(selected) != cantidad:
         return f"{prod_nombre}: selecciona o ingresa {cantidad} serie(s) antes de emitir boleta/factura."
     if len(set(selected)) != len(selected):
@@ -374,13 +381,7 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
         WHERE id=%s
         """, (row.get("id"),))
 
-    if registered_count:
-        sync_producto_stock_from_series(cur, producto_id, sucursal)
-    else:
-        cur.execute("""
-        UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
-        WHERE id = %s AND COALESCE(sucursal,%s)=%s
-        """, (cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+    sync_producto_stock_from_series(cur, producto_id, sucursal)
     return None
 
 
@@ -1072,10 +1073,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.31"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.31/erp_sql_pro_v20_v1.0.31.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.31.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.31: ingreso rapido de series conserva proveedor, guarda con Enter de pistola y vuelve a enfocar serie."
+    latest_version = "1.0.32"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.32/erp_sql_pro_v20_v1.0.32.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.32.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.32: series obligatorias solo en productos con series registradas e impresion automatica con S/N."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1089,10 +1090,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.26")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.27")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.26_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.26: ingreso rapido de series conserva proveedor y guarda con Enter de pistola.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.27_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.27: series flexibles para productos sin registro e impresion automatica con S/N.")
     return {
         "ok": True,
         "success": True,
