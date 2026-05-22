@@ -1072,10 +1072,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.30"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.30/erp_sql_pro_v20_v1.0.30.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.30.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.30: validacion estricta de series en ventas e inventariado por categoria con pistoleo de series."
+    latest_version = "1.0.31"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.31/erp_sql_pro_v20_v1.0.31.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.31.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.31: ingreso rapido de series conserva proveedor, guarda con Enter de pistola y vuelve a enfocar serie."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1089,10 +1089,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.25")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.26")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.25_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.25: inventariado por categoria con pistoleo de series y validacion estricta de series.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.26_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.26: ingreso rapido de series conserva proveedor y guarda con Enter de pistola.")
     return {
         "ok": True,
         "success": True,
