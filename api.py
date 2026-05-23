@@ -1077,10 +1077,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.36"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.36/erp_sql_pro_v20_v1.0.36.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.36.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.36: corrige proformas, vista PDF y publicacion Android instalable."
+    latest_version = "1.0.37"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.37/erp_sql_pro_v20_v1.0.37.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.37.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.37: activa el visor interno de PDF en el ERP de PC."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
