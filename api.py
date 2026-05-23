@@ -1077,10 +1077,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.35"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.35/erp_sql_pro_v20_v1.0.35.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.35.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.35: corrige iconos, letras con ñ y logo Computer Army en documentos."
+    latest_version = "1.0.36"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.36/erp_sql_pro_v20_v1.0.36.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.36.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.36: corrige proformas, vista PDF y publicacion Android instalable."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1094,10 +1094,10 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.29")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.30")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.29_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.29: corrige logo en documentos y textos del sistema.")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.30_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.30: proformas reales, vista PDF y APK instalable.")
     return {
         "ok": True,
         "success": True,
@@ -2379,7 +2379,10 @@ def crear_venta(data: Venta):
 
     try:
         sucursal = norm_sucursal(data.sucursal)
-        cur.execute("SELECT id, serie, correlativo FROM series WHERE tipo=%s", (data.tipo,))
+        doc_tipo_upper = (data.tipo or "").strip().upper()
+        if doc_tipo_upper:
+            data.tipo = doc_tipo_upper
+        cur.execute("SELECT id, serie, correlativo FROM series WHERE UPPER(tipo)=%s", (doc_tipo_upper,))
         row = cur.fetchone()
 
         if not row:
@@ -2401,7 +2404,6 @@ def crear_venta(data: Venta):
         metodo_pago = (data.metodo_pago or "").upper()
         fecha_emision = parse_fecha_emision(data.fecha_emision)
         fecha_vencimiento = data.fecha_vencimiento or None
-        doc_tipo_upper = (data.tipo or "").upper()
         es_proforma = doc_tipo_upper == "PROFORMA"
         mueve_stock = doc_tipo_upper in STOCK_DOC_TYPES
         if es_proforma and not fecha_vencimiento:
@@ -2507,6 +2509,16 @@ def crear_venta(data: Venta):
 
 @app.post("/documentos/emitir")
 def emitir_documento(data: Venta):
+    return crear_venta(data)
+
+
+@app.post("/proformas")
+def crear_proforma(data: Venta):
+    data.tipo = "PROFORMA"
+    data.estado_pago = "DEUDA"
+    data.metodo_pago = ""
+    if not data.cliente_nombre:
+        data.cliente_nombre = "CLIENTE GENERAL"
     return crear_venta(data)
 
 
