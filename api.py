@@ -633,6 +633,13 @@ class UsuarioRadioUpdate(BaseModel):
     boquitoqui_enabled: bool = False
 
 
+class UsuarioOnlineHeartbeat(BaseModel):
+    usuario: str
+    vista: str = ""
+    dispositivo: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
 class BoquitoquiMensaje(BaseModel):
     usuario_emisor: str
     destinatario: str = ""
@@ -801,6 +808,15 @@ def migrate_schema():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_sucursal_id ON boquitoqui_mensajes (sucursal, id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_destinatario ON boquitoqui_mensajes (sucursal, destinatario)")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_online (
+            usuario TEXT PRIMARY KEY,
+            sucursal TEXT DEFAULT 'computer_army',
+            vista TEXT DEFAULT '',
+            dispositivo TEXT DEFAULT '',
+            ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
 
         for usuario, clave, rol in [
             ("Giomar", "43yk0rr21", "ADMIN"),
@@ -1425,6 +1441,56 @@ def cambiar_boquitoqui_usuario(usuario_id: int, data: UsuarioRadioUpdate):
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "boquitoqui_enabled": bool(data.boquitoqui_enabled)}
+
+
+@app.get("/usuarios/online")
+def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.id, u.usuario, u.rol, COALESCE(u.foto_url,'') AS foto_url,
+               COALESCE(u.sucursal,%s) AS sucursal,
+               COALESCE(u.boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
+               CASE
+                   WHEN o.ultima_actividad IS NOT NULL
+                    AND o.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+                   THEN TRUE ELSE FALSE
+               END AS online,
+               COALESCE(o.vista,'') AS vista,
+               COALESCE(o.dispositivo,'') AS dispositivo,
+               TO_CHAR(o.ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad
+        FROM usuarios u
+        LEFT JOIN usuarios_online o ON lower(o.usuario)=lower(u.usuario)
+        WHERE (COALESCE(u.sucursal,%s)=%s OR lower(u.usuario)='giomar')
+          AND COALESCE(u.boquitoqui_enabled,FALSE)=TRUE
+        ORDER BY online DESC, u.usuario
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
+    data = dict_fetchall(cur)
+    conn.close()
+    return {"ok": True, "success": True, "data": data}
+
+
+@app.post("/usuarios/online")
+def registrar_usuario_online(data: UsuarioOnlineHeartbeat):
+    usuario = (data.usuario or "").strip()
+    if not usuario:
+        return {"ok": False, "success": False, "msg": "Usuario obligatorio"}
+    sucursal = norm_sucursal(data.sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO usuarios_online (usuario, sucursal, vista, dispositivo, ultima_actividad)
+        VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (usuario)
+        DO UPDATE SET sucursal=EXCLUDED.sucursal,
+                      vista=EXCLUDED.vista,
+                      dispositivo=EXCLUDED.dispositivo,
+                      ultima_actividad=CURRENT_TIMESTAMP
+    """, (usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:80]))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True}
 
 
 @app.delete("/usuarios/{usuario_id}")
