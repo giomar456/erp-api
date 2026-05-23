@@ -621,11 +621,26 @@ class Usuario(BaseModel):
     clave: str
     rol: str = "VENTAS"
     foto_url: Optional[str] = ""
+    boquitoqui_enabled: bool = False
     sucursal: str = DEFAULT_SUCURSAL
 
 
 class UsuarioRolUpdate(BaseModel):
     rol: str
+
+
+class UsuarioRadioUpdate(BaseModel):
+    boquitoqui_enabled: bool = False
+
+
+class BoquitoquiMensaje(BaseModel):
+    usuario_emisor: str
+    destinatario: str = ""
+    grupo: str = "GENERAL"
+    audio_mime: str = "audio/webm"
+    audio_base64: str
+    duracion_ms: int = 0
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class CajaMovimiento(BaseModel):
@@ -757,6 +772,7 @@ def migrate_schema():
         """)
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto_url TEXT DEFAULT ''")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS boquitoqui_enabled BOOLEAN DEFAULT FALSE")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS sucursales (
             codigo TEXT PRIMARY KEY,
@@ -770,6 +786,21 @@ def migrate_schema():
         VALUES ('computer_army','COMPUTER ARMY',TRUE)
         ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS boquitoqui_mensajes (
+            id SERIAL PRIMARY KEY,
+            sucursal TEXT DEFAULT 'computer_army',
+            usuario_emisor TEXT,
+            destinatario TEXT DEFAULT '',
+            grupo TEXT DEFAULT 'GENERAL',
+            audio_mime TEXT DEFAULT 'audio/webm',
+            audio_base64 TEXT,
+            duracion_ms INTEGER DEFAULT 0,
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_sucursal_id ON boquitoqui_mensajes (sucursal, id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_destinatario ON boquitoqui_mensajes (sucursal, destinatario)")
 
         for usuario, clave, rol in [
             ("Giomar", "43yk0rr21", "ADMIN"),
@@ -1121,7 +1152,8 @@ def login(data: dict):
 
     cur.execute("""
         SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
-               COALESCE(sucursal,%s) AS sucursal
+               COALESCE(sucursal,%s) AS sucursal,
+               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled
         FROM usuarios
         WHERE lower(usuario)=lower(%s) AND clave=%s
     """,
@@ -1138,7 +1170,7 @@ def login(data: dict):
             return {"ok": False, "msg": "No tienes acceso a esta sucursal."}
         sucursal = user_branch
 
-    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "sucursal": sucursal, "empresa": sucursal}
+    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "sucursal": sucursal, "empresa": sucursal}
 
 
 # ================= USUARIOS =================
@@ -1148,7 +1180,9 @@ def listar_usuarios(sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     cur.execute("""
-        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url, COALESCE(sucursal,%s) AS sucursal
+        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
+               COALESCE(sucursal,%s) AS sucursal,
+               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled
         FROM usuarios
         WHERE COALESCE(sucursal,%s)=%s OR lower(usuario)='giomar'
         ORDER BY usuario
@@ -1163,7 +1197,9 @@ def perfil_usuario(usuario: str = ""):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT usuario, rol, COALESCE(foto_url,'') AS foto_url, COALESCE(sucursal,%s) AS sucursal
+        SELECT usuario, rol, COALESCE(foto_url,'') AS foto_url,
+               COALESCE(sucursal,%s) AS sucursal,
+               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled
         FROM usuarios
         WHERE lower(usuario)=lower(%s)
     """, (DEFAULT_SUCURSAL, usuario.strip()))
@@ -1182,6 +1218,7 @@ def guardar_usuario(data: Usuario):
     clave = data.clave or ""
     rol = (data.rol or "VENTAS").upper()
     foto_url = data.foto_url or ""
+    radio_enabled = bool(data.boquitoqui_enabled)
     sucursal = norm_sucursal(data.sucursal)
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
@@ -1193,17 +1230,17 @@ def guardar_usuario(data: Usuario):
     if existing:
         cur.execute("""
         UPDATE usuarios
-        SET usuario=%s, clave=%s, rol=%s, sucursal=%s,
+        SET usuario=%s, clave=%s, rol=%s, sucursal=%s, boquitoqui_enabled=%s,
             foto_url=CASE WHEN %s <> '' THEN %s ELSE COALESCE(foto_url,'') END
         WHERE id=%s
         RETURNING id
-        """, (usuario, clave, rol, sucursal, foto_url, foto_url, existing[0]))
+        """, (usuario, clave, rol, sucursal, radio_enabled, foto_url, foto_url, existing[0]))
     else:
         cur.execute("""
-        INSERT INTO usuarios (usuario, clave, rol, foto_url, sucursal)
-        VALUES (%s,%s,%s,%s,%s)
+        INSERT INTO usuarios (usuario, clave, rol, foto_url, sucursal, boquitoqui_enabled)
+        VALUES (%s,%s,%s,%s,%s,%s)
         RETURNING id
-        """, (usuario, clave, rol, foto_url, sucursal))
+        """, (usuario, clave, rol, foto_url, sucursal, radio_enabled))
     user_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -1373,6 +1410,23 @@ def cambiar_rol_usuario(usuario_id: int, data: UsuarioRolUpdate):
     return {"ok": True, "success": True, "id": row[0], "rol": rol}
 
 
+@app.put("/usuarios/{usuario_id}/boquitoqui")
+def cambiar_boquitoqui_usuario(usuario_id: int, data: UsuarioRadioUpdate):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE usuarios SET boquitoqui_enabled=%s
+    WHERE id=%s
+    RETURNING id
+    """, (bool(data.boquitoqui_enabled), usuario_id))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True, "id": row[0], "boquitoqui_enabled": bool(data.boquitoqui_enabled)}
+
+
 @app.delete("/usuarios/{usuario_id}")
 def eliminar_usuario(usuario_id: int):
     conn = get_conn()
@@ -1389,6 +1443,103 @@ def eliminar_usuario(usuario_id: int):
     conn.commit()
     conn.close()
     return {"ok": True, "success": True}
+
+
+@app.get("/boquitoqui/mensajes")
+def listar_boquitoqui_mensajes(
+    since_id: int = 0,
+    usuario: str = "",
+    sucursal: str = DEFAULT_SUCURSAL,
+    limit: int = 25,
+):
+    sucursal = norm_sucursal(sucursal)
+    usuario = (usuario or "").strip()
+    limit = max(1, min(int(limit or 25), 50))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, sucursal, usuario_emisor, destinatario, grupo, audio_mime,
+               audio_base64, duracion_ms,
+               TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en
+        FROM boquitoqui_mensajes
+        WHERE sucursal=%s
+          AND id>%s
+          AND (%s='' OR destinatario='' OR lower(destinatario)=lower(%s) OR lower(usuario_emisor)=lower(%s))
+        ORDER BY id ASC
+        LIMIT %s
+    """, (sucursal, since_id, usuario, usuario, usuario, limit))
+    rows = dict_fetchall(cur)
+    conn.close()
+    return {"ok": True, "success": True, "data": rows}
+
+
+@app.get("/boquitoqui/ultimo")
+def ultimo_boquitoqui_mensaje(usuario: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    usuario = (usuario or "").strip()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, sucursal, usuario_emisor, destinatario, grupo, duracion_ms,
+               TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en
+        FROM boquitoqui_mensajes
+        WHERE sucursal=%s
+          AND (%s='' OR destinatario='' OR lower(destinatario)=lower(%s) OR lower(usuario_emisor)=lower(%s))
+        ORDER BY id DESC
+        LIMIT 1
+    """, (sucursal, usuario, usuario, usuario))
+    row = dict_fetchone(cur)
+    conn.close()
+    return {"ok": True, "success": True, "data": row}
+
+
+@app.post("/boquitoqui/mensajes")
+def guardar_boquitoqui_mensaje(data: BoquitoquiMensaje):
+    sucursal = norm_sucursal(data.sucursal)
+    usuario = (data.usuario_emisor or "").strip()
+    destinatario = (data.destinatario or "").strip()
+    grupo = (data.grupo or "GENERAL").strip().upper()
+    audio_mime = (data.audio_mime or "audio/webm").strip()[:80]
+    audio_base64 = (data.audio_base64 or "").strip()
+    duracion_ms = max(0, min(int(data.duracion_ms or 0), 30000))
+    if not usuario:
+        return {"ok": False, "success": False, "msg": "Usuario emisor obligatorio."}
+    if not audio_base64:
+        return {"ok": False, "success": False, "msg": "Audio vacio."}
+    if len(audio_base64) > 900000:
+        return {"ok": False, "success": False, "msg": "Audio muy grande. Usa mensajes cortos."}
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(boquitoqui_enabled,FALSE)
+        FROM usuarios
+        WHERE lower(usuario)=lower(%s)
+        LIMIT 1
+    """, (usuario,))
+    enabled = cur.fetchone()
+    if not enabled or not bool(enabled[0]):
+        conn.close()
+        return {"ok": False, "success": False, "msg": "Boquitoqui no habilitado para este usuario."}
+    cur.execute("""
+        INSERT INTO boquitoqui_mensajes
+            (sucursal, usuario_emisor, destinatario, grupo, audio_mime, audio_base64, duracion_ms)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id
+    """, (sucursal, usuario, destinatario, grupo, audio_mime, audio_base64, duracion_ms))
+    message_id = cur.fetchone()[0]
+    cur.execute("""
+        DELETE FROM boquitoqui_mensajes
+        WHERE sucursal=%s
+          AND id NOT IN (
+              SELECT id FROM boquitoqui_mensajes
+              WHERE sucursal=%s
+              ORDER BY id DESC
+              LIMIT 250
+          )
+    """, (sucursal, sucursal))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": message_id}
 
 
 # ================= AUDITORIA CENTRAL =================
