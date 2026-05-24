@@ -1144,6 +1144,8 @@ def app_version():
     android_version = os.getenv("ANDROID_APP_VERSION", "1.30")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.30_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.30_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.30: proformas reales, vista PDF y APK instalable.")
     return {
         "ok": True,
@@ -1156,6 +1158,8 @@ def app_version():
         "android_version": android_version,
         "android_url": android_download_url,
         "android_name": android_apk_name,
+        "android_dex_url": android_dex_download_url,
+        "android_dex_name": android_dex_apk_name,
         "android_notes": android_notes
     }
 
