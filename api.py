@@ -1540,13 +1540,14 @@ def listar_boquitoqui_mensajes(
 
 
 @app.get("/boquitoqui/ultimo")
-def ultimo_boquitoqui_mensaje(usuario: str = "", sucursal: str = DEFAULT_SUCURSAL):
+def ultimo_boquitoqui_mensaje(usuario: str = "", sucursal: str = DEFAULT_SUCURSAL, include_audio: bool = False):
     sucursal = norm_sucursal(sucursal)
     usuario = (usuario or "").strip()
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, sucursal, usuario_emisor, destinatario, grupo, duracion_ms,
+    audio_fields = ", audio_mime, audio_base64" if include_audio else ""
+    cur.execute(f"""
+        SELECT id, sucursal, usuario_emisor, destinatario, grupo, duracion_ms{audio_fields},
                TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en
         FROM boquitoqui_mensajes
         WHERE sucursal=%s
