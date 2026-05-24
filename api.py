@@ -2671,22 +2671,6 @@ def crear_venta(data: Venta):
                 item.cantidad, item.precio, item.total, sucursal
             ))
 
-            if mueve_stock:
-                serie_error = validar_y_marcar_series_venta(
-                    cur,
-                    producto_id,
-                    descripcion,
-                    marca,
-                    modelo,
-                    item.cantidad,
-                    item.series_texto or item.serie,
-                    sucursal,
-                )
-                if serie_error:
-                    conn.rollback()
-                    conn.close()
-                    return {"ok": False, "success": False, "msg": serie_error}
-
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
         if mueve_stock:
