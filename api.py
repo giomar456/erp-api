@@ -13,6 +13,7 @@ import binascii
 import psycopg2
 import os
 import json
+import re
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -1166,10 +1167,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.39"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.39/erp_sql_pro_v20_v1.0.39.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.39.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.39: agrega PASE interno para descontar stock y pasar a Caja."
+    latest_version = "1.0.40"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.40/erp_sql_pro_v20_v1.0.40.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.40.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.40: corrige emision de boletas/pases y numeros de cotizaciones abiertas."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
