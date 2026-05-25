@@ -289,7 +289,7 @@ def normalizar_pagos_detalle(items=None, metodo_pago=None, monto_pagado=None):
     return pagos, total, metodo_resumen, json.dumps(pagos, ensure_ascii=False) if pagos else ""
 
 
-STOCK_DOC_TYPES = {"BOLETA", "FACTURA"}
+STOCK_DOC_TYPES = {"BOLETA", "FACTURA", "PASE"}
 TEST_PRODUCT_MARKERS = ("PRUEBA", "RANDOM", "GENERICO", "GENÉRICO", "COTIZACION", "COTIZACIÓN")
 
 
@@ -383,6 +383,47 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
 
     sync_producto_stock_from_series(cur, producto_id, sucursal)
     return None
+
+
+def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
+    if not producto_id or not cantidad:
+        return
+    try:
+        cantidad = int(cantidad or 0)
+    except Exception:
+        cantidad = 0
+    if cantidad <= 0:
+        return
+
+    cur.execute("""
+    SELECT nombre, marca, modelo
+    FROM productos
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    prod = cur.fetchone()
+    if not prod:
+        return
+    prod_nombre, prod_marca, prod_modelo = prod
+    if is_test_product_name(prod_nombre, nombre_doc, marca_doc, modelo_doc):
+        return
+
+    cur.execute("""
+    UPDATE productos
+    SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
+    WHERE id = %s AND COALESCE(sucursal,%s)=%s
+    """, (cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+
+    selected = split_series_text(series_texto)
+    if selected:
+        cur.execute("""
+        UPDATE producto_series
+        SET estado='VENDIDO',
+            fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+        WHERE producto_id=%s
+          AND COALESCE(sucursal,%s)=%s
+          AND UPPER(serie)=ANY(%s)
+          AND UPPER(COALESCE(estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal, selected))
 
 
 def normalizar_comprobantes_pago(data, existentes=None):
@@ -877,6 +918,7 @@ def migrate_schema():
         VALUES
             ('PROFORMA','P001',1),
             ('NOTA DE VENTA','N001',1),
+            ('PASE','PA001',1),
             ('BOLETA','B001',1),
             ('FACTURA','F001',1)
         ON CONFLICT (tipo) DO NOTHING;
@@ -1124,10 +1166,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.37"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.37/erp_sql_pro_v20_v1.0.37.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.37.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.37: activa el visor interno de PDF en el ERP de PC."
+    latest_version = "1.0.39"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.39/erp_sql_pro_v20_v1.0.39.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.39.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.39: agrega PASE interno para descontar stock y pasar a Caja."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -2674,6 +2716,18 @@ def crear_venta(data: Venta):
                 item.series_texto or item.serie,
                 item.cantidad, item.precio, item.total, sucursal
             ))
+
+            if mueve_stock:
+                descontar_stock_venta(
+                    cur,
+                    producto_id,
+                    descripcion,
+                    marca,
+                    modelo,
+                    item.cantidad,
+                    item.series_texto or item.serie,
+                    sucursal,
+                )
 
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
