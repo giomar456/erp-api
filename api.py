@@ -503,8 +503,8 @@ def normalizar_dni(data, numero, source):
 
 def normalizar_ruc(data, numero, source):
     payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
-    nombre = first_value(payload, "razonSocial", "razon_social", "nombre", "nombre_o_razon_social")
-    direccion = first_value(payload, "direccion", "direccionFiscal", "domicilioFiscal", "domicilio_fiscal")
+    nombre = first_value(payload, "razonSocial", "razon_social", "nombre", "nombre_o_razon_social", "nombreORazonSocial")
+    direccion = first_value(payload, "direccion", "direccionFiscal", "domicilioFiscal", "domicilio_fiscal", "direccion_completa")
     if not nombre:
         return None
     return {
@@ -516,7 +516,7 @@ def normalizar_ruc(data, numero, source):
         "numero_documento": numero,
         "nombre": nombre.upper(),
         "razon_social": nombre.upper(),
-        "direccion": direccion.upper(),
+        "direccion": str(direccion or "").upper(),
         "estado": first_value(payload, "estado", "estadoContribuyente", "estado_contribuyente"),
         "condicion": first_value(payload, "condicion", "condicionContribuyente", "condicion_contribuyente"),
     }
@@ -573,6 +573,16 @@ def consulta_documento_apis_net_pe(tipo, numero):
     return normalizar_dni(data, numero, "apis_net_pe") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe")
 
 
+def consulta_documento_apis_net_pe_v1(tipo, numero):
+    if os.getenv("DISABLE_APIS_NET_PE_V1", "").strip().lower() in ("1", "true", "si", "yes"):
+        return None
+    base = os.getenv("APIS_NET_PE_V1_BASE", "https://api.apis.net.pe/v1").strip().rstrip("/")
+    endpoint = "dni" if tipo == "DNI" else "ruc"
+    url = f"{base}/{endpoint}?numero={urllib.parse.quote(numero)}"
+    data = http_get_json(url, headers={"Accept": "application/json"})
+    return normalizar_dni(data, numero, "apis_net_pe_v1") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe_v1")
+
+
 def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
     numero = only_digits(numero)
     tipo = "DNI" if len(numero) == 8 else "RUC" if len(numero) == 11 else ""
@@ -586,7 +596,7 @@ def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
 
     last_error = ""
     provider_configured = False
-    for provider in (consulta_documento_custom, consulta_documento_apis_net_pe):
+    for provider in (consulta_documento_custom, consulta_documento_apis_net_pe, consulta_documento_apis_net_pe_v1):
         try:
             if provider == consulta_documento_custom:
                 provider_configured = provider_configured or bool(os.getenv(f"DOC_LOOKUP_{tipo}_URL", "").strip())
@@ -1189,10 +1199,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.41"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.41/erp_sql_pro_v20_v1.0.41.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.41.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.41: combos por series, pago parcial visible y radio por tramos."
+    latest_version = "1.0.42"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.42/erp_sql_pro_v20_v1.0.42.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.42.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.42: consulta DNI/RUC, multiples series por item y limpieza de ventas."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1593,6 +1603,11 @@ def listar_boquitoqui_mensajes(
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
+        DELETE FROM boquitoqui_mensajes
+        WHERE sucursal=%s
+          AND creado_en < CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+    """, (sucursal,))
+    cur.execute("""
         SELECT id, sucursal, usuario_emisor, destinatario, grupo, audio_mime,
                audio_base64, duracion_ms,
                TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en
@@ -1604,6 +1619,7 @@ def listar_boquitoqui_mensajes(
         LIMIT %s
     """, (sucursal, since_id, usuario, usuario, usuario, limit))
     rows = dict_fetchall(cur)
+    conn.commit()
     conn.close()
     return {"ok": True, "success": True, "data": rows}
 
@@ -1614,6 +1630,11 @@ def ultimo_boquitoqui_mensaje(usuario: str = "", sucursal: str = DEFAULT_SUCURSA
     usuario = (usuario or "").strip()
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM boquitoqui_mensajes
+        WHERE sucursal=%s
+          AND creado_en < CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+    """, (sucursal,))
     audio_fields = ", audio_mime, audio_base64" if include_audio else ""
     cur.execute(f"""
         SELECT id, sucursal, usuario_emisor, destinatario, grupo, duracion_ms{audio_fields},
@@ -1625,6 +1646,7 @@ def ultimo_boquitoqui_mensaje(usuario: str = "", sucursal: str = DEFAULT_SUCURSA
         LIMIT 1
     """, (sucursal, usuario, usuario, usuario))
     row = dict_fetchone(cur)
+    conn.commit()
     conn.close()
     return {"ok": True, "success": True, "data": row}
 
@@ -1666,11 +1688,16 @@ def guardar_boquitoqui_mensaje(data: BoquitoquiMensaje):
     cur.execute("""
         DELETE FROM boquitoqui_mensajes
         WHERE sucursal=%s
+          AND creado_en < CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+    """, (sucursal,))
+    cur.execute("""
+        DELETE FROM boquitoqui_mensajes
+        WHERE sucursal=%s
           AND id NOT IN (
               SELECT id FROM boquitoqui_mensajes
               WHERE sucursal=%s
               ORDER BY id DESC
-              LIMIT 250
+              LIMIT 60
           )
     """, (sucursal, sucursal))
     conn.commit()
