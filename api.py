@@ -1192,7 +1192,7 @@ def app_version():
     latest_version = "1.0.41"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.41/erp_sql_pro_v20_v1.0.41.exe"
     latest_name = "erp_sql_pro_v20_v1.0.41.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.41: series de combos descuentan el producto real."
+    latest_notes = "Actualizacion G&G ERP v1.0.41: combos por series, pago parcial visible y radio por tramos."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
