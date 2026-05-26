@@ -387,13 +387,47 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
 
 
 def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
-    if not producto_id or not cantidad:
-        return
     try:
         cantidad = int(cantidad or 0)
     except Exception:
         cantidad = 0
     if cantidad <= 0:
+        return
+
+    selected = split_series_text(series_texto)
+    if selected:
+        cur.execute("""
+        SELECT ps.id,
+               ps.producto_id,
+               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND UPPER(ps.serie)=ANY(%s)
+        """, (DEFAULT_SUCURSAL, sucursal, selected))
+        rows = dict_fetchall(cur)
+        touched_products = set()
+        for row in rows:
+            estado = str(row.get("estado") or "DISPONIBLE").upper()
+            if estado not in ("DISPONIBLE", "RESERVADO"):
+                continue
+            serie_producto_id = row.get("producto_id")
+            if not serie_producto_id:
+                continue
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+            WHERE id=%s
+            """, (row.get("id"),))
+            touched_products.add(serie_producto_id)
+        for serie_producto_id in touched_products:
+            sync_producto_stock_from_series(cur, serie_producto_id, sucursal)
+        if touched_products:
+            return
+
+    if not producto_id:
         return
 
     cur.execute("""
@@ -413,18 +447,6 @@ def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, c
     SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
     WHERE id = %s AND COALESCE(sucursal,%s)=%s
     """, (cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
-
-    selected = split_series_text(series_texto)
-    if selected:
-        cur.execute("""
-        UPDATE producto_series
-        SET estado='VENDIDO',
-            fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
-        WHERE producto_id=%s
-          AND COALESCE(sucursal,%s)=%s
-          AND UPPER(serie)=ANY(%s)
-          AND UPPER(COALESCE(estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
-        """, (producto_id, DEFAULT_SUCURSAL, sucursal, selected))
 
 
 def normalizar_comprobantes_pago(data, existentes=None):
@@ -1167,10 +1189,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.40"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.40/erp_sql_pro_v20_v1.0.40.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.40.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.40: corrige emision de boletas/pases y numeros de cotizaciones abiertas."
+    latest_version = "1.0.41"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.41/erp_sql_pro_v20_v1.0.41.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.41.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.41: series de combos descuentan el producto real."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
