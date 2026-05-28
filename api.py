@@ -1208,10 +1208,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.45"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.45/erp_sql_pro_v20_v1.0.45.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.45.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.45: boquitoqui en vivo sin guardar audios, radio habilitada en PC y Android con menor retraso."
+    latest_version = "1.0.46"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.46/erp_sql_pro_v20_v1.0.46.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.46.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.46: corrige doble audio del boquitoqui, cola de reproduccion y sonido al pulsar."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1225,12 +1225,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.44")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.45")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.44_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.45_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.44_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.44: boquitoqui en vivo sin guardar audios y menor retraso.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.45_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.45: corrige doble audio del boquitoqui y reproduccion entrecortada.")
     return {
         "ok": True,
         "success": True,
