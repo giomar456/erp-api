@@ -1199,10 +1199,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.43"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.43/erp_sql_pro_v20_v1.0.43.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.43.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.43: boquitoqui reproduce audio automaticamente sin alerta principal."
+    latest_version = "1.0.44"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.44/erp_sql_pro_v20_v1.0.44.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.44.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.44: boquitoqui WAV rapido con escucha en PC y Android en segundo plano."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
