@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 from decimal import Decimal
 from datetime import date, datetime
+from collections import defaultdict, deque
+import threading
+import time
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -62,6 +65,11 @@ def parse_fecha_emision(value):
 # ================= CONEXION (SIMPLE Y ESTABLE) =================
 DEFAULT_SUCURSAL = "computer_army"
 MAX_COMPROBANTE_PAGO_BYTES = 15 * 1024 * 1024
+BOQUITOQUI_LIVE_TTL_SECONDS = 18
+BOQUITOQUI_LIVE_MAX_QUEUE = 80
+_boquitoqui_live_lock = threading.Lock()
+_boquitoqui_live_next_id = 1
+_boquitoqui_live_queues = defaultdict(deque)
 
 DEFAULT_FEATURES = {
     "dashboard": True,
@@ -72,6 +80,7 @@ DEFAULT_FEATURES = {
     "compras": True,
     "contabilidad": True,
     "caja": True,
+    "radio": True,
     "usuarios": True,
     "garantias": True,
     "auditoria": True,
@@ -1199,10 +1208,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.44"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.44/erp_sql_pro_v20_v1.0.44.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.44.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.44: boquitoqui WAV rapido con escucha en PC y Android en segundo plano."
+    latest_version = "1.0.45"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.45/erp_sql_pro_v20_v1.0.45.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.45.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.45: boquitoqui en vivo sin guardar audios, radio habilitada en PC y Android con menor retraso."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1216,12 +1225,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.30")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.44")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.30_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.44_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.30_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.30: proformas reales, vista PDF y APK instalable.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.44_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.44: boquitoqui en vivo sin guardar audios y menor retraso.")
     return {
         "ok": True,
         "success": True,
@@ -1703,6 +1712,128 @@ def guardar_boquitoqui_mensaje(data: BoquitoquiMensaje):
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "id": message_id}
+
+
+def _boquitoqui_live_cleanup(now_ts=None):
+    now_ts = now_ts or time.time()
+    stale_before = now_ts - BOQUITOQUI_LIVE_TTL_SECONDS
+    empty_keys = []
+    for key, queue in _boquitoqui_live_queues.items():
+        while queue and float(queue[0].get("_ts", 0)) < stale_before:
+            queue.popleft()
+        if not queue:
+            empty_keys.append(key)
+    for key in empty_keys:
+        try:
+            del _boquitoqui_live_queues[key]
+        except KeyError:
+            pass
+
+
+def _boquitoqui_live_key(sucursal, usuario):
+    return (norm_sucursal(sucursal), str(usuario or "").strip().lower())
+
+
+@app.get("/boquitoqui/live")
+def listar_boquitoqui_live(
+    since_id: int = 0,
+    usuario: str = "",
+    sucursal: str = DEFAULT_SUCURSAL,
+    limit: int = 20,
+):
+    sucursal = norm_sucursal(sucursal)
+    usuario = (usuario or "").strip()
+    if not usuario:
+        return {"ok": False, "success": False, "msg": "Usuario obligatorio.", "data": []}
+    limit = max(1, min(int(limit or 20), 40))
+    key = _boquitoqui_live_key(sucursal, usuario)
+    with _boquitoqui_live_lock:
+        _boquitoqui_live_cleanup()
+        rows = [
+            {k: v for k, v in item.items() if k != "_ts"}
+            for item in list(_boquitoqui_live_queues.get(key, []))
+            if int(item.get("id") or 0) > int(since_id or 0)
+        ][:limit]
+    return {"ok": True, "success": True, "data": rows}
+
+
+@app.post("/boquitoqui/live")
+def enviar_boquitoqui_live(data: BoquitoquiMensaje):
+    global _boquitoqui_live_next_id
+    sucursal = norm_sucursal(data.sucursal)
+    usuario = (data.usuario_emisor or "").strip()
+    destinatario = (data.destinatario or "").strip()
+    grupo = (data.grupo or "GENERAL").strip().upper()
+    audio_mime = (data.audio_mime or "audio/wav").strip()[:80]
+    audio_base64 = (data.audio_base64 or "").strip()
+    duracion_ms = max(0, min(int(data.duracion_ms or 0), 30000))
+    if not usuario:
+        return {"ok": False, "success": False, "msg": "Usuario emisor obligatorio."}
+    if not audio_base64:
+        return {"ok": False, "success": False, "msg": "Audio vacio."}
+    if len(audio_base64) > 650000:
+        return {"ok": False, "success": False, "msg": "Audio muy grande. Mantén presionado por tramos cortos."}
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(boquitoqui_enabled,FALSE)
+        FROM usuarios
+        WHERE lower(usuario)=lower(%s)
+        LIMIT 1
+    """, (usuario,))
+    enabled = cur.fetchone()
+    if not enabled or not bool(enabled[0]):
+        conn.close()
+        return {"ok": False, "success": False, "msg": "Boquitoqui no habilitado para este usuario."}
+    recipients = []
+    if destinatario:
+        cur.execute("""
+            SELECT usuario
+            FROM usuarios
+            WHERE lower(usuario)=lower(%s)
+              AND COALESCE(boquitoqui_enabled,FALSE)=TRUE
+            LIMIT 1
+        """, (destinatario,))
+        row = cur.fetchone()
+        if row:
+            recipients.append(str(row[0]).strip())
+    else:
+        cur.execute("""
+            SELECT usuario
+            FROM usuarios
+            WHERE COALESCE(boquitoqui_enabled,FALSE)=TRUE
+              AND lower(usuario)<>lower(%s)
+              AND lower(COALESCE(sucursal,%s))=lower(%s)
+            LIMIT 50
+        """, (usuario, sucursal, sucursal))
+        recipients = [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
+    conn.close()
+    if not recipients:
+        return {"ok": False, "success": False, "msg": "No hay usuario receptor habilitado."}
+
+    with _boquitoqui_live_lock:
+        _boquitoqui_live_cleanup()
+        _boquitoqui_live_next_id += 1
+        msg_id = _boquitoqui_live_next_id
+        now_ts = time.time()
+        for receptor in recipients:
+            queue = _boquitoqui_live_queues[_boquitoqui_live_key(sucursal, receptor)]
+            queue.append({
+                "id": msg_id,
+                "_ts": now_ts,
+                "sucursal": sucursal,
+                "usuario_emisor": usuario,
+                "destinatario": receptor,
+                "grupo": grupo,
+                "audio_mime": audio_mime,
+                "audio_base64": audio_base64,
+                "duracion_ms": duracion_ms,
+                "creado_en": lima_now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            while len(queue) > BOQUITOQUI_LIVE_MAX_QUEUE:
+                queue.popleft()
+    return {"ok": True, "success": True, "id": msg_id, "recipients": recipients}
 
 
 # ================= AUDITORIA CENTRAL =================
