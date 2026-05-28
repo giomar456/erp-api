@@ -1208,10 +1208,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.46"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.46/erp_sql_pro_v20_v1.0.46.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.46.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.46: corrige doble audio del boquitoqui, cola de reproduccion y sonido al pulsar."
+    latest_version = "1.0.47"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.47/erp_sql_pro_v20_v1.0.47.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.47.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.47: habilita Radio en PC para todos los usuarios y muestra conectados/desconectados."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1551,7 +1551,6 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
         FROM usuarios u
         LEFT JOIN usuarios_online o ON lower(o.usuario)=lower(u.usuario)
         WHERE (COALESCE(u.sucursal,%s)=%s OR lower(u.usuario)='giomar')
-          AND COALESCE(u.boquitoqui_enabled,FALSE)=TRUE
         ORDER BY online DESC, u.usuario
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
@@ -1678,15 +1677,15 @@ def guardar_boquitoqui_mensaje(data: BoquitoquiMensaje):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT COALESCE(boquitoqui_enabled,FALSE)
+        SELECT usuario
         FROM usuarios
         WHERE lower(usuario)=lower(%s)
         LIMIT 1
     """, (usuario,))
     enabled = cur.fetchone()
-    if not enabled or not bool(enabled[0]):
+    if not enabled:
         conn.close()
-        return {"ok": False, "success": False, "msg": "Boquitoqui no habilitado para este usuario."}
+        return {"ok": False, "success": False, "msg": "Usuario emisor no encontrado."}
     cur.execute("""
         INSERT INTO boquitoqui_mensajes
             (sucursal, usuario_emisor, destinatario, grupo, audio_mime, audio_base64, duracion_ms)
@@ -1792,7 +1791,6 @@ def enviar_boquitoqui_live(data: BoquitoquiMensaje):
             SELECT usuario
             FROM usuarios
             WHERE lower(usuario)=lower(%s)
-              AND COALESCE(boquitoqui_enabled,FALSE)=TRUE
             LIMIT 1
         """, (destinatario,))
         row = cur.fetchone()
@@ -1802,8 +1800,7 @@ def enviar_boquitoqui_live(data: BoquitoquiMensaje):
         cur.execute("""
             SELECT usuario
             FROM usuarios
-            WHERE COALESCE(boquitoqui_enabled,FALSE)=TRUE
-              AND lower(usuario)<>lower(%s)
+            WHERE lower(usuario)<>lower(%s)
               AND lower(COALESCE(sucursal,%s))=lower(%s)
             LIMIT 50
         """, (usuario, sucursal, sucursal))
