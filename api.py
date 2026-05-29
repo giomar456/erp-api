@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 from decimal import Decimal
@@ -30,7 +32,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LIMA_TZ = ZoneInfo("America/Lima") if ZoneInfo else None
+WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
+if os.path.isdir(WEBAPP_DIR):
+    assets_dir = os.path.join(WEBAPP_DIR, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/erp/assets", StaticFiles(directory=assets_dir), name="erp_assets")
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="root_assets")
+    sounds_dir = os.path.join(WEBAPP_DIR, "sounds")
+    if os.path.isdir(sounds_dir):
+        app.mount("/erp/sounds", StaticFiles(directory=sounds_dir), name="erp_sounds")
+        app.mount("/sounds", StaticFiles(directory=sounds_dir), name="root_sounds")
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "success": True,
+        "app": "G&G ERP API",
+        "web_url": "/erp/" if os.path.isdir(WEBAPP_DIR) else "",
+    }
+
+
+@app.get("/erp")
+@app.get("/erp/")
+def erp_web_index():
+    index_path = os.path.join(WEBAPP_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"ok": False, "success": False, "msg": "ERP web no publicado en este deploy."}
+
+
+@app.get("/favicon.svg")
+def erp_favicon():
+    target = os.path.join(WEBAPP_DIR, "favicon.svg")
+    return FileResponse(target) if os.path.exists(target) else {"ok": False}
+
+
+@app.get("/icons.svg")
+def erp_icons():
+    target = os.path.join(WEBAPP_DIR, "icons.svg")
+    return FileResponse(target) if os.path.exists(target) else {"ok": False}
+
+
+@app.get("/app-logo.png")
+def erp_app_logo():
+    target = os.path.join(WEBAPP_DIR, "app-logo.png")
+    return FileResponse(target) if os.path.exists(target) else {"ok": False}
+
+
+@app.get("/army-logo-doc.png")
+def erp_army_logo():
+    target = os.path.join(WEBAPP_DIR, "army-logo-doc.png")
+    return FileResponse(target) if os.path.exists(target) else {"ok": False}
+
+
+@app.get("/erp/{path:path}")
+def erp_web_path(path: str):
+    index_path = os.path.join(WEBAPP_DIR, "index.html")
+    target = os.path.abspath(os.path.join(WEBAPP_DIR, path or "index.html"))
+    if target.startswith(WEBAPP_DIR) and os.path.isfile(target):
+        return FileResponse(target)
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"ok": False, "success": False, "msg": "ERP web no publicado en este deploy."}
+
+try:
+    LIMA_TZ = ZoneInfo("America/Lima") if ZoneInfo else None
+except Exception:
+    LIMA_TZ = None
 
 
 def lima_now():
@@ -305,7 +375,15 @@ TEST_PRODUCT_MARKERS = ("PRUEBA", "RANDOM", "GENERICO", "GENÉRICO", "COTIZACION
 
 def split_series_text(value):
     raw = re.split(r"[,;\n\r|]+", str(value or ""))
-    return [s.strip().upper() for s in raw if s and s.strip()]
+    cleaned = []
+    for item in raw:
+        serie = str(item or "").strip()
+        if not serie:
+            continue
+        serie = re.sub(r"^(s\s*/?\s*n|sn|serie)\s*[:\-]?\s*", "", serie, flags=re.I).strip()
+        if serie:
+            cleaned.append(serie.upper())
+    return cleaned
 
 
 def is_test_product_name(*values):
@@ -672,6 +750,18 @@ class SerieProducto(BaseModel):
     almacen: str = "TIENDA"
     fecha_ingreso: str = ""
     fecha_salida: Optional[str] = None
+    usuario_ingreso: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
+class DocumentoManualSeries(BaseModel):
+    tipo: str = "BOLETA"
+    numero: str = ""
+    cliente_nombre: str = "CLIENTE MANUAL"
+    fecha_emision: str = ""
+    series_texto: str = ""
+    usuario_emisor: str = ""
+    observacion: str = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -982,6 +1072,8 @@ def migrate_schema():
         """)
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS inventario_conteos (
@@ -1209,10 +1301,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.48"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.48/erp_sql_pro_v20_v1.0.48.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.48.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.48: corrige Radio/Boquitoqui, usuarios online y evita guardar audios en servidor."
+    latest_version = "1.0.49"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.49/erp_sql_pro_v20_v1.0.49.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.49.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.49: acceso web /erp, series multiples con usuario/fecha, boleta manual por series y foto editable."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1226,12 +1318,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.46")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.47")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.46_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.47_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.46_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.46: Radio visible en DeX, usuarios online corregidos y audio temporal sin guardar en servidor.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.47_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.47: series multiples, auditoria de ingreso, boleta manual por series y foto editable.")
     return {
         "ok": True,
         "success": True,
@@ -2030,6 +2122,8 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
     texto = f"%{(q or '').lower()}%"
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     cur.execute("""
     SELECT
         ps.id,
@@ -2041,8 +2135,10 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
         ps.proveedor,
         ps.estado,
         COALESCE(ps.almacen, 'TIENDA') AS almacen,
+        COALESCE(ps.usuario_ingreso, '') AS usuario_ingreso,
         ps.fecha_ingreso,
-        ps.fecha_salida
+        ps.fecha_salida,
+        ps.creado_en
     FROM producto_series ps
     LEFT JOIN productos p ON p.id = ps.producto_id AND COALESCE(p.sucursal,%s)=%s
     WHERE COALESCE(ps.sucursal,%s)=%s
@@ -2067,7 +2163,7 @@ def guardar_serie_producto(data: SerieProducto):
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(data.sucursal)
-        serie = (data.serie or "").strip()
+        serie = (split_series_text(data.serie) or [""])[0]
         almacen = (data.almacen or "TIENDA").strip().upper()
         if not serie:
             conn.close()
@@ -2080,25 +2176,33 @@ def guardar_serie_producto(data: SerieProducto):
             return {"ok": False, "msg": "Producto no encontrado"}
 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
-        cur.execute("""
-        INSERT INTO producto_series (
-            producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (serie)
-        DO UPDATE SET producto_id=EXCLUDED.producto_id,
-                      proveedor=EXCLUDED.proveedor,
-                      estado=EXCLUDED.estado,
-                      almacen=EXCLUDED.almacen,
-                      fecha_ingreso=EXCLUDED.fecha_ingreso,
-                      fecha_salida=EXCLUDED.fecha_salida,
-                      sucursal=EXCLUDED.sucursal
-        RETURNING id
-        """, (
-            data.producto_id, serie, data.proveedor, data.estado, almacen,
-            data.fecha_ingreso, data.fecha_salida, sucursal
-        ))
-        serie_id = cur.fetchone()[0]
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        serie_ids = []
+        for serie in series:
+            cur.execute("""
+            INSERT INTO producto_series (
+                producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal, usuario_ingreso
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (serie)
+            DO UPDATE SET producto_id=EXCLUDED.producto_id,
+                          proveedor=EXCLUDED.proveedor,
+                          estado=EXCLUDED.estado,
+                          almacen=EXCLUDED.almacen,
+                          fecha_ingreso=EXCLUDED.fecha_ingreso,
+                          fecha_salida=EXCLUDED.fecha_salida,
+                          sucursal=EXCLUDED.sucursal,
+                          usuario_ingreso=CASE
+                              WHEN COALESCE(EXCLUDED.usuario_ingreso,'')<>'' THEN EXCLUDED.usuario_ingreso
+                              ELSE producto_series.usuario_ingreso
+                          END
+            RETURNING id
+            """, (
+                data.producto_id, serie, data.proveedor, data.estado, almacen,
+                data.fecha_ingreso or lima_today_iso(), data.fecha_salida, sucursal, data.usuario_ingreso or ""
+            ))
+            serie_ids.append(cur.fetchone()[0])
 
         estado_serie = (data.estado or "").upper()
         if estado_serie == "AGOTADO":
@@ -2132,9 +2236,9 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(data.sucursal or sucursal)
-        serie = (data.serie or "").strip()
+        series = split_series_text(data.serie)
         almacen = (data.almacen or "TIENDA").strip().upper()
-        if not serie:
+        if not series:
             conn.close()
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
@@ -2154,6 +2258,8 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
             return {"ok": False, "msg": "Producto no encontrado"}
 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         cur.execute("""
         UPDATE producto_series
         SET producto_id=%s,
@@ -2163,12 +2269,14 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
             almacen=%s,
             fecha_ingreso=%s,
             fecha_salida=%s,
+            usuario_ingreso=CASE WHEN %s<>'' THEN %s ELSE COALESCE(usuario_ingreso,'') END,
             sucursal=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
             data.producto_id, serie, data.proveedor, data.estado, almacen,
-            data.fecha_ingreso, data.fecha_salida, sucursal,
+            data.fecha_ingreso or lima_today_iso(), data.fecha_salida,
+            data.usuario_ingreso or "", data.usuario_ingreso or "", sucursal,
             serie_id, DEFAULT_SUCURSAL, sucursal
         ))
         row = cur.fetchone()
@@ -2196,7 +2304,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
 
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": serie_id}
+        return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -2835,6 +2943,136 @@ def crear_venta(data: Venta):
 @app.post("/documentos/emitir")
 def emitir_documento(data: Venta):
     return crear_venta(data)
+
+
+@app.post("/documentos/manual-series")
+def crear_documento_manual_series(data: DocumentoManualSeries):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.sucursal)
+        doc_tipo = (data.tipo or "BOLETA").strip().upper()
+        if doc_tipo not in STOCK_DOC_TYPES:
+            doc_tipo = "BOLETA"
+        series = split_series_text(data.series_texto)
+        if not series:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Ingresa una o mas series para descontar stock."}
+        if len(series) != len(set(series)):
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Hay series repetidas en la boleta manual."}
+
+        numero = (data.numero or "").strip().upper()
+        if not numero:
+            numero = f"MANUAL-{lima_now().strftime('%Y%m%d%H%M%S')}"
+        cur.execute("""
+        SELECT id FROM ventas
+        WHERE UPPER(COALESCE(tipo,''))=%s
+          AND UPPER(COALESCE(numero,''))=%s
+          AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+        """, (doc_tipo, numero, DEFAULT_SUCURSAL, sucursal))
+        if cur.fetchone():
+            conn.close()
+            return {"ok": False, "success": False, "msg": f"{doc_tipo} {numero} ya existe."}
+
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+        cur.execute("""
+        SELECT ps.id AS serie_id,
+               UPPER(ps.serie) AS serie,
+               ps.producto_id,
+               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
+               COALESCE(p.nombre,'') AS producto_nombre,
+               COALESCE(p.marca,'') AS marca,
+               COALESCE(p.modelo,'') AS modelo,
+               COALESCE(p.precio_venta,0) AS precio_venta
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND UPPER(ps.serie)=ANY(%s)
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, series))
+        found = {str(r.get("serie") or "").upper(): r for r in dict_fetchall(cur)}
+        faltantes = [serie for serie in series if serie not in found]
+        bloqueadas = [f"{serie} ({found[serie].get('estado')})" for serie in series if serie in found and found[serie].get("estado") not in ("DISPONIBLE", "RESERVADO")]
+        if faltantes or bloqueadas:
+            conn.close()
+            msg = []
+            if faltantes:
+                msg.append("Series no registradas: " + ", ".join(faltantes))
+            if bloqueadas:
+                msg.append("Series no disponibles: " + ", ".join(bloqueadas))
+            return {"ok": False, "success": False, "msg": " | ".join(msg), "faltantes": faltantes, "bloqueadas": bloqueadas}
+
+        fecha_emision = parse_fecha_emision(data.fecha_emision)
+        cliente = (data.cliente_nombre or "CLIENTE MANUAL").strip() or "CLIENTE MANUAL"
+        total = round(sum(float(found[s].get("precio_venta") or 0) for s in series), 2)
+        cur.execute("""
+        INSERT INTO ventas (
+            fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
+            subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor,
+            estado, estado_pago, metodo_pago, sucursal
+        )
+        VALUES (%s,%s,%s,%s,'','',%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s)
+        RETURNING id
+        """, (
+            fecha_emision, doc_tipo, numero, cliente, total, total,
+            data.observacion or "Boleta manual ingresada por series",
+            fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal
+        ))
+        venta_id = cur.fetchone()[0]
+
+        touched_products = set()
+        for serie in series:
+            row = found[serie]
+            producto_id = row.get("producto_id")
+            precio = float(row.get("precio_venta") or 0)
+            cur.execute("""
+            INSERT INTO ventas_detalle (
+                venta_id, producto_id, descripcion, marca, modelo,
+                series_texto, cantidad, precio, total, sucursal
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,%s)
+            """, (
+                venta_id, producto_id, row.get("producto_nombre") or "PRODUCTO POR SERIE",
+                row.get("marca") or "", row.get("modelo") or "", serie, precio, precio, sucursal
+            ))
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+            WHERE id=%s
+            """, (row.get("serie_id"),))
+            if producto_id:
+                touched_products.add(producto_id)
+        for producto_id in touched_products:
+            sync_producto_stock_from_series(cur, producto_id, sucursal)
+
+        cur.execute("""
+        INSERT INTO caja_movimientos (
+            fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
+        )
+        VALUES (%s,'INGRESO',%s,%s,%s,%s,%s,'PAGADO','MANUAL',%s)
+        """, (
+            fecha_emision, f"{doc_tipo} {numero} - {cliente}",
+            total, data.usuario_emisor or "", doc_tipo, numero, sucursal
+        ))
+
+        conn.commit()
+        conn.close()
+        return {
+            "ok": True,
+            "success": True,
+            "id": venta_id,
+            "tipo": doc_tipo,
+            "numero": numero,
+            "series": series,
+            "total": total,
+        }
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
 
 
 @app.post("/proformas")
@@ -3634,6 +3872,8 @@ def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     cur.execute("""
     SELECT
         ps.id,
@@ -3645,8 +3885,10 @@ def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         ps.proveedor,
         ps.estado,
         COALESCE(ps.almacen, 'TIENDA') AS almacen,
+        COALESCE(ps.usuario_ingreso, '') AS usuario_ingreso,
         ps.fecha_ingreso,
-        ps.fecha_salida
+        ps.fecha_salida,
+        ps.creado_en
     FROM producto_series ps
     LEFT JOIN productos p ON p.id = ps.producto_id AND COALESCE(p.sucursal,%s)=%s
     WHERE ps.producto_id=%s AND COALESCE(ps.sucursal,%s)=%s
