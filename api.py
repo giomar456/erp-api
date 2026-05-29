@@ -891,6 +891,7 @@ def migrate_schema():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_sucursal_id ON boquitoqui_mensajes (sucursal, id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_destinatario ON boquitoqui_mensajes (sucursal, destinatario)")
+        cur.execute("DELETE FROM boquitoqui_mensajes")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS usuarios_online (
             usuario TEXT PRIMARY KEY,
