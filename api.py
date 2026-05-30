@@ -2337,10 +2337,16 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
         """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": serie_id}
+        return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
     except Exception as e:
-        conn.rollback()
-        conn.close()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
         return {"ok": False, "msg": str(e)}
 
 
