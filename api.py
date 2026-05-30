@@ -1301,10 +1301,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.52"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.52/erp_sql_pro_v20_v1.0.52.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.52.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.52: agrega acceso ERP Moderno en PC con la misma interfaz Android/DeX."
+    latest_version = "1.0.53"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.53/erp_sql_pro_v20_v1.0.53.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.53.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.53: corrige guardado/edicion de series, panel con ventas diarias y ERP Moderno en visor interno."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -4498,7 +4498,15 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
           AND fecha >= date_trunc('month', (timezone('America/Lima', now()))::date)
           AND COALESCE(sucursal,%s)=%s
     """, (DEFAULT_SUCURSAL, sucursal))
-    total_ventas = float(cur.fetchone()[0] or 0)
+    total_ventas_mes = float(cur.fetchone()[0] or 0)
+    cur.execute(f"""
+        SELECT COALESCE(SUM(total),0)
+        FROM ventas
+        WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND fecha::date = (timezone('America/Lima', now()))::date
+          AND COALESCE(sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, sucursal))
+    total_ventas_hoy = float(cur.fetchone()[0] or 0)
     try:
         cur.execute(f"""
         SELECT COALESCE(SUM(
@@ -4515,9 +4523,28 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
           AND fecha >= date_trunc('month', (timezone('America/Lima', now()))::date)
           AND COALESCE(sucursal,%s)=%s
         """, (DEFAULT_SUCURSAL, sucursal))
-        saldo_caja = float(cur.fetchone()[0] or 0)
+        saldo_caja_mes = float(cur.fetchone()[0] or 0)
     except Exception:
-        saldo_caja = total_ventas
+        saldo_caja_mes = total_ventas_mes
+    try:
+        cur.execute(f"""
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN COALESCE(estado_pago,'PAGADO')='PAGADO'
+                    THEN COALESCE(NULLIF(monto_pagado,0), total, 0)
+                WHEN COALESCE(monto_pagado,0) > 0
+                    THEN monto_pagado
+                ELSE 0
+            END
+        ),0)
+        FROM ventas
+        WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+          AND fecha::date = (timezone('America/Lima', now()))::date
+          AND COALESCE(sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, sucursal))
+        saldo_caja_hoy = float(cur.fetchone()[0] or 0)
+    except Exception:
+        saldo_caja_hoy = total_ventas_hoy
 
     cur.execute(f"""
         SELECT to_char(fecha::date, 'YYYY-MM-DD') AS dia, COALESCE(SUM(total), 0) AS total
@@ -4557,7 +4584,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         FROM ventas
         WHERE COALESCE(estado_pago,'PAGADO')='PAGADO'
           AND UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
-          AND fecha >= date_trunc('month', (timezone('America/Lima', now()))::date)
+          AND fecha::date = (timezone('America/Lima', now()))::date
           AND COALESCE(sucursal,%s)=%s
         GROUP BY COALESCE(NULLIF(metodo_pago,''),'SIN METODO')
         ORDER BY total DESC
@@ -4616,8 +4643,12 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         "productos": productos,
         "documentos": documentos,
         "compras": 0,
-        "total_ventas": total_ventas,
-        "saldo_caja": saldo_caja,
+        "total_ventas": total_ventas_hoy,
+        "total_ventas_hoy": total_ventas_hoy,
+        "total_ventas_mes": total_ventas_mes,
+        "saldo_caja": saldo_caja_hoy,
+        "saldo_caja_hoy": saldo_caja_hoy,
+        "saldo_caja_mes": saldo_caja_mes,
         "ventas_por_dia": ventas_por_dia,
         "recientes": recientes,
         "metodos_pago": metodos_pago,
