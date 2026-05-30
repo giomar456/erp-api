@@ -2223,10 +2223,16 @@ def guardar_serie_producto(data: SerieProducto):
 
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": serie_id}
+        return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
     except Exception as e:
-        conn.rollback()
-        conn.close()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
         return {"ok": False, "msg": str(e)}
 
 
@@ -2260,6 +2266,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        serie = series[0]
         cur.execute("""
         UPDATE producto_series
         SET producto_id=%s,
@@ -2304,10 +2311,16 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
 
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
+        return {"ok": True, "success": True, "id": serie_id, "series_guardadas": [serie]}
     except Exception as e:
-        conn.rollback()
-        conn.close()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
         return {"ok": False, "msg": str(e)}
 
 
@@ -2337,7 +2350,7 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
         """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
+        return {"ok": True, "success": True, "id": serie_id}
     except Exception as e:
         try:
             conn.rollback()
