@@ -2163,9 +2163,9 @@ def guardar_serie_producto(data: SerieProducto):
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(data.sucursal)
-        serie = (split_series_text(data.serie) or [""])[0]
+        series = split_series_text(data.serie)
         almacen = (data.almacen or "TIENDA").strip().upper()
-        if not serie:
+        if not series:
             conn.close()
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
