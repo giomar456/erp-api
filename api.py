@@ -1301,10 +1301,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.56"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.56/erp_sql_pro_v20_v1.0.56.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.56.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.56: restaura el formato clasico de documentos y mantiene ventas PC con interfaz tipo Android."
+    latest_version = "1.0.57"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.57/erp_sql_pro_v20_v1.0.57.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.57.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.57: documento estilo original PC, cuentas por cobrar, rastreador de series y pestanas de cotizacion."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -4622,6 +4622,38 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
           AND COALESCE(sucursal,%s)=%s
     """, (DEFAULT_SUCURSAL, sucursal))
     facturas_cobrar = int(cur.fetchone()[0] or 0)
+    try:
+        cur.execute(f"""
+            SELECT id, tipo, numero, COALESCE(cliente,''), COALESCE(total,0),
+                   COALESCE(monto_pagado,0), COALESCE(estado_pago,'DEUDA'),
+                   to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha
+            FROM ventas
+            WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA')
+              AND UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
+              AND COALESCE(total,0) > COALESCE(monto_pagado,0)
+              AND COALESCE(sucursal,%s)=%s
+            ORDER BY fecha DESC, id DESC
+            LIMIT 12
+        """, (DEFAULT_SUCURSAL, sucursal))
+        cuentas_cobrar = [
+            {
+                "id": r[0],
+                "tipo": r[1],
+                "numero": r[2],
+                "cliente": r[3],
+                "total": float(r[4] or 0),
+                "pagado": float(r[5] or 0),
+                "saldo": max(0.0, float(r[4] or 0) - float(r[5] or 0)),
+                "estado_pago": r[6],
+                "fecha": r[7],
+            }
+            for r in cur.fetchall()
+        ]
+        total_cuentas_cobrar = round(sum(float(row.get("saldo") or 0) for row in cuentas_cobrar), 2)
+    except Exception:
+        conn.rollback()
+        cuentas_cobrar = []
+        total_cuentas_cobrar = 0.0
     cur.execute("""
         SELECT COUNT(*) FROM ventas
         WHERE COALESCE(sunat_estado,'PENDIENTE') IN ('PENDIENTE','PROCESO')
@@ -4655,6 +4687,8 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         "productos_bajos": productos_bajos,
         "stock_bajo": stock_bajo,
         "facturas_cobrar": facturas_cobrar,
+        "cuentas_cobrar": cuentas_cobrar,
+        "total_cuentas_cobrar": total_cuentas_cobrar,
         "documentos_pendientes": documentos_pendientes,
         "compras_pendientes": compras_pendientes,
         "clientes_hoy": clientes_hoy,
