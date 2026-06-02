@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
@@ -22,6 +22,8 @@ import re
 import urllib.parse
 import urllib.request
 import urllib.error
+import io
+import tempfile
 
 app = FastAPI()
 app.add_middleware(
@@ -1301,10 +1303,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.59"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.59/erp_sql_pro_v20_v1.0.59.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.59.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.59: descarga de documentos con respaldo, numeros editables de impresion, rastreador de series y salida manual Android."
+    latest_version = "1.0.60"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.60/erp_sql_pro_v20_v1.0.60.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.60.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.60: restaura formato original PC y descarga PDF real del servidor."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1318,12 +1320,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.49")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.50")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.49_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.50_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.49_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.49: descarga de documentos, rastreador de series, numeros editables y salida manual por series.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.50_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.50: formato original PC y descarga/compartir PDF real.")
     return {
         "ok": True,
         "success": True,
@@ -1888,29 +1890,7 @@ def listar_auditoria(q: str = "", limit: int = 1000):
 # ================= CONFIGURACION CENTRAL =================
 @app.get("/config/documento")
 def obtener_config_documento(sucursal: str = DEFAULT_SUCURSAL):
-    conn = get_conn()
-    cur = conn.cursor()
-    clave = f"documento:{norm_sucursal(sucursal)}"
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS app_config (
-        clave TEXT PRIMARY KEY,
-        valor TEXT,
-        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    cur.execute("SELECT valor FROM app_config WHERE clave=%s", (clave,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("SELECT valor FROM app_config WHERE clave=%s", ("documento",))
-        row = cur.fetchone()
-    conn.commit()
-    conn.close()
-    if not row or not row[0]:
-        return {"ok": True, "success": True, "data": {}}
-    try:
-        return {"ok": True, "success": True, "data": json.loads(row[0])}
-    except Exception:
-        return {"ok": True, "success": True, "data": {}}
+    return {"ok": True, "success": True, "data": cargar_config_documento_dict(sucursal)}
 
 
 @app.post("/config/documento")
@@ -1935,6 +1915,313 @@ def guardar_config_documento(data: dict):
     conn.commit()
     conn.close()
     return {"ok": True, "success": True}
+
+
+def documento_config_default():
+    return {
+        "empresa": "CORPORACION COMPUTER ARMY EIRL",
+        "company_name": "CORPORACION COMPUTER ARMY EIRL",
+        "ruc": "20611068701",
+        "direccion": "PRINCIPAL >> AV. INCA GARCILASO DE LA VEGA NRO. 1348 INT2B 130-131 - CERCADO DE LIMA - LIMA - PERU",
+        "address": "PRINCIPAL >> AV. INCA GARCILASO DE LA VEGA NRO. 1348 INT2B 130-131 - CERCADO DE LIMA - LIMA - PERU",
+        "telefono": "903039171",
+        "mensaje": "MEJORES PRECIOS EN TARJETAS DE VIDEOS",
+        "cuenta_bcp": "1941066028058",
+        "cuenta_interbank": "2003005323345",
+        "logo": "",
+        "doc_editor": {
+            "template_name": "Formato original PC",
+            "show_logo": True,
+            "show_serie": True,
+            "show_banks": True,
+            "texts": {
+                "garantia_1": "UN ANO DE GARANTIA DE CADA PRODUCTO Y 6 MESES PARA PERIFERICOS",
+                "garantia_2": "NO SE ACEPTAN CAMBIOS NI DEVOLUCIONES. SOLO DEFECTO DE FABRICA",
+                "garantia_3": "CONSERVAR CAJAS Y ACCESORIOS DE CADA PRODUCTO",
+                "garantia_4": "NO HAY GARANTIA por software, dano fisico, roto, quemado, sulfatado, presencia de oxido o presencia de sulfato",
+                "garantia_5": "ENSAMBLAJE PROFESIONAL Y INSTALACION DE SISTEMA OPERATIVO WINDOWS, PAQUETE DE OFFICE GRATIS",
+                "garantia_6": "POR PC COMPLETA",
+            },
+            "layout": {
+                "max_productos": 12,
+                "alto_fila_mm": 8.0,
+                "alto_tabla_mm": 100,
+                "letra_tabla_px": 7,
+                "letra_descripcion_px": 7,
+                "logo_ancho_mm": 24,
+                "logo_alto_mm": 18,
+                "logo_bajar_mm": 15,
+                "margen_superior_mm": 7,
+            },
+        },
+    }
+
+
+def cargar_config_documento_dict(sucursal=DEFAULT_SUCURSAL):
+    base = documento_config_default()
+    conn = get_conn()
+    cur = conn.cursor()
+    clave = f"documento:{norm_sucursal(sucursal)}"
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS app_config (
+        clave TEXT PRIMARY KEY,
+        valor TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("SELECT valor FROM app_config WHERE clave=%s", (clave,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("SELECT valor FROM app_config WHERE clave=%s", ("documento",))
+        row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if row and row[0]:
+        try:
+            saved = json.loads(row[0])
+            if isinstance(saved, dict):
+                base.update(saved)
+                doc_saved = saved.get("doc_editor") if isinstance(saved.get("doc_editor"), dict) else {}
+                base["doc_editor"] = {**documento_config_default()["doc_editor"], **doc_saved}
+                layout = {}
+                layout.update(documento_config_default()["doc_editor"]["layout"])
+                if isinstance(doc_saved.get("layout"), dict):
+                    layout.update(doc_saved.get("layout"))
+                base["doc_editor"]["layout"] = layout
+                texts = {}
+                texts.update(documento_config_default()["doc_editor"]["texts"])
+                if isinstance(doc_saved.get("texts"), dict):
+                    texts.update(doc_saved.get("texts"))
+                base["doc_editor"]["texts"] = texts
+        except Exception:
+            pass
+    return base
+
+
+def _pdf_text_lines(canvas_obj, text, max_width, font_name, font_size, max_lines=2):
+    words = str(text or "").replace("\n", " ").split()
+    lines = []
+    current = ""
+    for word in words:
+        test = f"{current} {word}".strip()
+        if canvas_obj.stringWidth(test, font_name, font_size) <= max_width or not current:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines:
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    return lines or [""]
+
+
+def _pdf_money(value):
+    try:
+        return f"{float(value or 0):.2f}"
+    except Exception:
+        return "0.00"
+
+
+def _pdf_words_soles(value):
+    try:
+        total = float(value or 0)
+    except Exception:
+        total = 0
+    unidades = ["", "UNO", "DOS", "TRES", "CUATRO", "CINCO", "SEIS", "SIETE", "OCHO", "NUEVE"]
+    decenas = {10: "DIEZ", 11: "ONCE", 12: "DOCE", 13: "TRECE", 14: "CATORCE", 15: "QUINCE", 20: "VEINTE", 30: "TREINTA", 40: "CUARENTA", 50: "CINCUENTA", 60: "SESENTA", 70: "SETENTA", 80: "OCHENTA", 90: "NOVENTA"}
+    centenas = ["", "CIENTO", "DOSCIENTOS", "TRESCIENTOS", "CUATROCIENTOS", "QUINIENTOS", "SEISCIENTOS", "SETECIENTOS", "OCHOCIENTOS", "NOVECIENTOS"]
+    def n99(n):
+        if n < 10:
+            return unidades[n]
+        if n in decenas:
+            return decenas[n]
+        if n < 20:
+            return "DIECI" + unidades[n - 10]
+        if n < 30:
+            return "VEINTI" + unidades[n - 20]
+        d = (n // 10) * 10
+        u = n % 10
+        return decenas[d] + (f" Y {unidades[u]}" if u else "")
+    def n999(n):
+        if n == 100:
+            return "CIEN"
+        if n < 100:
+            return n99(n)
+        return centenas[n // 100] + (f" {n99(n % 100)}" if n % 100 else "")
+    entero = int(total)
+    cent = int(round((total - entero) * 100))
+    if entero == 0:
+        words = "CERO"
+    elif entero < 1000:
+        words = n999(entero)
+    elif entero < 1000000:
+        miles = entero // 1000
+        resto = entero % 1000
+        words = "MIL" if miles == 1 else f"{n999(miles)} MIL"
+        if resto:
+            words += f" {n999(resto)}"
+    else:
+        words = str(entero)
+    return f"SON {words} Y {cent:02d}/100 SOLES"
+
+
+def _draw_pdf_logo(c, cfg, x, y, w, h, mm_unit, page_h):
+    try:
+        from reportlab.lib.utils import ImageReader
+        logo = str(cfg.get("logo") or cfg.get("document_logo") or "").strip()
+        if not logo:
+            candidate = os.path.join(WEBAPP_DIR, "army-logo-doc.png")
+            logo = candidate if os.path.exists(candidate) else ""
+        if not logo:
+            return
+        if logo.startswith("data:image") and "," in logo:
+            raw = base64.b64decode(logo.split(",", 1)[1])
+            image = ImageReader(io.BytesIO(raw))
+        elif logo.startswith(("http://", "https://")):
+            with urllib.request.urlopen(logo, timeout=8) as resp:
+                image = ImageReader(io.BytesIO(resp.read()))
+        elif os.path.exists(logo):
+            image = logo
+        else:
+            return
+        c.drawImage(image, x * mm_unit, page_h - ((y + h) * mm_unit), width=w * mm_unit, height=h * mm_unit, preserveAspectRatio=True, mask="auto")
+    except Exception:
+        pass
+
+
+def generar_pdf_documento_original(documento, detalle, cfg):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    def X(v): return v * mm
+    def Y(v): return page_h - (v * mm)
+    def font(name="Helvetica", size=8): c.setFont(name, size)
+    def txt(x, y, text, size=8, bold=False): font("Helvetica-Bold" if bold else "Helvetica", size); c.drawString(X(x), Y(y), str(text or ""))
+    def txt_r(x, y, text, size=8, bold=False): font("Helvetica-Bold" if bold else "Helvetica", size); c.drawRightString(X(x), Y(y), str(text or ""))
+    def txt_c(x, y, text, size=8, bold=False): font("Helvetica-Bold" if bold else "Helvetica", size); c.drawCentredString(X(x), Y(y), str(text or ""))
+    def rect(x, y, w, h): c.rect(X(x), Y(y + h), X(w), X(h), fill=0, stroke=1)
+    def line(x1, y1, x2, y2): c.line(X(x1), Y(y1), X(x2), Y(y2))
+
+    doc_type = str(documento.get("tipo") or "DOCUMENTO").upper()
+    numero = str(documento.get("numero") or "")
+    title = {"BOLETA": "BOLETA DE VENTA\nELECTRONICA", "FACTURA": "FACTURA\nELECTRONICA", "PROFORMA": "PROFORMA", "PASE": "PASE"}.get(doc_type, doc_type)
+    editor = cfg.get("doc_editor") if isinstance(cfg.get("doc_editor"), dict) else {}
+    layout = editor.get("layout") if isinstance(editor.get("layout"), dict) else {}
+    max_rows = max(1, min(int(float(layout.get("max_productos", 12) or 12)), 24))
+
+    _draw_pdf_logo(c, cfg, 14, 21, float(layout.get("logo_ancho_mm", 24) or 24), float(layout.get("logo_alto_mm", 18) or 18), mm, page_h)
+    empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
+    direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper()
+    telefono = str(cfg.get("telefono") or "")
+    slogan = str(cfg.get("mensaje") or "MEJORES PRECIOS EN TARJETAS DE VIDEOS").upper()
+    for i, ln in enumerate(_pdf_text_lines(c, empresa, X(80), "Helvetica-Bold", 14, 2)):
+        txt(43, 10 + i * 5.5, ln, 14, True)
+    for i, ln in enumerate(_pdf_text_lines(c, direccion, X(105), "Helvetica", 7, 4)):
+        txt(43, 28 + i * 4, ln, 7)
+    if telefono:
+        txt(43, 43, telefono, 7)
+    txt(43, 51, slogan, 7)
+
+    rect(130, 6, 74, 39)
+    txt_c(167, 20, f"RUC {cfg.get('ruc') or '20611068701'}", 10)
+    for i, ln in enumerate(title.split("\n")):
+        txt_c(167, 30 + i * 6, ln, 14, True)
+    txt_c(167, 44, numero, 11)
+
+    fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date()).slice(0, 10) if False else str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
+    venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
+    client_y = 62
+    txt(5.5, client_y, "DOCUMENTO", 7, True); txt(33, client_y, documento.get("documento_cliente") or "", 7)
+    txt(5.5, client_y + 6, "CLIENTE", 7, True); txt(33, client_y + 6, str(documento.get("cliente_nombre") or "USUARIO X").upper()[:80], 7)
+    txt(5.5, client_y + 12, "DIRECCION", 7, True); txt(33, client_y + 12, str(documento.get("direccion_cliente") or "SIN DIRECCION").upper()[:90], 7)
+    txt(136, client_y, "FECHA EMISION", 7, True); txt(174, client_y, fecha, 7)
+    txt(136, client_y + 6, "FECHA VENCIMIENTO", 7, True); txt(174, client_y + 6, venc, 7)
+    txt(136, client_y + 12, "MONEDA", 7, True); txt(174, client_y + 12, "SOLES", 7)
+
+    tx, ty, tw, th = 5.5, 77, 198.5, 100
+    rect(tx, ty, tw, th)
+    c.setFillGray(0); c.rect(X(tx), Y(ty + 6), X(tw), X(6), fill=1, stroke=0); c.setFillGray(1)
+    cols = [tx, tx + 8, tx + 27, tx + 55, tx + 134, tx + 156, tx + 177, tx + tw]
+    headers = ["Nro", "UNIDAD", "CODIGO", "DESCRIPCION", "CANT.", "TOTAL", "P. UNIT."]
+    centers = [(cols[i] + cols[i+1]) / 2 for i in range(len(cols)-1)]
+    for idx, h in enumerate(headers):
+        txt_c(centers[idx], ty + 4.2, h, 7, True)
+    c.setFillGray(0)
+    for cx in cols[1:-1]:
+        line(cx, ty, cx, ty + th)
+
+    row_y = ty + 11
+    row_h = max(5.8, min(8.2, (th - 12) / max_rows))
+    for idx, item in enumerate((detalle or [])[:max_rows], start=1):
+        qty = float(item.get("cantidad") or 0)
+        price = float(item.get("precio_unitario") or item.get("precio") or 0)
+        total = float(item.get("total") or qty * price)
+        desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
+        code = str(item.get("codigo") or item.get("producto_id") or item.get("id") or "")
+        series = str(item.get("series_texto") or item.get("serie") or "").strip()
+        txt_c(centers[0], row_y, idx, 7)
+        txt_c(centers[1], row_y, "UNIDADES", 6)
+        txt_c(centers[2], row_y, code[:12], 6)
+        desc_lines = _pdf_text_lines(c, desc, X(76), "Helvetica-Bold", 6.6, 2)
+        for j, ln in enumerate(desc_lines):
+            txt(cols[3] + 2, row_y + j * 2.7, ln, 6.6, True)
+        if series:
+            txt(cols[3] + 2, row_y + len(desc_lines) * 2.7, "S/N: " + series[:70], 5.2)
+        txt_r(cols[5] - 2, row_y, f"{qty:.2f}", 7)
+        txt_r(cols[6] - 2, row_y, _pdf_money(total), 7)
+        txt_r(cols[7] - 2, row_y, _pdf_money(price), 7)
+        row_y += row_h
+
+    total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle or []))
+    igv_doc = float(documento.get("igv") or round(total_doc - (total_doc / 1.18), 2))
+    subtotal_doc = float(documento.get("subtotal") or round(total_doc - igv_doc, 2))
+    line(tx, ty + th, tx + tw, ty + th)
+    txt_c(tx + tw / 2, ty + th + 5, _pdf_words_soles(total_doc), 7)
+    line(tx, ty + th + 8, tx + tw, ty + th + 8)
+
+    info_y = 190
+    txt(5.5, info_y, "USUARIO", 7, True); txt(58, info_y, f"{documento.get('usuario_emisor') or ''} - {fecha}", 7)
+    txt(5.5, info_y + 6, "CONDICION DE PAGO", 7, True); txt(58, info_y + 6, documento.get("estado_pago") or "CONTADO", 7)
+    txt(5.5, info_y + 12, "CUENTAS BANCARIAS", 7, True)
+    txt(58, info_y + 12, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 7)
+    txt(58, info_y + 16, "Titular:Computer Army Eirl", 7)
+    txt(58, info_y + 24, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 7)
+    txt(58, info_y + 28, "Titular: Computer Army eirl", 7)
+
+    totals_x, totals_y = 133, 188
+    rect(totals_x, totals_y, 71, 22)
+    line(totals_x, totals_y + 7, totals_x + 71, totals_y + 7)
+    line(totals_x, totals_y + 14, totals_x + 71, totals_y + 14)
+    txt(totals_x + 3, totals_y + 4, "GRAVADO", 8, True); txt(totals_x + 36, totals_y + 4, "S/", 8); txt_r(totals_x + 68, totals_y + 4, _pdf_money(subtotal_doc), 8)
+    txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 8, True); txt(totals_x + 36, totals_y + 11, "S/", 8); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 8)
+    txt(totals_x + 3, totals_y + 18, "TOTAL", 9, True); txt(totals_x + 36, totals_y + 18, "S/", 9, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 9, True)
+    rect(178, 216, 24.5, 24.5)
+
+    txt(5.5, 222, "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT", 6)
+    txt(5.5, 229, f"Representacion impresa de la {title.replace(chr(10), ' ')}", 6)
+    txt(5.5, 236, "Emitido mediante G&G ERP", 6)
+    txt(5.5, 243, "Resumen", 6)
+    texts = editor.get("texts") if isinstance(editor.get("texts"), dict) else {}
+    wy = 252
+    for key in ("garantia_1", "garantia_2", "garantia_3", "garantia_4", "garantia_5", "garantia_6"):
+        text = texts.get(key, "")
+        if text:
+            txt_c(105, wy, text, 6.4)
+            wy += 4
+    c.setFillColorRGB(0.92, 0.92, 0.92); c.rect(0, 0, page_w, X(21), fill=1, stroke=0); c.setFillGray(0)
+    txt_c(105, 282, "G&G ERP", 12, True)
+    txt_c(91, 287, "Comprobante emitido a traves de", 8)
+    txt_c(129, 287, "G&G ERP", 8, True)
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # ================= CLIENTES =================
@@ -3209,6 +3496,32 @@ def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
                 conn.close()
             except Exception:
                 pass
+
+
+@app.get("/documentos/{documento_id}/pdf")
+def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    detail = detalle_documento(documento_id)
+    if not detail.get("ok"):
+        return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+    documento = detail.get("documento") or {}
+    detalle = detail.get("detalle") or detail.get("data") or []
+    if not documento:
+        return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+    try:
+        cfg = cargar_config_documento_dict(sucursal or documento.get("sucursal") or DEFAULT_SUCURSAL)
+        pdf = generar_pdf_documento_original(documento, detalle, cfg)
+        raw_name = f"{documento.get('tipo') or 'DOCUMENTO'}_{documento.get('numero') or documento_id}.pdf"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name)
+        return Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except Exception as e:
+        return {"ok": False, "success": False, "msg": f"No se pudo generar PDF: {e}"}
 
 
 @app.get("/documentos/{documento_id}")
