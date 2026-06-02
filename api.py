@@ -1303,10 +1303,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.60"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.60/erp_sql_pro_v20_v1.0.60.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.60.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.60: restaura formato original PC y descarga PDF real del servidor."
+    latest_version = "1.0.61"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.61/erp_sql_pro_v20_v1.0.61.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.61.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.61: corrige visor PDF, descarga e impresion con PDF real del servidor."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1320,12 +1320,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.50")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.51")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.50_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.51_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.50_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.50: formato original PC y descarga/compartir PDF real.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.51_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.51: corrige visor PDF, descarga y compartir.")
     return {
         "ok": True,
         "success": True,
@@ -2133,7 +2133,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(167, 30 + i * 6, ln, 14, True)
     txt_c(167, 44, numero, 11)
 
-    fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date()).slice(0, 10) if False else str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
+    fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
     venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
     client_y = 62
     txt(5.5, client_y, "DOCUMENTO", 7, True); txt(33, client_y, documento.get("documento_cliente") or "", 7)
