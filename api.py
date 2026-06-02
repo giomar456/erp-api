@@ -1301,10 +1301,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.58"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.58/erp_sql_pro_v20_v1.0.58.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.58.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.58: corrige tabla del documento al formato original PC y habilita descarga PDF real."
+    latest_version = "1.0.59"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.59/erp_sql_pro_v20_v1.0.59.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.59.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.59: descarga de documentos con respaldo, numeros editables de impresion, rastreador de series y salida manual Android."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1318,12 +1318,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.48")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.49")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.48_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.49_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.48_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.48: salida manual por series y boton para registrar multiples series.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.49_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.49: descarga de documentos, rastreador de series, numeros editables y salida manual por series.")
     return {
         "ok": True,
         "success": True,
@@ -3036,7 +3036,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         RETURNING id
         """, (
             fecha_emision, doc_tipo, numero, cliente, total, total,
-            data.observacion or "Boleta manual ingresada por series",
+            data.observacion or f"{doc_tipo} manual ingresado por series",
             fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal
         ))
         venta_id = cur.fetchone()[0]
@@ -3082,6 +3082,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         return {
             "ok": True,
             "success": True,
+            "msg": f"{doc_tipo} {numero} registrado. Las series quedaron en historial como VENDIDO, no fueron eliminadas.",
             "id": venta_id,
             "tipo": doc_tipo,
             "numero": numero,
