@@ -2178,8 +2178,11 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         row_y += row_h
 
     total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle or []))
-    igv_doc = float(documento.get("igv") or round(total_doc - (total_doc / 1.18), 2))
-    subtotal_doc = float(documento.get("subtotal") or round(total_doc - igv_doc, 2))
+    igv_doc = float(documento.get("igv") or 0)
+    subtotal_doc = float(documento.get("subtotal") or 0)
+    if igv_doc <= 0 or subtotal_doc <= 0 or subtotal_doc >= total_doc:
+        subtotal_doc = round(total_doc / 1.18, 2) if total_doc else 0
+        igv_doc = round(total_doc - subtotal_doc, 2)
     line(tx, ty + th, tx + tw, ty + th)
     txt_c(tx + tw / 2, ty + th + 5, _pdf_words_soles(total_doc), 7)
     line(tx, ty + th + 8, tx + tw, ty + th + 8)
