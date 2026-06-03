@@ -1303,10 +1303,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.62"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.62/erp_sql_pro_v20_v1.0.62.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.62.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.62: corrige visor de caja y descarga PDF directa."
+    latest_version = "1.0.63"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.63/erp_sql_pro_v20_v1.0.63.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.63.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.63: restaura tabla de documentos sin raya bajo productos."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1320,12 +1320,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.52")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.53")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.52_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.53_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.52_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.52: corrige visor de caja, descarga y compartir PDF.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.53_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.53: restaura tabla sin raya bajo productos.")
     return {
         "ok": True,
         "success": True,
