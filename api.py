@@ -744,6 +744,21 @@ class Cliente(BaseModel):
     sucursal: str = DEFAULT_SUCURSAL
 
 
+class ReservaCliente(BaseModel):
+    tipo_documento: str = "DNI"
+    numero_documento: str = ""
+    cliente_nombre: str = ""
+    producto_id: Optional[int] = None
+    producto_nombre: str = ""
+    cantidad: int = 1
+    monto_total: float = 0
+    monto_reserva: float = 0
+    estado: str = "RESERVADO"
+    observacion: str = ""
+    usuario: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
 class SerieProducto(BaseModel):
     producto_id: int
     serie: str
@@ -1018,6 +1033,44 @@ def migrate_schema():
         cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
         cur.execute("ALTER TABLE clientes DROP CONSTRAINT IF EXISTS clientes_numero_documento_key")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS reservas_clientes (
+            id SERIAL PRIMARY KEY,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tipo_documento TEXT DEFAULT 'DNI',
+            numero_documento TEXT DEFAULT '',
+            cliente_nombre TEXT DEFAULT '',
+            producto_id INT,
+            producto_nombre TEXT DEFAULT '',
+            cantidad INT DEFAULT 1,
+            monto_total NUMERIC DEFAULT 0,
+            monto_reserva NUMERIC DEFAULT 0,
+            saldo NUMERIC DEFAULT 0,
+            estado TEXT DEFAULT 'RESERVADO',
+            observacion TEXT DEFAULT '',
+            usuario TEXT DEFAULT '',
+            sucursal TEXT DEFAULT 'computer_army'
+        );
+        """)
+        for column_sql in [
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS tipo_documento TEXT DEFAULT 'DNI'",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS numero_documento TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS cliente_nombre TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS producto_id INT",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS producto_nombre TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS cantidad INT DEFAULT 1",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS monto_total NUMERIC DEFAULT 0",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS monto_reserva NUMERIC DEFAULT 0",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS saldo NUMERIC DEFAULT 0",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'RESERVADO'",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS usuario TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
+        ]:
+            cur.execute(column_sql)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reservas_clientes_doc ON reservas_clientes (sucursal, numero_documento, estado)")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS productos (
@@ -1303,10 +1356,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.63"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.63/erp_sql_pro_v20_v1.0.63.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.63.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.63: restaura tabla de documentos sin raya bajo productos."
+    latest_version = "1.0.64"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.64/erp_sql_pro_v20_v1.0.64.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.64.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.64: agrega reservas de clientes y descarga PDF a Descargas."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1320,12 +1373,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.53")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.54")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.53_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.54_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.53_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.53: restaura tabla sin raya bajo productos.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.54_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.54: nueva interfaz con reservas y visor PDF corregido.")
     return {
         "ok": True,
         "success": True,
@@ -2302,6 +2355,142 @@ def listar_clientes(sucursal: str = DEFAULT_SUCURSAL):
     conn.close()
 
     return data
+
+
+@app.post("/reservas")
+def crear_reserva(data: ReservaCliente):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
+    documento = only_digits(data.numero_documento)
+    cliente = (data.cliente_nombre or "CLIENTE RESERVA").strip() or "CLIENTE RESERVA"
+    producto_nombre = (data.producto_nombre or "").strip()
+    producto_id = data.producto_id
+    if producto_id and not producto_nombre:
+        cur.execute("""
+        SELECT COALESCE(nombre,'') FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        producto_nombre = row[0] if row else ""
+    if not documento:
+        conn.close()
+        return {"ok": False, "success": False, "msg": "Ingresa DNI/RUC del cliente para controlar la reserva."}
+    if not producto_nombre:
+        conn.close()
+        return {"ok": False, "success": False, "msg": "Selecciona o escribe el producto reservado."}
+    cantidad = max(1, int(data.cantidad or 1))
+    monto_total = round(float(data.monto_total or 0), 2)
+    monto_reserva = round(float(data.monto_reserva or 0), 2)
+    saldo = max(0.0, round(monto_total - monto_reserva, 2))
+    estado = (data.estado or "RESERVADO").upper()
+    if estado not in ("RESERVADO", "PAGADO", "ENTREGADO", "ANULADO"):
+        estado = "RESERVADO"
+    cur.execute("""
+    INSERT INTO reservas_clientes (
+        tipo_documento, numero_documento, cliente_nombre, producto_id, producto_nombre,
+        cantidad, monto_total, monto_reserva, saldo, estado, observacion, usuario, sucursal
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    RETURNING id, fecha
+    """, (
+        (data.tipo_documento or "DNI").upper(), documento, cliente, producto_id, producto_nombre,
+        cantidad, monto_total, monto_reserva, saldo, estado, data.observacion or "", data.usuario or "", sucursal
+    ))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": row[0], "fecha": row[1], "saldo": saldo}
+
+
+@app.get("/reservas")
+def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    documento_digits = only_digits(documento)
+    estado = (estado or "").upper()
+    where = ["COALESCE(sucursal,%s)=%s"]
+    params = [DEFAULT_SUCURSAL, sucursal]
+    if documento_digits:
+        where.append("regexp_replace(COALESCE(numero_documento,''), '\\D', '', 'g')=%s")
+        params.append(documento_digits)
+    if estado and estado != "TODOS":
+        where.append("UPPER(COALESCE(estado,''))=%s")
+        params.append(estado)
+    cur.execute(f"""
+        SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
+               COALESCE(tipo_documento,'DNI') AS tipo_documento,
+               COALESCE(numero_documento,'') AS numero_documento,
+               COALESCE(cliente_nombre,'') AS cliente_nombre,
+               producto_id,
+               COALESCE(producto_nombre,'') AS producto_nombre,
+               COALESCE(cantidad,1) AS cantidad,
+               COALESCE(monto_total,0) AS monto_total,
+               COALESCE(monto_reserva,0) AS monto_reserva,
+               COALESCE(saldo,0) AS saldo,
+               COALESCE(estado,'RESERVADO') AS estado,
+               COALESCE(observacion,'') AS observacion,
+               COALESCE(usuario,'') AS usuario
+        FROM reservas_clientes
+        WHERE {' AND '.join(where)}
+        ORDER BY fecha DESC, id DESC
+        LIMIT 200
+    """, tuple(params))
+    reservas = [_jsonable_row(row) for row in dict_fetchall(cur)]
+    documentos = []
+    if documento_digits:
+        cur.execute("""
+            SELECT id, tipo, numero, COALESCE(cliente,'') AS cliente_nombre,
+                   COALESCE(documento_cliente,'') AS documento_cliente,
+                   COALESCE(total,0) AS total,
+                   COALESCE(estado_pago,'PAGADO') AS estado_pago,
+                   to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha
+            FROM ventas
+            WHERE regexp_replace(COALESCE(documento_cliente,''), '\\D', '', 'g')=%s
+              AND COALESCE(sucursal,%s)=%s
+            ORDER BY fecha DESC, id DESC
+            LIMIT 100
+        """, (documento_digits, DEFAULT_SUCURSAL, sucursal))
+        documentos = [_jsonable_row(row) for row in dict_fetchall(cur)]
+    conn.close()
+    return {"ok": True, "success": True, "data": reservas, "reservas": reservas, "documentos": documentos}
+
+
+@app.put("/reservas/{reserva_id}")
+def actualizar_reserva(reserva_id: int, data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(data.get("sucursal") or DEFAULT_SUCURSAL)
+    estado = str(data.get("estado") or "RESERVADO").upper()
+    if estado not in ("RESERVADO", "PAGADO", "ENTREGADO", "ANULADO"):
+        estado = "RESERVADO"
+    monto_total = data.get("monto_total")
+    monto_reserva = data.get("monto_reserva")
+    observacion = str(data.get("observacion") or "")
+    cur.execute("""
+        SELECT COALESCE(monto_total,0), COALESCE(monto_reserva,0)
+        FROM reservas_clientes
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+    """, (reserva_id, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "success": False, "msg": "Reserva no encontrada."}
+    total = round(float(monto_total if monto_total not in (None, "") else row[0] or 0), 2)
+    reservado = round(float(monto_reserva if monto_reserva not in (None, "") else row[1] or 0), 2)
+    saldo = max(0.0, round(total - reservado, 2))
+    cur.execute("""
+        UPDATE reservas_clientes
+        SET estado=%s, monto_total=%s, monto_reserva=%s, saldo=%s,
+            observacion=CASE WHEN %s <> '' THEN %s ELSE COALESCE(observacion,'') END
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (estado, total, reservado, saldo, observacion, observacion, reserva_id, DEFAULT_SUCURSAL, sucursal))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "id": reserva_id, "saldo": saldo, "estado": estado}
 
 
 # ================= PRODUCTOS =================
@@ -3502,7 +3691,7 @@ def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
 
 
 @app.get("/documentos/{documento_id}/pdf")
-def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL, inline: bool = False):
     detail = detalle_documento(documento_id)
     if not detail.get("ok"):
         return {"ok": False, "success": False, "msg": "Documento no encontrado."}
@@ -3519,7 +3708,7 @@ def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL)
             content=pdf,
             media_type="application/pdf",
             headers={
-                "Content-Disposition": f'attachment; filename="{safe_name}"',
+                "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{safe_name}"',
                 "Cache-Control": "no-store",
             },
         )
@@ -4932,6 +5121,20 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
 
     cur.execute("SELECT COUNT(*) FROM productos WHERE COALESCE(stock,0) <= 5 AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     stock_bajo = int(cur.fetchone()[0] or 0)
+    try:
+        cur.execute("""
+            SELECT COUNT(*), COALESCE(SUM(saldo),0)
+            FROM reservas_clientes
+            WHERE UPPER(COALESCE(estado,'RESERVADO'))='RESERVADO'
+              AND COALESCE(sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, sucursal))
+        reserva_row = cur.fetchone()
+        reservas_activas = int(reserva_row[0] or 0)
+        reservas_saldo = float(reserva_row[1] or 0)
+    except Exception:
+        conn.rollback()
+        reservas_activas = 0
+        reservas_saldo = 0.0
     cur.execute(f"""
         SELECT COUNT(*) FROM ventas
         WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA')
@@ -5003,6 +5206,8 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         "metodos_pago": metodos_pago,
         "productos_bajos": productos_bajos,
         "stock_bajo": stock_bajo,
+        "reservas_activas": reservas_activas,
+        "reservas_saldo": reservas_saldo,
         "facturas_cobrar": facturas_cobrar,
         "cuentas_cobrar": cuentas_cobrar,
         "total_cuentas_cobrar": total_cuentas_cobrar,
