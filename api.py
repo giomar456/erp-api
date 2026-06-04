@@ -167,6 +167,13 @@ def norm_sucursal(value: str = ""):
     return value or DEFAULT_SUCURSAL
 
 
+def norm_theme_color(value: str = ""):
+    clean = str(value or "").strip()
+    if re.match(r"^#[0-9a-fA-F]{6}$", clean):
+        return clean.lower()
+    return "#304fb8"
+
+
 def get_conn():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
@@ -829,6 +836,7 @@ class Usuario(BaseModel):
     foto_url: Optional[str] = ""
     boquitoqui_enabled: bool = False
     sucursal: str = DEFAULT_SUCURSAL
+    color_tema: Optional[str] = "#304fb8"
 
 
 class UsuarioRolUpdate(BaseModel):
@@ -837,6 +845,11 @@ class UsuarioRolUpdate(BaseModel):
 
 class UsuarioRadioUpdate(BaseModel):
     boquitoqui_enabled: bool = False
+
+
+class UsuarioColorUpdate(BaseModel):
+    usuario: Optional[str] = ""
+    color_tema: str = "#304fb8"
 
 
 class UsuarioOnlineHeartbeat(BaseModel):
@@ -986,6 +999,7 @@ def migrate_schema():
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto_url TEXT DEFAULT ''")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS boquitoqui_enabled BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS color_tema TEXT DEFAULT '#304fb8'")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS sucursales (
             codigo TEXT PRIMARY KEY,
@@ -1379,10 +1393,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.65"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.65/erp_sql_pro_v20_v1.0.65.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.65.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.65: series con fecha/usuario, caja por calendario, venta con click unico y formato de documentos alineado."
+    latest_version = "1.0.66"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.66/erp_sql_pro_v20_v1.0.66.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.66.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.66: color por usuario, ventas sin modal al agregar y formato PDF compacto corregido."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1396,12 +1410,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.57")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.58")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.57: series con fecha/usuario, caja por calendario, venta con click unico y formato de documentos alineado.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.58: color por usuario, ventas sin modal al agregar y formato PDF compacto corregido.")
     return {
         "ok": True,
         "success": True,
@@ -1428,7 +1442,8 @@ def login(data: dict):
     cur.execute("""
         SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
                COALESCE(sucursal,%s) AS sucursal,
-               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled
+               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
+               COALESCE(color_tema,'#304fb8') AS color_tema
         FROM usuarios
         WHERE lower(usuario)=lower(%s) AND clave=%s
     """,
@@ -1445,7 +1460,7 @@ def login(data: dict):
             return {"ok": False, "msg": "No tienes acceso a esta sucursal."}
         sucursal = user_branch
 
-    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "sucursal": sucursal, "empresa": sucursal}
+    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "color_tema": norm_theme_color(user.get("color_tema")), "sucursal": sucursal, "empresa": sucursal}
 
 
 # ================= USUARIOS =================
@@ -1457,7 +1472,8 @@ def listar_usuarios(sucursal: str = DEFAULT_SUCURSAL):
     cur.execute("""
         SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
                COALESCE(sucursal,%s) AS sucursal,
-               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled
+               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
+               COALESCE(color_tema,'#304fb8') AS color_tema
         FROM usuarios
         WHERE COALESCE(sucursal,%s)=%s OR lower(usuario)='giomar'
         ORDER BY usuario
@@ -1474,7 +1490,8 @@ def perfil_usuario(usuario: str = ""):
     cur.execute("""
         SELECT usuario, rol, COALESCE(foto_url,'') AS foto_url,
                COALESCE(sucursal,%s) AS sucursal,
-               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled
+               COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
+               COALESCE(color_tema,'#304fb8') AS color_tema
         FROM usuarios
         WHERE lower(usuario)=lower(%s)
     """, (DEFAULT_SUCURSAL, usuario.strip()))
@@ -1495,6 +1512,7 @@ def guardar_usuario(data: Usuario):
     foto_url = data.foto_url or ""
     radio_enabled = bool(data.boquitoqui_enabled)
     sucursal = norm_sucursal(data.sucursal)
+    color_tema = norm_theme_color(data.color_tema)
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
     if not usuario or not clave:
@@ -1506,16 +1524,17 @@ def guardar_usuario(data: Usuario):
         cur.execute("""
         UPDATE usuarios
         SET usuario=%s, clave=%s, rol=%s, sucursal=%s, boquitoqui_enabled=%s,
+            color_tema=%s,
             foto_url=CASE WHEN %s <> '' THEN %s ELSE COALESCE(foto_url,'') END
         WHERE id=%s
         RETURNING id
-        """, (usuario, clave, rol, sucursal, radio_enabled, foto_url, foto_url, existing[0]))
+        """, (usuario, clave, rol, sucursal, radio_enabled, color_tema, foto_url, foto_url, existing[0]))
     else:
         cur.execute("""
-        INSERT INTO usuarios (usuario, clave, rol, foto_url, sucursal, boquitoqui_enabled)
-        VALUES (%s,%s,%s,%s,%s,%s)
+        INSERT INTO usuarios (usuario, clave, rol, foto_url, sucursal, boquitoqui_enabled, color_tema)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
         RETURNING id
-        """, (usuario, clave, rol, foto_url, sucursal, radio_enabled))
+        """, (usuario, clave, rol, foto_url, sucursal, radio_enabled, color_tema))
     user_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -1702,6 +1721,45 @@ def cambiar_boquitoqui_usuario(usuario_id: int, data: UsuarioRadioUpdate):
     return {"ok": True, "success": True, "id": row[0], "boquitoqui_enabled": bool(data.boquitoqui_enabled)}
 
 
+@app.put("/usuarios/{usuario_id}/color")
+def cambiar_color_usuario_admin(usuario_id: int, data: UsuarioColorUpdate):
+    color = norm_theme_color(data.color_tema)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE usuarios SET color_tema=%s
+    WHERE id=%s
+    RETURNING id
+    """, (color, usuario_id))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True, "id": row[0], "color_tema": color}
+
+
+@app.put("/usuarios/color")
+def cambiar_color_usuario(data: UsuarioColorUpdate):
+    usuario = (data.usuario or "").strip()
+    if not usuario:
+        return {"ok": False, "msg": "Usuario requerido."}
+    color = norm_theme_color(data.color_tema)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE usuarios SET color_tema=%s
+    WHERE lower(usuario)=lower(%s)
+    RETURNING id
+    """, (color, usuario))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True, "id": row[0], "color_tema": color}
+
+
 @app.get("/usuarios/online")
 def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
@@ -1711,6 +1769,7 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
         SELECT u.id, u.usuario, u.rol, COALESCE(u.foto_url,'') AS foto_url,
                COALESCE(u.sucursal,%s) AS sucursal,
                COALESCE(u.boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
+               COALESCE(u.color_tema,'#304fb8') AS color_tema,
                CASE
                    WHEN o.ultima_actividad IS NOT NULL
                     AND o.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
@@ -2020,14 +2079,14 @@ def documento_config_default():
             },
             "layout": {
                 "max_productos": 12,
-                "alto_fila_mm": 8.2,
-                "alto_tabla_mm": 120,
-                "letra_tabla_px": 7.2,
-                "letra_descripcion_px": 7.4,
+                "alto_fila_mm": 6.5,
+                "alto_tabla_mm": 86,
+                "letra_tabla_px": 7.0,
+                "letra_descripcion_px": 7.0,
                 "logo_ancho_mm": 24,
                 "logo_alto_mm": 15,
-                "logo_bajar_mm": 21,
-                "margen_superior_mm": 10,
+                "logo_bajar_mm": 23,
+                "margen_superior_mm": 8,
             },
         },
     }
@@ -2230,30 +2289,27 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     # Plantilla fija A4 alineada al formato Computer Army usado en PC/Android.
     logo_w = min(max(float(layout.get("logo_ancho_mm", 24) or 24), 16), 36)
     logo_h = min(max(float(layout.get("logo_alto_mm", 15) or 15), 10), 26)
-    _draw_pdf_logo(c, cfg, 16, 27, logo_w, logo_h, mm, page_h)
+    _draw_pdf_logo(c, cfg, 16, 25, logo_w, logo_h, mm, page_h)
 
     empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
     direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper()
-    telefono = str(cfg.get("telefono") or "")
     slogan = str(cfg.get("mensaje") or "MEJORES PRECIOS EN TARJETAS DE VIDEOS").upper()
 
     for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 15.8, 2)):
-        txt(49, 10.5 + i * 5.2, ln, 15.8, True)
+        txt(44, 14.6 + i * 5.2, ln, 15.8, True)
     for i, ln in enumerate(fit(direccion, 82, "Helvetica-Bold", 7.2, 3)):
-        txt(49, 27.5 + i * 3.9, ln, 7.2, True)
-    if telefono:
-        txt(49, 39.5, telefono, 6.8)
-    txt(49, 45.5 if telefono else 40.5, slogan, 7.2, True)
+        txt(44, 26.5 + i * 3.9, ln, 7.2, True)
+    txt(44, 43.0, slogan, 7.2, True)
 
-    rect(124, 7, 72, 45)
-    txt_c(160, 18.5, f"RUC {cfg.get('ruc') or '20611068701'}", 11.8)
+    rect(124, 6, 72, 39)
+    txt_c(160, 13.0, f"RUC {cfg.get('ruc') or '20611068701'}", 11.8)
     for i, ln in enumerate(title.split("\n")):
-        txt_c(160, 32.0 + i * 5.4, ln, 16.0, True)
-    txt_c(160, 46.0, numero, 11.6)
+        txt_c(160, 24.5 + i * 5.4, ln, 16.0, True)
+    txt_c(160, 40.5, numero, 11.6)
 
     fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
     venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
-    client_y = 58
+    client_y = 52
     doc_cliente = str(documento.get("documento_cliente") or "").upper()
     cliente = str(documento.get("cliente_nombre") or "USUARIO X").upper()
     direccion_cliente = str(documento.get("direccion_cliente") or "SIN DIRECCION").upper()
@@ -2268,9 +2324,9 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(124, client_y + 5.0, "FECHA VENCIMIENTO", 7.4, True); txt(169, client_y + 5.0, venc, 7.2)
     txt(124, client_y + 10.0, "MONEDA", 7.4, True); txt(169, client_y + 10.0, "SOLES", 7.2)
 
-    tx, ty, tw = 7.0, 73.0, 199.0
+    tx, ty, tw = 7.0, 69.5, 199.0
     header_h = 4.8
-    row_h = 8.2
+    row_h = max(5.8, min(float(layout.get("alto_fila_mm", 6.5) or 6.5), 8.2))
     th = header_h + (row_h * max_rows)
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
@@ -2294,11 +2350,11 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
         txt_c(centers[2], row_y, code[:15], 7.8)
-        desc_lines = fit(desc, 84, "Helvetica-Bold", 7.4, 3)
+        desc_lines = fit(desc, 84, "Helvetica-Bold", 7.0, 3)
         for j, ln in enumerate(desc_lines):
-            txt(cols[3] + 1.6, row_y + j * 3.0, ln, 7.4, True)
+            txt(cols[3] + 1.6, row_y + j * 2.6, ln, 7.0, True)
         if series:
-            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 3) * 2.8, "SN:" + series[:76], 6.2)
+            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 3) * 2.5, "SN:" + series[:76], 6.0)
         txt_r(cols[5] - 1.2, row_y, f"{qty:.2f}", 8.0)
         txt_r(cols[6] - 1.2, row_y, _pdf_money(total), 8.0)
         txt_r(cols[7] - 1.2, row_y, _pdf_money(price), 8.0)
@@ -2315,7 +2371,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 6.2)
     line(tx, ty + th + 7.2, tx + tw, ty + th + 7.2)
 
-    block_y = ty + th + 8.0
+    block_y = ty + th + 7.0
     totals_x, totals_y = 141, block_y
     rect(totals_x, totals_y, 71, 22)
     line(totals_x, totals_y + 7, totals_x + 71, totals_y + 7)
@@ -2324,7 +2380,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 10.2, True); txt(totals_x + 36, totals_y + 11, "S/", 10.0); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 10.0)
     txt(totals_x + 3, totals_y + 18, "TOTAL", 10.8, True); txt(totals_x + 36, totals_y + 18, "S/", 10.8, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 10.8, True)
 
-    info_y = 204
+    info_y = 176
     txt(7.0, info_y, "USUARIO", 7.0, True); txt(65, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 6.6)
     txt(7.0, info_y + 4.8, "CONDICION DE PAGO", 7.0, True); txt(65, info_y + 4.8, documento.get("estado_pago") or "CONTADO", 6.8)
     txt(65, info_y + 12.0, "CUENTAS BANCARIAS", 6.8, True)
@@ -2336,13 +2392,13 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     if not _draw_pdf_qr(c, qr_url, 181, info_y + 27, 20, mm, page_h):
         rect(181, info_y + 27, 20, 20)
 
-    legal_y = 236
+    legal_y = 216
     txt(5.0, legal_y, "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT", 7.0)
     txt(5.0, legal_y + 5, f"Representacion impresa de la {title.replace(chr(10), ' ')}", 7.0)
     txt(5.0, legal_y + 10, "Para consultar el comprobante visita G&G ERP", 8.6)
     txt(5.0, legal_y + 15, "Resumen", 8.6)
     texts = editor.get("texts") if isinstance(editor.get("texts"), dict) else {}
-    wy = 254
+    wy = 244
     for key in ("garantia_1", "garantia_2", "garantia_3", "garantia_4", "garantia_5", "garantia_6"):
         text = texts.get(key, "")
         if text:
