@@ -2171,62 +2171,62 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     max_rows = max(1, min(int(float(layout.get("max_productos", 12) or 12)), 12))
 
     # Plantilla fija A4: evita que el visor interno mande la impresion a 2 hojas.
-    logo_w = min(max(float(layout.get("logo_ancho_mm", 30) or 30), 22), 38)
-    logo_h = min(max(float(layout.get("logo_alto_mm", 21) or 21), 16), 27)
-    _draw_pdf_logo(c, cfg, 8, 17, logo_w, logo_h, mm, page_h)
+    logo_w = min(max(float(layout.get("logo_ancho_mm", 29) or 29), 22), 36)
+    logo_h = min(max(float(layout.get("logo_alto_mm", 20) or 20), 16), 26)
+    _draw_pdf_logo(c, cfg, 7, 17, logo_w, logo_h, mm, page_h)
 
     empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
-    direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper()
+    direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper().replace(">>", "»")
     telefono = str(cfg.get("telefono") or "")
     slogan = str(cfg.get("mensaje") or "MEJORES PRECIOS EN TARJETAS DE VIDEOS").upper()
 
-    for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 12.5, 2)):
-        txt(43, 11 + i * 5.6, ln, 12.5, True)
-    for i, ln in enumerate(fit(direccion, 102, "Helvetica", 7.0, 3)):
-        txt(43, 30 + i * 3.8, ln, 7.0)
+    for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 14.6, 2)):
+        txt(43, 10.2 + i * 5.3, ln, 14.6, True)
+    for i, ln in enumerate(fit(direccion, 80, "Helvetica", 8.0, 3)):
+        txt(43, 25.5 + i * 4.5, ln, 8.0)
     if telefono:
-        txt(43, 43, telefono, 6.6)
-    txt(43, 50, slogan, 6.8, True)
+        txt(43, 43, telefono, 7.5)
+    txt(43, 41.5, slogan, 8.8)
 
-    rect(130, 10, 74, 37)
-    txt_c(167, 22, f"RUC {cfg.get('ruc') or '20611068701'}", 10)
+    rect(130, 6, 74, 39)
+    txt_c(167, 18, f"RUC {cfg.get('ruc') or '20611068701'}", 14.0)
     for i, ln in enumerate(title.split("\n")):
-        txt_c(167, 31 + i * 5.7, ln, 13, True)
-    txt_c(167, 43.5, numero, 10)
+        txt_c(167, 28.5 + i * 5.7, ln, 16.2, True)
+    txt_c(167, 42, numero, 13.2)
 
     fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
     venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
-    client_y = 58
+    client_y = 52
     doc_cliente = str(documento.get("documento_cliente") or "").upper()
     cliente = str(documento.get("cliente_nombre") or "USUARIO X").upper()
     direccion_cliente = str(documento.get("direccion_cliente") or "SIN DIRECCION").upper()
-    txt(5.5, client_y, "DOCUMENTO", 7.1, True); txt(33, client_y, doc_cliente, 7.1)
-    txt(5.5, client_y + 5.8, "CLIENTE", 7.1, True)
-    for i, ln in enumerate(fit(cliente, 91, "Helvetica", 7.1, 2)):
-        txt(33, client_y + 5.8 + i * 3.3, ln, 7.1)
-    txt(5.5, client_y + 12.4, "DIRECCION", 7.1, True)
-    for i, ln in enumerate(fit(direccion_cliente, 91, "Helvetica", 7.1, 2)):
-        txt(33, client_y + 12.4 + i * 3.3, ln, 7.1)
-    txt(136, client_y, "FECHA EMISION", 7.1, True); txt(174, client_y, fecha, 7.1)
-    txt(136, client_y + 5.8, "FECHA VENCIMIENTO", 7.1, True); txt(174, client_y + 5.8, venc, 7.1)
-    txt(136, client_y + 11.6, "MONEDA", 7.1, True); txt(174, client_y + 11.6, "SOLES", 7.1)
+    txt(5.5, client_y, "DOCUMENTO", 9.4, True); txt(34, client_y, doc_cliente, 9.2)
+    txt(5.5, client_y + 4.6, "CLIENTE", 9.4, True)
+    for i, ln in enumerate(fit(cliente, 91, "Helvetica", 9.2, 2)):
+        txt(34, client_y + 4.6 + i * 3.8, ln, 9.2)
+    txt(5.5, client_y + 9.2, "DIRECCIÓN", 9.4, True)
+    for i, ln in enumerate(fit(direccion_cliente, 91, "Helvetica", 9.2, 2)):
+        txt(34, client_y + 9.2 + i * 3.8, ln, 9.2)
+    txt(136, client_y, "FECHA EMISIÓN", 9.4, True); txt(174, client_y, fecha, 9.2)
+    txt(136, client_y + 4.6, "FECHA VENCIMIENTO", 9.4, True); txt(174, client_y + 4.6, venc, 9.2)
+    txt(136, client_y + 9.2, "MONEDA", 9.4, True); txt(174, client_y + 9.2, "SOLES", 9.2)
 
-    tx, ty, tw = 5.5, 77, 198.5
-    header_h = 6.4
-    row_h = min(max(float(layout.get("alto_fila_mm", 8.2) or 8.2), 7.4), 8.4)
+    tx, ty, tw = 5.0, 70.0, 200.0
+    header_h = 5.2
+    row_h = 5.8
     th = header_h + (row_h * max_rows)
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
-    cols = [tx, tx + 8, tx + 27, tx + 55, tx + 134, tx + 156, tx + 177, tx + tw]
+    cols = [tx, tx + 8.5, tx + 28.5, tx + 57.5, tx + 152.0, tx + 167.5, tx + 183.0, tx + tw]
     headers = ["Nro", "UNIDAD", "CODIGO", "DESCRIPCION", "CANT.", "TOTAL", "P. UNIT."]
     centers = [(cols[i] + cols[i+1]) / 2 for i in range(len(cols)-1)]
     for idx, h in enumerate(headers):
-        txt_c(centers[idx], ty + 4.2, h, 6.7, True)
+        txt_c(centers[idx], ty + 3.8, h, 9.4, True)
     c.setFillGray(0)
     for cx in cols[1:-1]:
         line(cx, ty, cx, ty + th)
 
-    row_y = ty + header_h + 4.7
+    row_y = ty + header_h + 4.5
     for idx, item in enumerate((detalle or [])[:max_rows], start=1):
         qty = float(item.get("cantidad") or 0)
         price = float(item.get("precio_unitario") or item.get("precio") or 0)
@@ -2234,17 +2234,17 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
         code = str(item.get("codigo") or item.get("producto_id") or item.get("id") or "")
         series = str(item.get("series_texto") or item.get("serie") or "").strip()
-        txt_c(centers[0], row_y, idx, 6.7)
-        txt_c(centers[1], row_y, "UNIDADES", 6.2)
-        txt_c(centers[2], row_y, code[:12], 6.2)
-        desc_lines = fit(desc, 76, "Helvetica-Bold", 6.7, 2)
+        txt_c(centers[0], row_y, idx, 8.0)
+        txt_c(centers[1], row_y, "UNIDADES", 7.8)
+        txt_c(centers[2], row_y, code[:15], 7.8)
+        desc_lines = fit(desc, 92, "Helvetica", 8.2, 2)
         for j, ln in enumerate(desc_lines):
-            txt(cols[3] + 2, row_y + j * 2.8, ln, 6.7, True)
+            txt(cols[3] + 1.6, row_y + j * 3.0, ln, 8.2)
         if series:
-            txt(cols[3] + 2, row_y + min(len(desc_lines), 2) * 2.65, "S/N: " + series[:70], 5.3)
-        txt_r(cols[5] - 2, row_y, f"{qty:.2f}", 6.7)
-        txt_r(cols[6] - 2, row_y, _pdf_money(total), 6.7)
-        txt_r(cols[7] - 2, row_y, _pdf_money(price), 6.7)
+            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 2) * 2.9, "SN:" + series[:70], 8.0)
+        txt_r(cols[5] - 1.2, row_y, f"{qty:.2f}", 8.0)
+        txt_r(cols[6] - 1.2, row_y, _pdf_money(total), 8.0)
+        txt_r(cols[7] - 1.2, row_y, _pdf_money(price), 8.0)
         row_y += row_h
 
     total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle or []))
@@ -2254,46 +2254,46 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         subtotal_doc = round(total_doc / 1.18, 2) if total_doc else 0
         igv_doc = round(total_doc - subtotal_doc, 2)
     line(tx, ty + th, tx + tw, ty + th)
-    words_y = ty + th + 5
-    txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 6.4)
-    line(tx, ty + th + 8, tx + tw, ty + th + 8)
+    words_y = ty + th + 4.0
+    txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 9.2)
+    line(tx, ty + th + 7.2, tx + tw, ty + th + 7.2)
 
-    block_y = min(ty + th + 12, 187)
-    totals_x, totals_y = 133, block_y
+    block_y = ty + th + 10.5
+    totals_x, totals_y = 136, block_y
     rect(totals_x, totals_y, 71, 22)
     line(totals_x, totals_y + 7, totals_x + 71, totals_y + 7)
     line(totals_x, totals_y + 14, totals_x + 71, totals_y + 14)
-    txt(totals_x + 3, totals_y + 4, "GRAVADO", 7.8, True); txt(totals_x + 36, totals_y + 4, "S/", 7.8, True); txt_r(totals_x + 68, totals_y + 4, _pdf_money(subtotal_doc), 7.8, True)
-    txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 7.8, True); txt(totals_x + 36, totals_y + 11, "S/", 7.8, True); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 7.8, True)
-    txt(totals_x + 3, totals_y + 18, "TOTAL", 9.4, True); txt(totals_x + 36, totals_y + 18, "S/", 9.4, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 9.4, True)
+    txt(totals_x + 3, totals_y + 4, "GRAVADO", 10.2, True); txt(totals_x + 36, totals_y + 4, "S/", 10.0); txt_r(totals_x + 68, totals_y + 4, _pdf_money(subtotal_doc), 10.0)
+    txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 10.2, True); txt(totals_x + 36, totals_y + 11, "S/", 10.0); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 10.0)
+    txt(totals_x + 3, totals_y + 18, "TOTAL", 10.8, True); txt(totals_x + 36, totals_y + 18, "S/", 10.8, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 10.8, True)
 
-    info_y = block_y + 1
-    txt(5.5, info_y, "USUARIO", 6.4, True); txt(52, info_y, f"{documento.get('usuario_emisor') or ''} - {fecha}", 6.4)
-    txt(5.5, info_y + 5.5, "CONDICION DE PAGO", 6.4, True); txt(52, info_y + 5.5, documento.get("estado_pago") or "CONTADO", 6.4)
-    txt(5.5, info_y + 12, "CUENTAS BANCARIAS", 6.4, True)
-    txt(52, info_y + 12, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 6.2)
-    txt(52, info_y + 16, "Titular:Computer Army Eirl", 6.2)
-    txt(52, info_y + 23, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 6.2)
-    txt(52, info_y + 27, "Titular: Computer Army eirl", 6.2)
-    rect(178, block_y + 28, 24.5, 24.5)
+    info_y = 177
+    txt(5.0, info_y, "USUARIO", 9.2, True); txt(58, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 8.8)
+    txt(5.0, info_y + 4.8, "CONDICIÓN DE PAGO", 9.2, True); txt(58, info_y + 4.8, documento.get("estado_pago") or "CONTADO", 9.0)
+    txt(5.0, info_y + 9.6, "CUENTAS BANCARIAS", 9.2, True)
+    txt(58, info_y + 9.6, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 8.8)
+    txt(58, info_y + 14.0, "Titular:Computer Army Eirl", 8.8)
+    txt(58, info_y + 22.0, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 8.6)
+    txt(58, info_y + 26.4, "Titular: Computer Army eirl", 8.8)
+    rect(181, info_y + 27, 20, 20)
 
-    legal_y = 224
-    txt(5.5, legal_y, "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT", 5.4)
-    txt(5.5, legal_y + 5, f"Representacion impresa de la {title.replace(chr(10), ' ')}", 5.4)
-    txt(5.5, legal_y + 10, "Emitido mediante G&G ERP", 5.4)
-    txt(5.5, legal_y + 15, "Resumen", 5.4)
+    legal_y = 216
+    txt(5.0, legal_y, "Autorizado mediante resolución Nº 034-005-0010431/SUNAT", 8.6)
+    txt(5.0, legal_y + 5, f"Representación impresa de la {title.replace(chr(10), ' ')}", 8.6)
+    txt(5.0, legal_y + 10, "Para consultar el comprobante visita G&G ERP", 8.6)
+    txt(5.0, legal_y + 15, "Resumen", 8.6)
     texts = editor.get("texts") if isinstance(editor.get("texts"), dict) else {}
-    wy = 245
+    wy = 244
     for key in ("garantia_1", "garantia_2", "garantia_3", "garantia_4", "garantia_5", "garantia_6"):
         text = texts.get(key, "")
         if text:
-            txt_c(105, wy, text, 5.5)
-            wy += 3.8
-            if wy > 269:
+            txt_c(105, wy, text, 9.0)
+            wy += 4.3
+            if wy > 268:
                 break
     c.setFillColorRGB(0.94, 0.94, 0.94); c.rect(0, 0, page_w, X(14), fill=1, stroke=0); c.setFillGray(0)
-    txt_c(105, 285, "G&G ERP", 8, True)
-    txt_c(105, 290, "Comprobante emitido a traves de G&G ERP", 5.8)
+    txt_c(105, 285, "G&G ERP", 12.5, True)
+    txt_c(105, 290, "Comprobante emitido a través de G&G ERP", 8.0)
 
     c.showPage()
     c.save()
