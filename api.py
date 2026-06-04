@@ -24,6 +24,7 @@ import urllib.request
 import urllib.error
 import io
 import tempfile
+import html
 
 app = FastAPI()
 app.add_middleware(
@@ -218,12 +219,16 @@ def first_value(data, *keys):
 
 
 def normalizar_comprobante_pago(data):
-    nombre = (data.comprobante_pago_nombre or "").strip()
-    referencia = (data.comprobante_pago or "").strip()
-    mime = (data.comprobante_pago_mime or "").strip() or "application/octet-stream"
-    tamano = data.comprobante_pago_tamano
-    raw_b64 = (data.comprobante_pago_base64 or "").strip()
-    data_url = (data.comprobante_pago_data_url or "").strip()
+    def get_value(key, default=""):
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return getattr(data, key, default)
+    nombre = str(get_value("comprobante_pago_nombre") or "").strip()
+    referencia = str(get_value("comprobante_pago") or "").strip()
+    mime = str(get_value("comprobante_pago_mime") or "").strip() or "application/octet-stream"
+    tamano = get_value("comprobante_pago_tamano", None)
+    raw_b64 = str(get_value("comprobante_pago_base64") or "").strip()
+    data_url = str(get_value("comprobante_pago_data_url") or "").strip()
 
     if data_url.startswith("data:") and "," in data_url:
         header, encoded = data_url.split(",", 1)
@@ -539,8 +544,12 @@ def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, c
 
 
 def normalizar_comprobantes_pago(data, existentes=None):
+    def get_value(key, default=None):
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return getattr(data, key, default)
     recibidos = []
-    for item in getattr(data, "comprobantes_pago", None) or []:
+    for item in get_value("comprobantes_pago", None) or []:
         normalizado = normalizar_un_comprobante(item)
         if normalizado:
             recibidos.append(normalizado)
@@ -756,6 +765,13 @@ class ReservaCliente(BaseModel):
     estado: str = "RESERVADO"
     observacion: str = ""
     usuario: str = ""
+    comprobante_pago: Optional[str] = ""
+    comprobante_pago_nombre: Optional[str] = ""
+    comprobante_pago_mime: Optional[str] = ""
+    comprobante_pago_tamano: Optional[int] = None
+    comprobante_pago_base64: Optional[str] = ""
+    comprobante_pago_data_url: Optional[str] = ""
+    comprobantes_pago: Optional[List[dict]] = None
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1067,6 +1083,13 @@ def migrate_schema():
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'RESERVADO'",
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''",
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS usuario TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago_nombre TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago_mime TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago_tamano BIGINT DEFAULT 0",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago_base64 TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago_data_url TEXT DEFAULT ''",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobantes_pago_json TEXT DEFAULT ''",
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
@@ -2143,6 +2166,40 @@ def _draw_pdf_logo(c, cfg, x, y, w, h, mm_unit, page_h):
         pass
 
 
+def public_base_url():
+    return (os.getenv("PUBLIC_BASE_URL") or os.getenv("APP_PUBLIC_URL") or "https://erp-api-7x3d.onrender.com").rstrip("/")
+
+
+def public_document_url(documento):
+    doc_id = documento.get("id") if isinstance(documento, dict) else None
+    if not doc_id:
+        return ""
+    sucursal = norm_sucursal((documento or {}).get("sucursal") or DEFAULT_SUCURSAL)
+    return f"{public_base_url()}/public/documento/{doc_id}?sucursal={urllib.parse.quote(sucursal)}"
+
+
+def _draw_pdf_qr(c, value, x, y, size, mm_unit, page_h):
+    if not value:
+        return False
+    try:
+        from reportlab.graphics.barcode.qr import QrCodeWidget
+        from reportlab.graphics.shapes import Drawing
+        from reportlab.graphics import renderPDF
+        qr = QrCodeWidget(value)
+        bounds = qr.getBounds()
+        width = bounds[2] - bounds[0]
+        height = bounds[3] - bounds[1]
+        drawing = Drawing(size * mm_unit, size * mm_unit, transform=[
+            (size * mm_unit) / width, 0, 0, (size * mm_unit) / height,
+            -bounds[0] * (size * mm_unit) / width, -bounds[1] * (size * mm_unit) / height
+        ])
+        drawing.add(qr)
+        renderPDF.draw(drawing, c, x * mm_unit, page_h - ((y + size) * mm_unit))
+        return True
+    except Exception:
+        return False
+
+
 def generar_pdf_documento_original(documento, detalle, cfg):
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -2275,7 +2332,9 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(58, info_y + 14.0, "Titular:Computer Army Eirl", 8.8)
     txt(58, info_y + 22.0, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 8.6)
     txt(58, info_y + 26.4, "Titular: Computer Army eirl", 8.8)
-    rect(181, info_y + 27, 20, 20)
+    qr_url = public_document_url(documento)
+    if not _draw_pdf_qr(c, qr_url, 181, info_y + 27, 20, mm, page_h):
+        rect(181, info_y + 27, 20, 20)
 
     legal_y = 216
     txt(5.0, legal_y, "Autorizado mediante resolución Nº 034-005-0010431/SUNAT", 8.6)
@@ -2408,16 +2467,31 @@ def crear_reserva(data: ReservaCliente):
     estado = (data.estado or "RESERVADO").upper()
     if estado not in ("RESERVADO", "PAGADO", "ENTREGADO", "ANULADO"):
         estado = "RESERVADO"
+    try:
+        comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data)
+    except ValueError as e:
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
     cur.execute("""
     INSERT INTO reservas_clientes (
         tipo_documento, numero_documento, cliente_nombre, producto_id, producto_nombre,
-        cantidad, monto_total, monto_reserva, saldo, estado, observacion, usuario, sucursal
+        cantidad, monto_total, monto_reserva, saldo, estado, observacion, usuario,
+        comprobante_pago, comprobante_pago_nombre, comprobante_pago_mime, comprobante_pago_tamano,
+        comprobante_pago_base64, comprobante_pago_data_url, comprobantes_pago_json, sucursal
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id, fecha
     """, (
         (data.tipo_documento or "DNI").upper(), documento, cliente, producto_id, producto_nombre,
-        cantidad, monto_total, monto_reserva, saldo, estado, data.observacion or "", data.usuario or "", sucursal
+        cantidad, monto_total, monto_reserva, saldo, estado, data.observacion or "", data.usuario or "",
+        comprobante.get("comprobante_pago") or "",
+        comprobante.get("comprobante_pago_nombre") or "",
+        comprobante.get("comprobante_pago_mime") or "",
+        comprobante.get("comprobante_pago_tamano") or 0,
+        comprobante.get("comprobante_pago_base64") or "",
+        comprobante.get("comprobante_pago_data_url") or "",
+        comprobantes_json or "",
+        sucursal
     ))
     row = cur.fetchone()
     conn.commit()
@@ -2453,13 +2527,23 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
                COALESCE(saldo,0) AS saldo,
                COALESCE(estado,'RESERVADO') AS estado,
                COALESCE(observacion,'') AS observacion,
-               COALESCE(usuario,'') AS usuario
+               COALESCE(usuario,'') AS usuario,
+               COALESCE(comprobante_pago_nombre,'') AS comprobante_pago_nombre,
+               COALESCE(comprobante_pago_mime,'') AS comprobante_pago_mime,
+               COALESCE(comprobante_pago_tamano,0) AS comprobante_pago_tamano,
+               COALESCE(comprobantes_pago_json,'') AS comprobantes_pago_json
         FROM reservas_clientes
         WHERE {' AND '.join(where)}
         ORDER BY fecha DESC, id DESC
         LIMIT 200
     """, tuple(params))
-    reservas = [_jsonable_row(row) for row in dict_fetchall(cur)]
+    reservas = []
+    for row in dict_fetchall(cur):
+        item = _jsonable_row(row)
+        item["comprobantes_pago"] = comprobantes_metadata_liviana(item.get("comprobantes_pago_json"))
+        item["comprobantes_pago_count"] = len(item["comprobantes_pago"])
+        item["comprobantes_pago_json"] = ""
+        reservas.append(item)
     documentos = []
     if documento_digits:
         cur.execute("""
@@ -2479,6 +2563,45 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
     return {"ok": True, "success": True, "data": reservas, "reservas": reservas, "documentos": documentos}
 
 
+@app.get("/reservas/{reserva_id}")
+def detalle_reserva(reserva_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+        SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
+               COALESCE(tipo_documento,'DNI') AS tipo_documento,
+               COALESCE(numero_documento,'') AS numero_documento,
+               COALESCE(cliente_nombre,'') AS cliente_nombre,
+               producto_id,
+               COALESCE(producto_nombre,'') AS producto_nombre,
+               COALESCE(cantidad,1) AS cantidad,
+               COALESCE(monto_total,0) AS monto_total,
+               COALESCE(monto_reserva,0) AS monto_reserva,
+               COALESCE(saldo,0) AS saldo,
+               COALESCE(estado,'RESERVADO') AS estado,
+               COALESCE(observacion,'') AS observacion,
+               COALESCE(usuario,'') AS usuario,
+               COALESCE(comprobante_pago,'') AS comprobante_pago,
+               COALESCE(comprobante_pago_nombre,'') AS comprobante_pago_nombre,
+               COALESCE(comprobante_pago_mime,'') AS comprobante_pago_mime,
+               COALESCE(comprobante_pago_tamano,0) AS comprobante_pago_tamano,
+               COALESCE(comprobante_pago_base64,'') AS comprobante_pago_base64,
+               COALESCE(comprobante_pago_data_url,'') AS comprobante_pago_data_url,
+               COALESCE(comprobantes_pago_json,'') AS comprobantes_pago_json
+        FROM reservas_clientes
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+    """, (reserva_id, DEFAULT_SUCURSAL, sucursal))
+    row = dict_fetchone(cur)
+    conn.close()
+    if not row:
+        return {"ok": False, "success": False, "msg": "Reserva no encontrada."}
+    row = _jsonable_row(row)
+    row["comprobantes_pago"] = cargar_comprobantes_json(row.get("comprobantes_pago_json"))
+    return {"ok": True, "success": True, "data": row, "reserva": row}
+
+
 @app.put("/reservas/{reserva_id}")
 def actualizar_reserva(reserva_id: int, data: dict):
     conn = get_conn()
@@ -2491,7 +2614,8 @@ def actualizar_reserva(reserva_id: int, data: dict):
     monto_reserva = data.get("monto_reserva")
     observacion = str(data.get("observacion") or "")
     cur.execute("""
-        SELECT COALESCE(monto_total,0), COALESCE(monto_reserva,0)
+        SELECT COALESCE(monto_total,0), COALESCE(monto_reserva,0),
+               COALESCE(comprobantes_pago_json,'')
         FROM reservas_clientes
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         LIMIT 1
@@ -2503,12 +2627,34 @@ def actualizar_reserva(reserva_id: int, data: dict):
     total = round(float(monto_total if monto_total not in (None, "") else row[0] or 0), 2)
     reservado = round(float(monto_reserva if monto_reserva not in (None, "") else row[1] or 0), 2)
     saldo = max(0.0, round(total - reservado, 2))
+    try:
+        comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data, row[2] or "")
+    except ValueError as e:
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
     cur.execute("""
         UPDATE reservas_clientes
         SET estado=%s, monto_total=%s, monto_reserva=%s, saldo=%s,
-            observacion=CASE WHEN %s <> '' THEN %s ELSE COALESCE(observacion,'') END
+            observacion=CASE WHEN %s <> '' THEN %s ELSE COALESCE(observacion,'') END,
+            comprobante_pago=COALESCE(%s, comprobante_pago, ''),
+            comprobante_pago_nombre=COALESCE(%s, comprobante_pago_nombre, ''),
+            comprobante_pago_mime=COALESCE(%s, comprobante_pago_mime, ''),
+            comprobante_pago_tamano=COALESCE(%s, comprobante_pago_tamano, 0),
+            comprobante_pago_base64=COALESCE(%s, comprobante_pago_base64, ''),
+            comprobante_pago_data_url=COALESCE(%s, comprobante_pago_data_url, ''),
+            comprobantes_pago_json=COALESCE(%s, comprobantes_pago_json, '')
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (estado, total, reservado, saldo, observacion, observacion, reserva_id, DEFAULT_SUCURSAL, sucursal))
+    """, (
+        estado, total, reservado, saldo, observacion, observacion,
+        comprobante.get("comprobante_pago"),
+        comprobante.get("comprobante_pago_nombre"),
+        comprobante.get("comprobante_pago_mime"),
+        comprobante.get("comprobante_pago_tamano"),
+        comprobante.get("comprobante_pago_base64"),
+        comprobante.get("comprobante_pago_data_url"),
+        comprobantes_json,
+        reserva_id, DEFAULT_SUCURSAL, sucursal
+    ))
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "id": reserva_id, "saldo": saldo, "estado": estado}
@@ -3735,6 +3881,52 @@ def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL,
         )
     except Exception as e:
         return {"ok": False, "success": False, "msg": f"No se pudo generar PDF: {e}"}
+
+
+@app.get("/public/documento/{documento_id}")
+def documento_publico_qr(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    detail = detalle_documento(documento_id)
+    if not detail.get("ok"):
+        return Response("<h1>Documento no encontrado</h1>", media_type="text/html", status_code=404)
+    documento = detail.get("documento") or {}
+    numero = html.escape(str(documento.get("numero") or documento_id))
+    tipo = html.escape(str(documento.get("tipo") or "DOCUMENTO"))
+    cliente = html.escape(str(documento.get("cliente_nombre") or "CLIENTE"))
+    fecha = html.escape(str(documento.get("fecha_emision") or "")[:10])
+    total = _pdf_money(documento.get("total") or 0)
+    safe_sucursal = urllib.parse.quote(norm_sucursal(sucursal or documento.get("sucursal") or DEFAULT_SUCURSAL))
+    pdf_inline = f"/documentos/{documento_id}/pdf?sucursal={safe_sucursal}&inline=true"
+    pdf_download = f"/documentos/{documento_id}/pdf?sucursal={safe_sucursal}"
+    title = f"{tipo} {numero}"
+    body = f"""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{title}</title>
+  <style>
+    *{{box-sizing:border-box}} body{{margin:0;background:#edf2f7;color:#0f172a;font-family:Arial,Helvetica,sans-serif}}
+    header{{background:#fff;border-bottom:1px solid #dbe4ef;padding:14px 18px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:2}}
+    header img{{width:46px;height:46px;object-fit:contain}} h1{{font-size:18px;margin:0;font-weight:900}} .sub{{font-size:12px;color:#64748b;margin-top:2px}}
+    main{{max-width:980px;margin:16px auto;padding:0 12px}} .card{{background:#fff;border:1px solid #dbe4ef;border-radius:8px;box-shadow:0 8px 22px rgba(15,23,42,.08);overflow:hidden}}
+    .summary{{display:grid;grid-template-columns:1fr auto;gap:10px;padding:14px 16px;border-bottom:1px solid #e2e8f0}}
+    .summary b{{font-size:16px}} .total{{font-size:20px;font-weight:900;color:#0f766e;text-align:right}}
+    .actions{{display:flex;gap:8px;flex-wrap:wrap;padding:10px;background:#f8fafc;border-bottom:1px solid #e2e8f0}}
+    button,a.btn{{border:0;border-radius:7px;padding:10px 13px;font-weight:900;text-decoration:none;cursor:pointer;color:white;background:#2563eb}}
+    a.download{{background:#7c3aed}} button.print{{background:#059669}} iframe{{width:100%;height:76vh;border:0;background:white}}
+    @media(max-width:640px){{.summary{{grid-template-columns:1fr}} iframe{{height:70vh}}}}
+  </style>
+</head>
+<body>
+  <header><img src="/army-logo-doc.png" alt="G&G ERP"><div><h1>{title}</h1><div class="sub">Documento emitido por G&G ERP</div></div></header>
+  <main><section class="card">
+    <div class="summary"><div><b>{cliente}</b><div class="sub">Fecha: {fecha}</div></div><div class="total">S/ {total}</div></div>
+    <div class="actions"><button class="print" onclick="frames.pdf.focus();frames.pdf.print()">Imprimir</button><a class="btn download" href="{pdf_download}">Descargar PDF</a><a class="btn" href="{pdf_inline}" target="_blank" rel="noopener">Abrir PDF</a></div>
+    <iframe name="pdf" src="{pdf_inline}" title="PDF"></iframe>
+  </section></main>
+</body>
+</html>"""
+    return Response(body, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/documentos/{documento_id}")
