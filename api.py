@@ -1396,12 +1396,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.55")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.56")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.55_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.56_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.55_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.55: corrige version visible y fuerza APK actualizado.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.56_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.56: formato de documentos unificado, login recordado y cotizaciones persistentes.")
     return {
         "ok": True,
         "success": True,
@@ -2230,30 +2230,30 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     # Plantilla fija A4: evita que el visor interno mande la impresion a 2 hojas.
     logo_w = min(max(float(layout.get("logo_ancho_mm", 29) or 29), 22), 36)
     logo_h = min(max(float(layout.get("logo_alto_mm", 20) or 20), 16), 26)
-    _draw_pdf_logo(c, cfg, 7, 17, logo_w, logo_h, mm, page_h)
+    _draw_pdf_logo(c, cfg, 7, 15, logo_w, logo_h, mm, page_h)
 
     empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
-    direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper().replace(">>", "»")
+    direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper()
     telefono = str(cfg.get("telefono") or "")
     slogan = str(cfg.get("mensaje") or "MEJORES PRECIOS EN TARJETAS DE VIDEOS").upper()
 
-    for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 14.6, 2)):
-        txt(43, 10.2 + i * 5.3, ln, 14.6, True)
-    for i, ln in enumerate(fit(direccion, 80, "Helvetica", 8.0, 3)):
-        txt(43, 25.5 + i * 4.5, ln, 8.0)
+    for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 15.8, 2)):
+        txt(37, 8.8 + i * 5.4, ln, 15.8, True)
+    for i, ln in enumerate(fit(direccion, 86, "Helvetica", 8.8, 3)):
+        txt(37, 25.0 + i * 4.6, ln, 8.8)
     if telefono:
-        txt(43, 43, telefono, 7.5)
-    txt(43, 41.5, slogan, 8.8)
+        txt(37, 43, telefono, 7.5)
+    txt(37, 41.5, slogan, 8.8, True)
 
-    rect(130, 6, 74, 39)
-    txt_c(167, 18, f"RUC {cfg.get('ruc') or '20611068701'}", 14.0)
+    rect(114, 4, 72, 39)
+    txt_c(150, 13.0, f"RUC {cfg.get('ruc') or '20611068701'}", 14.2)
     for i, ln in enumerate(title.split("\n")):
-        txt_c(167, 28.5 + i * 5.7, ln, 16.2, True)
-    txt_c(167, 42, numero, 13.2)
+        txt_c(150, 25.0 + i * 5.6, ln, 15.8, True)
+    txt_c(150, 39.0, numero, 13.0)
 
     fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
     venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
-    client_y = 52
+    client_y = 48
     doc_cliente = str(documento.get("documento_cliente") or "").upper()
     cliente = str(documento.get("cliente_nombre") or "USUARIO X").upper()
     direccion_cliente = str(documento.get("direccion_cliente") or "SIN DIRECCION").upper()
@@ -2264,13 +2264,13 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(5.5, client_y + 9.2, "DIRECCIÓN", 9.4, True)
     for i, ln in enumerate(fit(direccion_cliente, 91, "Helvetica", 9.2, 2)):
         txt(34, client_y + 9.2 + i * 3.8, ln, 9.2)
-    txt(136, client_y, "FECHA EMISIÓN", 9.4, True); txt(174, client_y, fecha, 9.2)
-    txt(136, client_y + 4.6, "FECHA VENCIMIENTO", 9.4, True); txt(174, client_y + 4.6, venc, 9.2)
-    txt(136, client_y + 9.2, "MONEDA", 9.4, True); txt(174, client_y + 9.2, "SOLES", 9.2)
+    txt(118, client_y, "FECHA EMISIÓN", 9.4, True); txt(160, client_y, fecha, 9.2)
+    txt(118, client_y + 4.6, "FECHA VENCIMIENTO", 9.4, True); txt(160, client_y + 4.6, venc, 9.2)
+    txt(118, client_y + 9.2, "MONEDA", 9.4, True); txt(160, client_y + 9.2, "SOLES", 9.2)
 
-    tx, ty, tw = 5.0, 70.0, 200.0
-    header_h = 5.2
-    row_h = 5.8
+    tx, ty, tw = 5.0, 62.0, 200.0
+    header_h = 4.8
+    row_h = 5.3
     th = header_h + (row_h * max_rows)
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
@@ -2294,11 +2294,11 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
         txt_c(centers[2], row_y, code[:15], 7.8)
-        desc_lines = fit(desc, 92, "Helvetica", 8.2, 2)
+        desc_lines = fit(desc, 92, "Helvetica-Bold", 8.4, 2)
         for j, ln in enumerate(desc_lines):
-            txt(cols[3] + 1.6, row_y + j * 3.0, ln, 8.2)
+            txt(cols[3] + 1.6, row_y + j * 3.0, ln, 8.4, True)
         if series:
-            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 2) * 2.9, "SN:" + series[:70], 8.0)
+            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 2) * 2.9, "SN:" + series[:70], 7.6)
         txt_r(cols[5] - 1.2, row_y, f"{qty:.2f}", 8.0)
         txt_r(cols[6] - 1.2, row_y, _pdf_money(total), 8.0)
         txt_r(cols[7] - 1.2, row_y, _pdf_money(price), 8.0)
@@ -2315,7 +2315,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 9.2)
     line(tx, ty + th + 7.2, tx + tw, ty + th + 7.2)
 
-    block_y = ty + th + 10.5
+    block_y = ty + th + 9.5
     totals_x, totals_y = 136, block_y
     rect(totals_x, totals_y, 71, 22)
     line(totals_x, totals_y + 7, totals_x + 71, totals_y + 7)
@@ -2324,7 +2324,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 10.2, True); txt(totals_x + 36, totals_y + 11, "S/", 10.0); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 10.0)
     txt(totals_x + 3, totals_y + 18, "TOTAL", 10.8, True); txt(totals_x + 36, totals_y + 18, "S/", 10.8, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 10.8, True)
 
-    info_y = 177
+    info_y = 163
     txt(5.0, info_y, "USUARIO", 9.2, True); txt(58, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 8.8)
     txt(5.0, info_y + 4.8, "CONDICIÓN DE PAGO", 9.2, True); txt(58, info_y + 4.8, documento.get("estado_pago") or "CONTADO", 9.0)
     txt(5.0, info_y + 9.6, "CUENTAS BANCARIAS", 9.2, True)
@@ -2350,10 +2350,6 @@ def generar_pdf_documento_original(documento, detalle, cfg):
             wy += 4.3
             if wy > 268:
                 break
-    c.setFillColorRGB(0.94, 0.94, 0.94); c.rect(0, 0, page_w, X(14), fill=1, stroke=0); c.setFillGray(0)
-    txt_c(105, 285, "G&G ERP", 12.5, True)
-    txt_c(105, 290, "Comprobante emitido a través de G&G ERP", 8.0)
-
     c.showPage()
     c.save()
     buffer.seek(0)
