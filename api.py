@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -377,7 +377,7 @@ def normalizar_pagos_detalle(items=None, metodo_pago=None, monto_pagado=None):
 
 
 STOCK_DOC_TYPES = {"BOLETA", "FACTURA", "PASE"}
-TEST_PRODUCT_MARKERS = ("PRUEBA", "RANDOM", "GENERICO", "GENÉRICO", "COTIZACION", "COTIZACIÓN")
+TEST_PRODUCT_MARKERS = ("PRUEBA", "RANDOM", "GENERICO", "GENÃ‰RICO", "COTIZACION", "COTIZACIÃ“N")
 
 
 def split_series_text(value):
@@ -1379,10 +1379,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.64"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.64/erp_sql_pro_v20_v1.0.64.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.64.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.64: agrega reservas de clientes y descarga PDF a Descargas."
+    latest_version = "1.0.65"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.65/erp_sql_pro_v20_v1.0.65.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.65.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.65: series con fecha/usuario, caja por calendario, venta con click unico y formato de documentos alineado."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1396,12 +1396,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.56")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.57")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.56_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.56_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.56: formato de documentos unificado, login recordado y cotizaciones persistentes.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.57: series con fecha/usuario, caja por calendario, venta con click unico y formato de documentos alineado.")
     return {
         "ok": True,
         "success": True,
@@ -1846,7 +1846,7 @@ def enviar_boquitoqui_live(data: BoquitoquiMensaje):
     if not audio_base64:
         return {"ok": False, "success": False, "msg": "Audio vacio."}
     if len(audio_base64) > 650000:
-        return {"ok": False, "success": False, "msg": "Audio muy grande. Mantén presionado por tramos cortos."}
+        return {"ok": False, "success": False, "msg": "Audio muy grande. MantÃ©n presionado por tramos cortos."}
 
     recipients = []
     if destinatario:
@@ -2020,14 +2020,14 @@ def documento_config_default():
             },
             "layout": {
                 "max_productos": 12,
-                "alto_fila_mm": 8.0,
-                "alto_tabla_mm": 100,
-                "letra_tabla_px": 7,
-                "letra_descripcion_px": 7,
+                "alto_fila_mm": 8.2,
+                "alto_tabla_mm": 120,
+                "letra_tabla_px": 7.2,
+                "letra_descripcion_px": 7.4,
                 "logo_ancho_mm": 24,
-                "logo_alto_mm": 18,
-                "logo_bajar_mm": 15,
-                "margen_superior_mm": 7,
+                "logo_alto_mm": 15,
+                "logo_bajar_mm": 21,
+                "margen_superior_mm": 10,
             },
         },
     }
@@ -2227,10 +2227,10 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     layout = editor.get("layout") if isinstance(editor.get("layout"), dict) else {}
     max_rows = max(1, min(int(float(layout.get("max_productos", 12) or 12)), 12))
 
-    # Plantilla fija A4: evita que el visor interno mande la impresion a 2 hojas.
-    logo_w = min(max(float(layout.get("logo_ancho_mm", 29) or 29), 22), 36)
-    logo_h = min(max(float(layout.get("logo_alto_mm", 20) or 20), 16), 26)
-    _draw_pdf_logo(c, cfg, 7, 15, logo_w, logo_h, mm, page_h)
+    # Plantilla fija A4 alineada al formato Computer Army usado en PC/Android.
+    logo_w = min(max(float(layout.get("logo_ancho_mm", 24) or 24), 16), 36)
+    logo_h = min(max(float(layout.get("logo_alto_mm", 15) or 15), 10), 26)
+    _draw_pdf_logo(c, cfg, 16, 27, logo_w, logo_h, mm, page_h)
 
     empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
     direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper()
@@ -2238,43 +2238,43 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     slogan = str(cfg.get("mensaje") or "MEJORES PRECIOS EN TARJETAS DE VIDEOS").upper()
 
     for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 15.8, 2)):
-        txt(37, 8.8 + i * 5.4, ln, 15.8, True)
-    for i, ln in enumerate(fit(direccion, 86, "Helvetica", 8.8, 3)):
-        txt(37, 25.0 + i * 4.6, ln, 8.8)
+        txt(49, 10.5 + i * 5.2, ln, 15.8, True)
+    for i, ln in enumerate(fit(direccion, 82, "Helvetica-Bold", 7.2, 3)):
+        txt(49, 27.5 + i * 3.9, ln, 7.2, True)
     if telefono:
-        txt(37, 43, telefono, 7.5)
-    txt(37, 41.5, slogan, 8.8, True)
+        txt(49, 39.5, telefono, 6.8)
+    txt(49, 45.5 if telefono else 40.5, slogan, 7.2, True)
 
-    rect(114, 4, 72, 39)
-    txt_c(150, 13.0, f"RUC {cfg.get('ruc') or '20611068701'}", 14.2)
+    rect(124, 7, 72, 45)
+    txt_c(160, 18.5, f"RUC {cfg.get('ruc') or '20611068701'}", 11.8)
     for i, ln in enumerate(title.split("\n")):
-        txt_c(150, 25.0 + i * 5.6, ln, 15.8, True)
-    txt_c(150, 39.0, numero, 13.0)
+        txt_c(160, 32.0 + i * 5.4, ln, 16.0, True)
+    txt_c(160, 46.0, numero, 11.6)
 
     fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
     venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
-    client_y = 48
+    client_y = 58
     doc_cliente = str(documento.get("documento_cliente") or "").upper()
     cliente = str(documento.get("cliente_nombre") or "USUARIO X").upper()
     direccion_cliente = str(documento.get("direccion_cliente") or "SIN DIRECCION").upper()
-    txt(5.5, client_y, "DOCUMENTO", 9.4, True); txt(34, client_y, doc_cliente, 9.2)
-    txt(5.5, client_y + 4.6, "CLIENTE", 9.4, True)
-    for i, ln in enumerate(fit(cliente, 91, "Helvetica", 9.2, 2)):
-        txt(34, client_y + 4.6 + i * 3.8, ln, 9.2)
-    txt(5.5, client_y + 9.2, "DIRECCIÓN", 9.4, True)
-    for i, ln in enumerate(fit(direccion_cliente, 91, "Helvetica", 9.2, 2)):
-        txt(34, client_y + 9.2 + i * 3.8, ln, 9.2)
-    txt(118, client_y, "FECHA EMISIÓN", 9.4, True); txt(160, client_y, fecha, 9.2)
-    txt(118, client_y + 4.6, "FECHA VENCIMIENTO", 9.4, True); txt(160, client_y + 4.6, venc, 9.2)
-    txt(118, client_y + 9.2, "MONEDA", 9.4, True); txt(160, client_y + 9.2, "SOLES", 9.2)
+    txt(7, client_y, "DOCUMENTO", 7.4, True); txt(42, client_y, doc_cliente, 7.2)
+    txt(7, client_y + 5.0, "CLIENTE", 7.4, True)
+    for i, ln in enumerate(fit(cliente, 91, "Helvetica", 7.2, 2)):
+        txt(42, client_y + 5.0 + i * 3.5, ln, 7.2)
+    txt(7, client_y + 10.0, "DIRECCION", 7.4, True)
+    for i, ln in enumerate(fit(direccion_cliente, 91, "Helvetica", 7.2, 2)):
+        txt(42, client_y + 10.0 + i * 3.5, ln, 7.2)
+    txt(124, client_y, "FECHA EMISION", 7.4, True); txt(169, client_y, fecha, 7.2)
+    txt(124, client_y + 5.0, "FECHA VENCIMIENTO", 7.4, True); txt(169, client_y + 5.0, venc, 7.2)
+    txt(124, client_y + 10.0, "MONEDA", 7.4, True); txt(169, client_y + 10.0, "SOLES", 7.2)
 
-    tx, ty, tw = 5.0, 62.0, 200.0
+    tx, ty, tw = 7.0, 73.0, 199.0
     header_h = 4.8
-    row_h = 5.3
+    row_h = 8.2
     th = header_h + (row_h * max_rows)
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
-    cols = [tx, tx + 8.5, tx + 28.5, tx + 57.5, tx + 152.0, tx + 167.5, tx + 183.0, tx + tw]
+    cols = [tx, tx + 8.5, tx + 28.5, tx + 57.5, tx + 144.0, tx + 160.0, tx + 180.0, tx + tw]
     headers = ["Nro", "UNIDAD", "CODIGO", "DESCRIPCION", "CANT.", "TOTAL", "P. UNIT."]
     centers = [(cols[i] + cols[i+1]) / 2 for i in range(len(cols)-1)]
     for idx, h in enumerate(headers):
@@ -2294,11 +2294,11 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
         txt_c(centers[2], row_y, code[:15], 7.8)
-        desc_lines = fit(desc, 92, "Helvetica-Bold", 8.4, 2)
+        desc_lines = fit(desc, 84, "Helvetica-Bold", 7.4, 3)
         for j, ln in enumerate(desc_lines):
-            txt(cols[3] + 1.6, row_y + j * 3.0, ln, 8.4, True)
+            txt(cols[3] + 1.6, row_y + j * 3.0, ln, 7.4, True)
         if series:
-            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 2) * 2.9, "SN:" + series[:70], 7.6)
+            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 3) * 2.8, "SN:" + series[:76], 6.2)
         txt_r(cols[5] - 1.2, row_y, f"{qty:.2f}", 8.0)
         txt_r(cols[6] - 1.2, row_y, _pdf_money(total), 8.0)
         txt_r(cols[7] - 1.2, row_y, _pdf_money(price), 8.0)
@@ -2312,11 +2312,11 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         igv_doc = round(total_doc - subtotal_doc, 2)
     line(tx, ty + th, tx + tw, ty + th)
     words_y = ty + th + 4.0
-    txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 9.2)
+    txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 6.2)
     line(tx, ty + th + 7.2, tx + tw, ty + th + 7.2)
 
-    block_y = ty + th + 9.5
-    totals_x, totals_y = 136, block_y
+    block_y = ty + th + 8.0
+    totals_x, totals_y = 141, block_y
     rect(totals_x, totals_y, 71, 22)
     line(totals_x, totals_y + 7, totals_x + 71, totals_y + 7)
     line(totals_x, totals_y + 14, totals_x + 71, totals_y + 14)
@@ -2324,25 +2324,25 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 10.2, True); txt(totals_x + 36, totals_y + 11, "S/", 10.0); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 10.0)
     txt(totals_x + 3, totals_y + 18, "TOTAL", 10.8, True); txt(totals_x + 36, totals_y + 18, "S/", 10.8, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 10.8, True)
 
-    info_y = 163
-    txt(5.0, info_y, "USUARIO", 9.2, True); txt(58, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 8.8)
-    txt(5.0, info_y + 4.8, "CONDICIÓN DE PAGO", 9.2, True); txt(58, info_y + 4.8, documento.get("estado_pago") or "CONTADO", 9.0)
-    txt(5.0, info_y + 9.6, "CUENTAS BANCARIAS", 9.2, True)
-    txt(58, info_y + 9.6, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 8.8)
-    txt(58, info_y + 14.0, "Titular:Computer Army Eirl", 8.8)
-    txt(58, info_y + 22.0, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 8.6)
-    txt(58, info_y + 26.4, "Titular: Computer Army eirl", 8.8)
+    info_y = 204
+    txt(7.0, info_y, "USUARIO", 7.0, True); txt(65, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 6.6)
+    txt(7.0, info_y + 4.8, "CONDICION DE PAGO", 7.0, True); txt(65, info_y + 4.8, documento.get("estado_pago") or "CONTADO", 6.8)
+    txt(65, info_y + 12.0, "CUENTAS BANCARIAS", 6.8, True)
+    txt(94, info_y + 12.0, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 6.5)
+    txt(65, info_y + 16.0, "Titular:Computer Army Eirl", 6.5)
+    txt(65, info_y + 23.2, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 6.3)
+    txt(65, info_y + 27.2, "Titular: Computer Army eirl", 6.5)
     qr_url = public_document_url(documento)
     if not _draw_pdf_qr(c, qr_url, 181, info_y + 27, 20, mm, page_h):
         rect(181, info_y + 27, 20, 20)
 
-    legal_y = 216
-    txt(5.0, legal_y, "Autorizado mediante resolución Nº 034-005-0010431/SUNAT", 8.6)
-    txt(5.0, legal_y + 5, f"Representación impresa de la {title.replace(chr(10), ' ')}", 8.6)
+    legal_y = 236
+    txt(5.0, legal_y, "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT", 7.0)
+    txt(5.0, legal_y + 5, f"Representacion impresa de la {title.replace(chr(10), ' ')}", 7.0)
     txt(5.0, legal_y + 10, "Para consultar el comprobante visita G&G ERP", 8.6)
     txt(5.0, legal_y + 15, "Resumen", 8.6)
     texts = editor.get("texts") if isinstance(editor.get("texts"), dict) else {}
-    wy = 244
+    wy = 254
     for key in ("garantia_1", "garantia_2", "garantia_3", "garantia_4", "garantia_5", "garantia_6"):
         text = texts.get(key, "")
         if text:
@@ -3263,6 +3263,36 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
 
         _, nombre, categoria, marca, modelo = producto
         movimientos = []
+
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        cur.execute("""
+        SELECT
+            COALESCE(fecha_ingreso::text, '') AS fecha_ingreso,
+            to_char(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en,
+            COALESCE(serie,'') AS serie,
+            COALESCE(proveedor,'') AS proveedor,
+            COALESCE(estado,'DISPONIBLE') AS estado,
+            COALESCE(almacen,'TIENDA') AS almacen,
+            COALESCE(usuario_ingreso,'') AS usuario_ingreso
+        FROM producto_series
+        WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s
+        ORDER BY COALESCE(fecha_ingreso, creado_en::date) DESC, id DESC
+        LIMIT 120
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+        for row in dict_fetchall(cur):
+            fecha = row.get("fecha_ingreso") or row.get("creado_en") or ""
+            movimientos.append({
+                "origen": "INGRESO SERIE",
+                "fecha": fecha,
+                "titulo": f"Ingreso serie {row.get('serie') or ''}".strip(),
+                "detalle": f"{row.get('estado') or 'DISPONIBLE'} / {row.get('proveedor') or 'Sin proveedor'} / {row.get('almacen') or 'TIENDA'}",
+                "serie": row.get("serie"),
+                "usuario": row.get("usuario_ingreso"),
+                "proveedor": row.get("proveedor"),
+                "estado": row.get("estado"),
+                "almacen": row.get("almacen"),
+            })
 
         cur.execute("""
         SELECT
@@ -5440,3 +5470,5 @@ if __name__ == "__main__":
     out = migrate_schema()
     print(json.dumps(out, ensure_ascii=False))
     sys.exit(0 if out.get("ok") else 1)
+
+
