@@ -1396,12 +1396,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.54")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.55")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
-    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.54_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.55_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
-    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.54_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.54: nueva interfaz con reservas y visor PDF corregido.")
+    android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.55_CAJA_PRODUCTOS_INSTALABLE.apk")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.55: corrige version visible y fuerza APK actualizado.")
     return {
         "ok": True,
         "success": True,
