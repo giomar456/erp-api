@@ -1393,10 +1393,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.66"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.66/erp_sql_pro_v20_v1.0.66.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.66.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.66: color por usuario, ventas sin modal al agregar y formato PDF compacto corregido."
+    latest_version = "1.0.67"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.67/erp_sql_pro_v20_v1.0.67.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.67.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.67: documentos A4 sin columna codigo, descripcion amplia y formato fijo al imprimir."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1410,12 +1410,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.58")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.59")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.58: color por usuario, ventas sin modal al agregar y formato PDF compacto corregido.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.59: documentos A4 sin columna codigo, descripcion amplia y formato fijo al imprimir.")
     return {
         "ok": True,
         "success": True,
@@ -2330,8 +2330,8 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     th = header_h + (row_h * max_rows)
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
-    cols = [tx, tx + 8.5, tx + 28.5, tx + 57.5, tx + 144.0, tx + 160.0, tx + 180.0, tx + tw]
-    headers = ["Nro", "UNIDAD", "CODIGO", "DESCRIPCION", "CANT.", "TOTAL", "P. UNIT."]
+    cols = [tx, tx + 8.5, tx + 28.5, tx + 144.0, tx + 160.0, tx + 180.0, tx + tw]
+    headers = ["Nro", "UNIDAD", "DESCRIPCION", "CANT.", "TOTAL", "P. UNIT."]
     centers = [(cols[i] + cols[i+1]) / 2 for i in range(len(cols)-1)]
     for idx, h in enumerate(headers):
         txt_c(centers[idx], ty + 3.8, h, 9.4, True)
@@ -2345,19 +2345,17 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         price = float(item.get("precio_unitario") or item.get("precio") or 0)
         total = float(item.get("total") or qty * price)
         desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
-        code = str(item.get("codigo") or item.get("producto_id") or item.get("id") or "")
         series = str(item.get("series_texto") or item.get("serie") or "").strip()
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
-        txt_c(centers[2], row_y, code[:15], 7.8)
-        desc_lines = fit(desc, 84, "Helvetica-Bold", 7.0, 3)
+        desc_lines = fit(desc, 108, "Helvetica-Bold", 7.0, 3)
         for j, ln in enumerate(desc_lines):
-            txt(cols[3] + 1.6, row_y + j * 2.6, ln, 7.0, True)
+            txt(cols[2] + 1.6, row_y + j * 2.6, ln, 7.0, True)
         if series:
-            txt(cols[3] + 1.6, row_y + min(len(desc_lines), 3) * 2.5, "SN:" + series[:76], 6.0)
-        txt_r(cols[5] - 1.2, row_y, f"{qty:.2f}", 8.0)
-        txt_r(cols[6] - 1.2, row_y, _pdf_money(total), 8.0)
-        txt_r(cols[7] - 1.2, row_y, _pdf_money(price), 8.0)
+            txt(cols[2] + 1.6, row_y + min(len(desc_lines), 3) * 2.5, "SN:" + series[:92], 6.0)
+        txt_r(cols[4] - 1.2, row_y, f"{qty:.2f}", 8.0)
+        txt_r(cols[5] - 1.2, row_y, _pdf_money(total), 8.0)
+        txt_r(cols[6] - 1.2, row_y, _pdf_money(price), 8.0)
         row_y += row_h
 
     total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle or []))
