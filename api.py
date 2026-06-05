@@ -1393,10 +1393,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.67"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.67/erp_sql_pro_v20_v1.0.67.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.67.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.67: documentos A4 sin columna codigo, descripcion amplia y formato fijo al imprimir."
+    latest_version = "1.0.68"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.68/erp_sql_pro_v20_v1.0.68.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.68.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.68: ventas con buscador rapido, sin botones extra y documentos A4 sin columna codigo."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1410,12 +1410,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.59")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.60")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.59: documentos A4 sin columna codigo, descripcion amplia y formato fijo al imprimir.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.60: ventas con buscador rapido, sin botones extra y documentos A4 sin columna codigo.")
     return {
         "ok": True,
         "success": True,
