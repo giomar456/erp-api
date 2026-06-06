@@ -2094,7 +2094,7 @@ def documento_config_default():
                 "direccion": "PRINCIPAL >> AV. INCA GARCILASO DE LA VEGA NRO. 1348 INT2B 130-131 - CERCADO DE LIMA - LIMA - PERU",
                 "slogan": "MEJORES PRECIOS EN TARJETAS DE VIDEOS",
                 "legal_line1": "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT",
-                "legal_line2": "Representacion impresa de la BOLETA DE VENTA ELECTRONICA",
+                "legal_line2": "",
                 "legal_line3": "Emitido mediante G&G ERP",
                 "garantia_1": "UN ANO DE GARANTIA DE CADA PRODUCTO Y 6 MESES PARA PERIFERICOS",
                 "garantia_2": "NO SE ACEPTAN CAMBIOS NI DEVOLUCIONES. SOLO DEFECTO DE FABRICA",
@@ -2307,7 +2307,13 @@ def generar_pdf_documento_original(documento, detalle, cfg):
 
     doc_type = str(documento.get("tipo") or "DOCUMENTO").upper()
     numero = str(documento.get("numero") or "")
-    title = {"BOLETA": "BOLETA DE VENTA\nELECTRONICA", "FACTURA": "FACTURA\nELECTRONICA", "PROFORMA": "PROFORMA", "PASE": "PASE"}.get(doc_type, doc_type)
+    title = {
+        "BOLETA": "BOLETA DE VENTA\nELECTRONICA",
+        "FACTURA": "FACTURA\nELECTRONICA",
+        "PROFORMA": "PROFORMA",
+        "PASE": "PASE",
+        "NOTA DE VENTA": "NOTA DE VENTA",
+    }.get(doc_type, doc_type)
     editor = cfg.get("doc_editor") if isinstance(cfg.get("doc_editor"), dict) else {}
     layout = editor.get("layout") if isinstance(editor.get("layout"), dict) else {}
     max_rows = max(1, min(int(float(layout.get("max_productos", 12) or 12)), 12))
