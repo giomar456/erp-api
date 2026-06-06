@@ -4022,6 +4022,69 @@ def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL,
         return {"ok": False, "success": False, "msg": f"No se pudo generar PDF: {e}"}
 
 
+@app.post("/documentos/preview/pdf")
+def preview_documento_pdf(data: Venta, sucursal: str = DEFAULT_SUCURSAL, inline: bool = True):
+    doc_type = str(data.tipo or "PROFORMA").upper()
+    numero_preview = {
+        "BOLETA": "B001-VISTA-PREVIA",
+        "FACTURA": "F001-VISTA-PREVIA",
+        "PROFORMA": "VISTA-PREVIA",
+        "PASE": "PA001-VISTA-PREVIA",
+        "NOTA DE VENTA": "NV001-VISTA-PREVIA",
+    }.get(doc_type, "VISTA-PREVIA")
+    documento = {
+        "id": 0,
+        "tipo": doc_type,
+        "numero": numero_preview,
+        "cliente_nombre": data.cliente_nombre or ("CLIENTE GENERAL" if doc_type == "PROFORMA" else "USUARIO X"),
+        "documento_cliente": data.numero_documento_cliente or data.tipo_documento_cliente or "",
+        "numero_documento_cliente": data.numero_documento_cliente or "",
+        "direccion_cliente": data.direccion_cliente or "SIN DIRECCION",
+        "fecha_emision": data.fecha_emision or local_date(),
+        "fecha_vencimiento": data.fecha_vencimiento or (local_date() if doc_type == "PROFORMA" else ""),
+        "estado_pago": data.estado_pago or ("PROFORMA" if doc_type == "PROFORMA" else "CONTADO"),
+        "metodo_pago": data.metodo_pago or "",
+        "usuario_emisor": data.usuario_emisor or "",
+        "sucursal": sucursal or data.sucursal or DEFAULT_SUCURSAL,
+    }
+    detalle = []
+    for item in data.items or []:
+        qty = float(item.cantidad or 0)
+        price = float(item.precio or 0)
+        detalle.append({
+            "id": item.id,
+            "producto_id": item.producto_id or item.id,
+            "nombre": item.nombre or "",
+            "descripcion": item.nombre or "",
+            "marca": item.marca or "",
+            "modelo": item.modelo or "",
+            "cantidad": qty,
+            "precio": price,
+            "precio_unitario": price,
+            "total": float(item.total or (qty * price)),
+            "serie": item.serie or "",
+            "series_texto": item.series_texto or item.serie or "",
+        })
+    total_doc = round(sum(float(x.get("total") or 0) for x in detalle), 2)
+    documento["total"] = total_doc
+    documento["subtotal"] = round(total_doc / 1.18, 2) if total_doc else 0
+    documento["igv"] = round(total_doc - documento["subtotal"], 2) if total_doc else 0
+    try:
+        cfg = cargar_config_documento_dict(sucursal or data.sucursal or DEFAULT_SUCURSAL)
+        pdf = generar_pdf_documento_original(documento, detalle, cfg)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{doc_type}_{numero_preview}.pdf")
+        return Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{safe_name}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except Exception as e:
+        return {"ok": False, "success": False, "msg": f"No se pudo generar vista previa PDF: {e}"}
+
+
 @app.get("/public/documento/{documento_id}")
 def documento_publico_qr(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
     detail = detalle_documento(documento_id)
