@@ -1393,10 +1393,10 @@ def init_http():
 # ================= AUTO UPDATE =================
 @app.get("/app/version")
 def app_version():
-    latest_version = "1.0.69"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.69/erp_sql_pro_v20_v1.0.69.exe"
-    latest_name = "erp_sql_pro_v20_v1.0.69.exe"
-    latest_notes = "Actualizacion G&G ERP v1.0.69: ventas compactas, buscador fijo inferior y cambio automatico DNI/RUC."
+    latest_version = "1.0.70"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
+    latest_name = "erp_sql_pro_v20_v1.0.70.exe"
+    latest_notes = "Actualizacion G&G ERP v1.0.70: formato PDF referencia 1.0.52, visor PDF real, QR publico, edicion de proformas y reservas."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1410,12 +1410,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.61")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.62")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.61: ventas compactas, buscador fijo inferior y cambio automatico DNI/RUC.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion Android G&G ERP v1.62: PDF real para descargar/compartir, QR publico, edicion de proformas y reservas.")
     return {
         "ok": True,
         "success": True,
@@ -2065,11 +2065,37 @@ def documento_config_default():
         "cuenta_interbank": "2003005323345",
         "logo": "",
         "doc_editor": {
-            "template_name": "Formato original PC",
+            "template_name": "ARMY referencia exacta",
             "show_logo": True,
             "show_serie": True,
             "show_banks": True,
+            "keyfacil_exact": True,
+            "show_reference_footer": False,
+            "title_font": 14,
+            "header_font": 14,
+            "body_font": 7,
+            "table_font": 7,
+            "pdf_desc_font": 7.0,
+            "pdf_series_font": 6.2,
+            "pdf_row_height": 6.5,
+            "pdf_max_rows_first_page": 12,
+            "pdf_desc_lines": 3,
+            "pdf_series_lines": 1,
+            "pdf_line_gap": 2.8,
+            "logo_x": 16,
+            "logo_y": 27,
+            "logo_w": 24,
+            "logo_h": 15,
+            "company_x": 49,
+            "company_y": 10.5,
+            "company_w": 82,
             "texts": {
+                "empresa": "CORPORACION COMPUTER ARMY EIRL",
+                "direccion": "PRINCIPAL >> AV. INCA GARCILASO DE LA VEGA NRO. 1348 INT2B 130-131 - CERCADO DE LIMA - LIMA - PERU",
+                "slogan": "MEJORES PRECIOS EN TARJETAS DE VIDEOS",
+                "legal_line1": "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT",
+                "legal_line2": "Representacion impresa de la BOLETA DE VENTA ELECTRONICA",
+                "legal_line3": "Emitido mediante G&G ERP",
                 "garantia_1": "UN ANO DE GARANTIA DE CADA PRODUCTO Y 6 MESES PARA PERIFERICOS",
                 "garantia_2": "NO SE ACEPTAN CAMBIOS NI DEVOLUCIONES. SOLO DEFECTO DE FABRICA",
                 "garantia_3": "CONSERVAR CAJAS Y ACCESORIOS DE CADA PRODUCTO",
@@ -2663,6 +2689,20 @@ def actualizar_reserva(reserva_id: int, data: dict):
     monto_total = data.get("monto_total")
     monto_reserva = data.get("monto_reserva")
     observacion = str(data.get("observacion") or "")
+    tipo_documento = str(data.get("tipo_documento") or "").upper().strip()
+    numero_documento = only_digits(data.get("numero_documento") or "")
+    cliente_nombre = str(data.get("cliente_nombre") or "").strip()
+    producto_nombre = str(data.get("producto_nombre") or "").strip()
+    producto_id = data.get("producto_id")
+    cantidad = data.get("cantidad")
+    try:
+        producto_id = int(producto_id) if str(producto_id or "").strip() else None
+    except Exception:
+        producto_id = None
+    try:
+        cantidad = max(1, int(float(cantidad))) if cantidad not in (None, "") else None
+    except Exception:
+        cantidad = None
     cur.execute("""
         SELECT COALESCE(monto_total,0), COALESCE(monto_reserva,0),
                COALESCE(comprobantes_pago_json,'')
@@ -2685,6 +2725,12 @@ def actualizar_reserva(reserva_id: int, data: dict):
     cur.execute("""
         UPDATE reservas_clientes
         SET estado=%s, monto_total=%s, monto_reserva=%s, saldo=%s,
+            tipo_documento=CASE WHEN %s <> '' THEN %s ELSE COALESCE(tipo_documento,'DNI') END,
+            numero_documento=CASE WHEN %s <> '' THEN %s ELSE COALESCE(numero_documento,'') END,
+            cliente_nombre=CASE WHEN %s <> '' THEN %s ELSE COALESCE(cliente_nombre,'') END,
+            producto_id=COALESCE(%s, producto_id),
+            producto_nombre=CASE WHEN %s <> '' THEN %s ELSE COALESCE(producto_nombre,'') END,
+            cantidad=COALESCE(%s, cantidad, 1),
             observacion=CASE WHEN %s <> '' THEN %s ELSE COALESCE(observacion,'') END,
             comprobante_pago=COALESCE(%s, comprobante_pago, ''),
             comprobante_pago_nombre=COALESCE(%s, comprobante_pago_nombre, ''),
@@ -2695,7 +2741,14 @@ def actualizar_reserva(reserva_id: int, data: dict):
             comprobantes_pago_json=COALESCE(%s, comprobantes_pago_json, '')
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (
-        estado, total, reservado, saldo, observacion, observacion,
+        estado, total, reservado, saldo,
+        tipo_documento, tipo_documento,
+        numero_documento, numero_documento,
+        cliente_nombre, cliente_nombre,
+        producto_id,
+        producto_nombre, producto_nombre,
+        cantidad,
+        observacion, observacion,
         comprobante.get("comprobante_pago"),
         comprobante.get("comprobante_pago_nombre"),
         comprobante.get("comprobante_pago_mime"),
@@ -4094,6 +4147,8 @@ def detalle_documento(documento_id: int):
                 pass
 
 
+@app.put("/documentos/{documento_id}/editar")
+@app.post("/documentos/{documento_id}/editar")
 @app.put("/documentos/{documento_id}")
 def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
