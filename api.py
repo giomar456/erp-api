@@ -938,6 +938,11 @@ class EstadoSunatUpdate(BaseModel):
     sunat_modo: str = "MANUAL"
 
 
+class DocumentoObservacionInternaUpdate(BaseModel):
+    observacion_interna: str = ""
+    usuario: str = ""
+
+
 class DocumentoDetalleSeriesUpdate(BaseModel):
     series_texto: str = ""
     usuario: str = ""
@@ -1228,6 +1233,7 @@ def migrate_schema():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS subtotal NUMERIC DEFAULT 0",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS igv NUMERIC DEFAULT 0",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion TEXT",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS usuario_emisor TEXT",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'EMITIDO'",
@@ -2932,6 +2938,43 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     return data
 
 
+@app.get("/series/duplicadas")
+def listar_series_duplicadas(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        WITH normalizadas AS (
+            SELECT
+                UPPER(TRIM(COALESCE(ps.serie,''))) AS serie_norm,
+                ps.id,
+                ps.serie,
+                ps.producto_id,
+                COALESCE(p.nombre,'') AS producto_nombre,
+                COALESCE(ps.estado,'') AS estado,
+                COALESCE(ps.proveedor,'') AS proveedor
+            FROM producto_series ps
+            LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+            WHERE COALESCE(ps.sucursal,%s)=%s
+              AND TRIM(COALESCE(ps.serie,''))<>''
+        ),
+        repetidas AS (
+            SELECT serie_norm
+            FROM normalizadas
+            GROUP BY serie_norm
+            HAVING COUNT(DISTINCT producto_id) > 1 OR COUNT(*) > 1
+        )
+        SELECT n.*
+        FROM normalizadas n
+        INNER JOIN repetidas r ON r.serie_norm=n.serie_norm
+        ORDER BY n.serie_norm, n.producto_nombre
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+        return dict_fetchall(cur)
+    finally:
+        conn.close()
+
+
 @app.post("/series")
 def guardar_serie_producto(data: SerieProducto):
     conn = get_conn()
@@ -2953,6 +2996,21 @@ def guardar_serie_producto(data: SerieProducto):
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        cur.execute("""
+        SELECT UPPER(ps.serie) AS serie,
+               ps.producto_id,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND UPPER(ps.serie)=ANY(%s)
+          AND COALESCE(ps.producto_id,0)<>%s
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, series, data.producto_id))
+        duplicadas = dict_fetchall(cur)
+        if duplicadas:
+            detalle = "; ".join([f"{r.get('serie')} ya existe en {r.get('producto_nombre') or 'otro producto'}" for r in duplicadas])
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Serie duplicada en otro producto: " + detalle, "duplicadas": duplicadas}
         serie_ids = []
         for serie in series:
             cur.execute("""
@@ -3042,6 +3100,21 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         serie = series[0]
+        cur.execute("""
+        SELECT ps.id,
+               ps.producto_id,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE UPPER(ps.serie)=UPPER(%s)
+          AND COALESCE(ps.sucursal,%s)=%s
+          AND ps.id<>%s
+        LIMIT 1
+        """, (DEFAULT_SUCURSAL, sucursal, serie, DEFAULT_SUCURSAL, sucursal, serie_id))
+        duplicada = dict_fetchone(cur)
+        if duplicada:
+            conn.close()
+            return {"ok": False, "success": False, "msg": f"Serie duplicada en otro producto: {serie} ya existe en {duplicada.get('producto_nombre') or 'otro producto'}", "duplicada": duplicada}
         cur.execute("""
         UPDATE producto_series
         SET producto_id=%s,
@@ -3935,6 +4008,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = ""):
         cur = conn.cursor()
         sucursal = norm_sucursal(sucursal)
         filtro_fecha = (fecha or "").strip()
+        cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''")
 
         cur.execute("""
         SELECT
@@ -3950,6 +4024,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = ""):
             COALESCE(igv, 0) AS igv,
             COALESCE(total, 0) AS total,
             COALESCE(observacion, '') AS observacion,
+            COALESCE(observacion_interna, '') AS observacion_interna,
             COALESCE(usuario_emisor, '') AS usuario_emisor,
             COALESCE(estado, 'EMITIDO') AS estado,
             COALESCE(estado_pago, 'PAGADO') AS estado_pago,
@@ -4168,12 +4243,44 @@ def documento_publico_qr(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
     return Response(body, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
+@app.put("/documentos/{documento_id}/observacion-interna")
+def actualizar_observacion_interna_documento(documento_id: int, data: DocumentoObservacionInternaUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''")
+        observacion = (data.observacion_interna or "").strip()
+        cur.execute("""
+        UPDATE ventas
+        SET observacion_interna=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id, tipo, numero, COALESCE(observacion_interna,'') AS observacion_interna
+        """, (observacion, documento_id, DEFAULT_SUCURSAL, sucursal))
+        row = dict_fetchone(cur)
+        if not row:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Documento no encontrado"}
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (data.usuario or "", "", sucursal, "OBSERVACION INTERNA DOCUMENTO", f"{row.get('tipo')} {row.get('numero')} - {observacion}"))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, **row}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
 @app.get("/documentos/{documento_id}")
 def detalle_documento(documento_id: int):
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
+        cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''")
 
         cur.execute("""
         SELECT
@@ -4189,6 +4296,7 @@ def detalle_documento(documento_id: int):
             COALESCE(igv, 0) AS igv,
             COALESCE(total, 0) AS total,
             COALESCE(observacion, '') AS observacion,
+            COALESCE(observacion_interna, '') AS observacion_interna,
             COALESCE(usuario_emisor, '') AS usuario_emisor,
             COALESCE(estado, 'EMITIDO') AS estado,
             COALESCE(estado_pago, 'PAGADO') AS estado_pago,
