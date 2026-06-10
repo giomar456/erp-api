@@ -418,6 +418,20 @@ def sync_producto_stock_from_series(cur, producto_id, sucursal):
     """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
 
 
+def producto_tiene_series_activas(cur, producto_id, sucursal):
+    if not producto_id:
+        return False
+    cur.execute("""
+    SELECT COUNT(*)
+    FROM producto_series
+    WHERE producto_id=%s
+      AND COALESCE(sucursal,%s)=%s
+      AND UPPER(COALESCE(estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    return bool(row and int(row[0] or 0) > 0)
+
+
 def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
     cantidad = max(0, int(float(cantidad or 0)))
     if cantidad <= 0 or not producto_id:
@@ -444,9 +458,10 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     registered = {str(r.get("serie") or "").strip().upper(): r for r in dict_fetchall(cur) if str(r.get("serie") or "").strip()}
     registered_count = len(registered)
+    active_count = sum(1 for r in registered.values() if r.get("estado") in ("DISPONIBLE", "RESERVADO"))
     selected = split_series_text(series_texto)
 
-    if not registered_count:
+    if not registered_count or (not selected and not active_count):
         cur.execute("""
         UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
         WHERE id = %s AND COALESCE(sucursal,%s)=%s
@@ -541,6 +556,8 @@ def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, c
         return
     prod_nombre, prod_marca, prod_modelo = prod
     if is_test_product_name(prod_nombre, nombre_doc, marca_doc, modelo_doc):
+        return
+    if producto_tiene_series_activas(cur, producto_id, sucursal):
         return
 
     cur.execute("""
@@ -878,6 +895,7 @@ class CajaMovimiento(BaseModel):
     documento_numero: str = ""
     estado_pago: str = "PAGADO"
     metodo_pago: str = ""
+    observacion: str = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1264,11 +1282,13 @@ def migrate_schema():
             documento_tipo TEXT,
             documento_numero TEXT,
             estado_pago TEXT DEFAULT 'PAGADO',
-            metodo_pago TEXT DEFAULT ''
+            metodo_pago TEXT DEFAULT '',
+            observacion TEXT DEFAULT ''
         );
         """)
 
         cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS metodo_pago TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
         cur.execute("ALTER TABLE caja_movimientos ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
 
         cur.execute("""
@@ -3653,6 +3673,34 @@ def crear_venta(data: Venta):
             estado_pago = "DEUDA"
             metodo_pago = ""
 
+        if mueve_stock:
+            for item in data.items:
+                producto_id = item.producto_id or item.id
+                descripcion = item.nombre
+                marca = item.marca
+                modelo = item.modelo
+                if producto_id and not descripcion:
+                    cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal))
+                    prod = cur.fetchone()
+                    if prod:
+                        descripcion = prod[0] or ""
+                        marca = marca or (prod[1] or "")
+                        modelo = modelo or (prod[2] or "")
+                error_series = validar_y_marcar_series_venta(
+                    cur,
+                    producto_id,
+                    descripcion,
+                    marca,
+                    modelo,
+                    item.cantidad,
+                    item.series_texto or item.serie,
+                    sucursal,
+                )
+                if error_series:
+                    conn.rollback()
+                    conn.close()
+                    return {"ok": False, "success": False, "msg": error_series}
+
         cur.execute("""
         INSERT INTO ventas (
             fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
@@ -3694,31 +3742,20 @@ def crear_venta(data: Venta):
                 item.cantidad, item.precio, item.total, sucursal
             ))
 
-            if mueve_stock:
-                descontar_stock_venta(
-                    cur,
-                    producto_id,
-                    descripcion,
-                    marca,
-                    modelo,
-                    item.cantidad,
-                    item.series_texto or item.serie,
-                    sucursal,
-                )
-
         cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
 
         if mueve_stock:
+            caja_observacion = (data.observacion or "").strip()
             cur.execute("""
             INSERT INTO caja_movimientos (
-                fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
+                fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, observacion, sucursal
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 fecha_emision,
                 "INGRESO" if estado_pago == "PAGADO" else estado_pago,
                 f"{data.tipo} {numero} - {data.cliente_nombre}",
-                total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago, sucursal
+                total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago, caja_observacion, sucursal
             ))
 
         conn.commit()
@@ -3854,12 +3891,12 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
 
         cur.execute("""
         INSERT INTO caja_movimientos (
-            fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
+            fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, observacion, sucursal
         )
-        VALUES (%s,'INGRESO',%s,%s,%s,%s,%s,'PAGADO','MANUAL',%s)
+        VALUES (%s,'INGRESO',%s,%s,%s,%s,%s,'PAGADO','MANUAL',%s,%s)
         """, (
             fecha_emision, f"{doc_tipo} {numero} - {cliente}",
-            total, data.usuario_emisor or "", doc_tipo, numero, sucursal
+            total, data.usuario_emisor or "", doc_tipo, numero, data.observacion or "", sucursal
         ))
 
         conn.commit()
@@ -4650,21 +4687,21 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
 
         cur.execute("""
         UPDATE caja_movimientos
-        SET tipo=%s, estado_pago=%s, metodo_pago=%s, monto=%s
+        SET tipo=%s, estado_pago=%s, metodo_pago=%s, monto=%s, observacion=%s
         WHERE documento_tipo=%s AND documento_numero=%s
           AND COALESCE(sucursal,%s)=%s
-        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, metodo_pago_db, monto_pagado_db, tipo, numero, DEFAULT_SUCURSAL, sucursal_db))
+        """, ("INGRESO" if estado_pago == "PAGADO" else estado_pago, estado_pago, metodo_pago_db, monto_pagado_db, data.observacion_pago or "", tipo, numero, DEFAULT_SUCURSAL, sucursal_db))
 
         if cur.rowcount == 0:
             cur.execute("""
             INSERT INTO caja_movimientos (
-                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
+                tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, observacion, sucursal
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 "INGRESO" if estado_pago == "PAGADO" else estado_pago,
                 f"{tipo} {numero} - {cliente}",
-                monto_pagado_db, usuario or "", tipo, numero, estado_pago, metodo_pago_db, sucursal_db
+                monto_pagado_db, usuario or "", tipo, numero, estado_pago, metodo_pago_db, data.observacion_pago or "", sucursal_db
             ))
 
         conn.commit()
@@ -4754,6 +4791,7 @@ def listar_caja(sucursal: str = DEFAULT_SUCURSAL):
            COALESCE(documento_numero, '') AS documento_numero,
            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
            COALESCE(metodo_pago, '') AS metodo_pago,
+           COALESCE(observacion, '') AS observacion,
            COALESCE(sucursal,%s) AS sucursal
     FROM caja_movimientos
     WHERE COALESCE(sucursal,%s)=%s
@@ -4775,13 +4813,13 @@ def registrar_caja(data: CajaMovimiento):
     metodo_pago = (data.metodo_pago or "").upper()
     cur.execute("""
     INSERT INTO caja_movimientos (
-        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, sucursal
+        tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, observacion, sucursal
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (
         data.tipo, data.detalle, data.monto, data.usuario,
-        data.documento_tipo, data.documento_numero, estado_pago, metodo_pago, sucursal
+        data.documento_tipo, data.documento_numero, estado_pago, metodo_pago, data.observacion or "", sucursal
     ))
     movimiento_id = cur.fetchone()[0]
     conn.commit()
