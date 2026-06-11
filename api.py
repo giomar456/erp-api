@@ -405,6 +405,94 @@ def is_test_product_name(*values):
     return any(marker in text for marker in TEST_PRODUCT_MARKERS)
 
 
+def normalize_match_text(value):
+    text = str(value or "").upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
+    texto_doc = normalize_match_text(descripcion_doc)
+    selected = split_series_text(series_texto)
+    touched_products = set()
+
+    if selected:
+        if len(set(selected)) != len(selected):
+            return "Combo/PRUEBA: hay series repetidas en el documento."
+        cur.execute("""
+        SELECT ps.id,
+               UPPER(COALESCE(ps.serie,'')) AS serie,
+               ps.producto_id,
+               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND UPPER(ps.serie)=ANY(%s)
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, selected))
+        rows = dict_fetchall(cur)
+        found = defaultdict(list)
+        for row in rows:
+            found[str(row.get("serie") or "").upper()].append(row)
+        for serie in selected:
+            matches = found.get(serie, [])
+            if not matches:
+                return f"Combo/PRUEBA: la serie {serie} no esta registrada."
+            disponibles = [r for r in matches if str(r.get("estado") or "").upper() in ("DISPONIBLE", "RESERVADO")]
+            if not disponibles:
+                estados = ", ".join(sorted({str(r.get("estado") or "") for r in matches}))
+                return f"Combo/PRUEBA: la serie {serie} no esta disponible ({estados})."
+            if len(disponibles) > 1:
+                candidatos = []
+                for row in disponibles:
+                    nombre = normalize_match_text(row.get("producto_nombre") or "")
+                    if nombre and nombre in texto_doc:
+                        candidatos.append(row)
+                if len(candidatos) == 1:
+                    row = candidatos[0]
+                else:
+                    nombres = ", ".join([r.get("producto_nombre") or "producto sin nombre" for r in disponibles])
+                    return f"Combo/PRUEBA: la serie {serie} existe en varios productos. Especifica el producto en el texto: {nombres}."
+            else:
+                row = disponibles[0]
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+            WHERE id=%s
+            """, (row.get("id"),))
+            if row.get("producto_id"):
+                touched_products.add(row.get("producto_id"))
+
+    for producto_id in touched_products:
+        sync_producto_stock_from_series(cur, producto_id, sucursal)
+
+    if texto_doc:
+        cur.execute("""
+        SELECT id, COALESCE(nombre,'') AS nombre
+        FROM productos
+        WHERE COALESCE(sucursal,%s)=%s
+        ORDER BY LENGTH(COALESCE(nombre,'')) DESC
+        """, (DEFAULT_SUCURSAL, sucursal))
+        for prod in dict_fetchall(cur):
+            producto_id = prod.get("id")
+            if not producto_id or producto_id in touched_products:
+                continue
+            nombre = normalize_match_text(prod.get("nombre") or "")
+            if len(nombre) < 8 or nombre not in texto_doc:
+                continue
+            if producto_tiene_series_activas(cur, producto_id, sucursal):
+                continue
+            cur.execute("""
+            UPDATE productos
+            SET stock = GREATEST(COALESCE(stock,0) - 1, 0)
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+            touched_products.add(producto_id)
+
+    return None
+
+
 def sync_producto_stock_from_series(cur, producto_id, sucursal):
     cur.execute("""
     UPDATE productos
@@ -1177,7 +1265,7 @@ def migrate_schema():
         CREATE TABLE IF NOT EXISTS producto_series (
             id SERIAL PRIMARY KEY,
             producto_id INT REFERENCES productos(id) ON DELETE CASCADE,
-            serie TEXT UNIQUE,
+            serie TEXT,
             proveedor TEXT,
             estado TEXT DEFAULT 'DISPONIBLE',
             fecha_ingreso TEXT,
@@ -1185,6 +1273,7 @@ def migrate_schema():
             creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cur.execute("ALTER TABLE producto_series DROP CONSTRAINT IF EXISTS producto_series_serie_key")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
@@ -2996,45 +3085,44 @@ def guardar_serie_producto(data: SerieProducto):
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        cur.execute("""
-        SELECT UPPER(ps.serie) AS serie,
-               ps.producto_id,
-               COALESCE(p.nombre,'') AS producto_nombre
-        FROM producto_series ps
-        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
-        WHERE COALESCE(ps.sucursal,%s)=%s
-          AND UPPER(ps.serie)=ANY(%s)
-          AND COALESCE(ps.producto_id,0)<>%s
-        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, series, data.producto_id))
-        duplicadas = dict_fetchall(cur)
-        if duplicadas:
-            detalle = "; ".join([f"{r.get('serie')} ya existe en {r.get('producto_nombre') or 'otro producto'}" for r in duplicadas])
-            conn.close()
-            return {"ok": False, "success": False, "msg": "Serie duplicada en otro producto: " + detalle, "duplicadas": duplicadas}
         serie_ids = []
         for serie in series:
             cur.execute("""
-            INSERT INTO producto_series (
-                producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal, usuario_ingreso
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (serie)
-            DO UPDATE SET producto_id=EXCLUDED.producto_id,
-                          proveedor=EXCLUDED.proveedor,
-                          estado=EXCLUDED.estado,
-                          almacen=EXCLUDED.almacen,
-                          fecha_ingreso=EXCLUDED.fecha_ingreso,
-                          fecha_salida=EXCLUDED.fecha_salida,
-                          sucursal=EXCLUDED.sucursal,
-                          usuario_ingreso=CASE
-                              WHEN COALESCE(EXCLUDED.usuario_ingreso,'')<>'' THEN EXCLUDED.usuario_ingreso
-                              ELSE producto_series.usuario_ingreso
-                          END
+            SELECT id
+            FROM producto_series
+            WHERE producto_id=%s
+              AND COALESCE(sucursal,%s)=%s
+              AND UPPER(COALESCE(serie,''))=UPPER(%s)
+            LIMIT 1
+            """, (data.producto_id, DEFAULT_SUCURSAL, sucursal, serie))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute("""
+                UPDATE producto_series
+                SET proveedor=%s,
+                    estado=%s,
+                    almacen=%s,
+                    fecha_ingreso=%s,
+                    fecha_salida=%s,
+                    usuario_ingreso=CASE WHEN %s<>'' THEN %s ELSE COALESCE(usuario_ingreso,'') END
+                WHERE id=%s
+                RETURNING id
+                """, (
+                    data.proveedor, data.estado, almacen,
+                    data.fecha_ingreso or lima_today_iso(), data.fecha_salida,
+                    data.usuario_ingreso or "", data.usuario_ingreso or "", existing[0]
+                ))
+            else:
+                cur.execute("""
+                INSERT INTO producto_series (
+                    producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal, usuario_ingreso
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
-            """, (
-                data.producto_id, serie, data.proveedor, data.estado, almacen,
-                data.fecha_ingreso or lima_today_iso(), data.fecha_salida, sucursal, data.usuario_ingreso or ""
-            ))
+                """, (
+                    data.producto_id, serie, data.proveedor, data.estado, almacen,
+                    data.fecha_ingreso or lima_today_iso(), data.fecha_salida, sucursal, data.usuario_ingreso or ""
+                ))
             serie_ids.append(cur.fetchone()[0])
 
         estado_serie = (data.estado or "").upper()
@@ -3109,12 +3197,13 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         WHERE UPPER(ps.serie)=UPPER(%s)
           AND COALESCE(ps.sucursal,%s)=%s
           AND ps.id<>%s
+          AND COALESCE(ps.producto_id,0)=%s
         LIMIT 1
-        """, (DEFAULT_SUCURSAL, sucursal, serie, DEFAULT_SUCURSAL, sucursal, serie_id))
+        """, (DEFAULT_SUCURSAL, sucursal, serie, DEFAULT_SUCURSAL, sucursal, serie_id, data.producto_id))
         duplicada = dict_fetchone(cur)
         if duplicada:
             conn.close()
-            return {"ok": False, "success": False, "msg": f"Serie duplicada en otro producto: {serie} ya existe en {duplicada.get('producto_nombre') or 'otro producto'}", "duplicada": duplicada}
+            return {"ok": False, "success": False, "msg": f"La serie {serie} ya existe en este producto.", "duplicada": duplicada}
         cur.execute("""
         UPDATE producto_series
         SET producto_id=%s,
@@ -3759,6 +3848,14 @@ def crear_venta(data: Venta):
                         descripcion = prod[0] or ""
                         marca = marca or (prod[1] or "")
                         modelo = modelo or (prod[2] or "")
+                series_texto = item.series_texto or item.serie
+                if is_test_product_name(descripcion, marca, modelo) or ((not producto_id) and series_texto):
+                    error_combo = procesar_combo_generico_venta(cur, descripcion, series_texto, sucursal)
+                    if error_combo:
+                        conn.rollback()
+                        conn.close()
+                        return {"ok": False, "success": False, "msg": error_combo}
+                    continue
                 error_series = validar_y_marcar_series_venta(
                     cur,
                     producto_id,
@@ -3766,7 +3863,7 @@ def crear_venta(data: Venta):
                     marca,
                     modelo,
                     item.cantidad,
-                    item.series_texto or item.serie,
+                    series_texto,
                     sucursal,
                 )
                 if error_series:
