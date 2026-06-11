@@ -147,24 +147,66 @@ _boquitoqui_live_queues = defaultdict(deque)
 DEFAULT_FEATURES = {
     "dashboard": True,
     "ventas": True,
+    "reservas": True,
+    "caja": True,
     "clientes": True,
     "productos": True,
     "inventario": True,
     "compras": True,
-    "contabilidad": True,
-    "caja": True,
+    "documentos": True,
     "radio": True,
     "usuarios": True,
     "garantias": True,
     "auditoria": True,
-    "pagina_web": True,
+    "web": True,
     "ajustes": True,
+    "contabilidad": True,
+    "pagina_web": True,
 }
 
 
 def norm_sucursal(value: str = ""):
     value = (value or DEFAULT_SUCURSAL).strip().lower().replace(" ", "_")
     return value or DEFAULT_SUCURSAL
+
+
+def ensure_usuario_permisos_table(cur):
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usuario_permisos (
+        usuario_id INTEGER PRIMARY KEY,
+        permisos TEXT,
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+
+def normalize_feature_permissions(value=None):
+    permisos = dict(DEFAULT_FEATURES)
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = {}
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in permisos:
+                permisos[k] = bool(v)
+    return permisos
+
+
+def permisos_usuario(cur, usuario_id, usuario_nombre="", rol=""):
+    permisos = dict(DEFAULT_FEATURES)
+    if str(usuario_nombre or "").strip().lower() == "giomar":
+        return permisos
+    if str(rol or "").strip().upper() == "ADMIN":
+        return permisos
+    try:
+        ensure_usuario_permisos_table(cur)
+        cur.execute("SELECT permisos FROM usuario_permisos WHERE usuario_id=%s", (usuario_id,))
+        row = cur.fetchone()
+        return normalize_feature_permissions(row[0] if row else None)
+    except Exception:
+        return permisos
 
 
 def norm_theme_color(value: str = ""):
@@ -391,13 +433,21 @@ def split_series_text(value):
     raw = re.split(r"[,;\n\r|]+", str(value or ""))
     cleaned = []
     for item in raw:
-        serie = str(item or "").strip()
+        serie = normalize_serie_key(item)
         if not serie:
             continue
-        serie = re.sub(r"^(s\s*/?\s*n|sn|serie)\s*[:\-]?\s*", "", serie, flags=re.I).strip()
-        if serie:
-            cleaned.append(serie.upper())
+        cleaned.append(serie)
     return cleaned
+
+
+def normalize_serie_key(value):
+    serie = str(value or "").strip()
+    serie = re.sub(r"^(s\s*/?\s*n|sn|serie)\s*[:\-]?\s*", "", serie, flags=re.I).strip()
+    serie = re.sub(r"[^A-Z0-9]+", "", serie.upper())
+    return serie
+
+
+SERIE_SQL_KEY = "regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')"
 
 
 def is_test_product_name(*values):
@@ -421,14 +471,14 @@ def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
             return "Combo/PRUEBA: hay series repetidas en el documento."
         cur.execute("""
         SELECT ps.id,
-               UPPER(COALESCE(ps.serie,'')) AS serie,
+               regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g') AS serie,
                ps.producto_id,
                UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
                COALESCE(p.nombre,'') AS producto_nombre
         FROM producto_series ps
         LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
         WHERE COALESCE(ps.sucursal,%s)=%s
-          AND UPPER(ps.serie)=ANY(%s)
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
         """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, selected))
         rows = dict_fetchall(cur)
         found = defaultdict(list)
@@ -540,7 +590,7 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
         return None
 
     cur.execute("""
-    SELECT id, UPPER(COALESCE(serie,'')) AS serie, UPPER(COALESCE(estado,'DISPONIBLE')) AS estado
+    SELECT id, regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g') AS serie, UPPER(COALESCE(estado,'DISPONIBLE')) AS estado
     FROM producto_series
     WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
@@ -570,7 +620,7 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
                    UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado
             FROM producto_series ps
             LEFT JOIN productos p ON p.id=ps.producto_id
-            WHERE UPPER(ps.serie)=UPPER(%s) AND COALESCE(ps.sucursal,%s)=%s
+            WHERE regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s AND COALESCE(ps.sucursal,%s)=%s
             LIMIT 1
             """, (serie, DEFAULT_SUCURSAL, sucursal))
             other = dict_fetchone(cur)
@@ -608,7 +658,7 @@ def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, c
         FROM producto_series ps
         LEFT JOIN productos p ON p.id=ps.producto_id
         WHERE COALESCE(ps.sucursal,%s)=%s
-          AND UPPER(ps.serie)=ANY(%s)
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
         """, (DEFAULT_SUCURSAL, sucursal, selected))
         rows = dict_fetchall(cur)
         touched_products = set()
@@ -1031,6 +1081,15 @@ class DocumentoObservacionInternaUpdate(BaseModel):
     usuario: str = ""
 
 
+class DocumentoConvertirUpdate(BaseModel):
+    tipo: str = "BOLETA"
+    estado_pago: str = "PAGADO"
+    metodo_pago: str = "EFECTIVO"
+    usuario_emisor: str = ""
+    observacion: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
 class DocumentoDetalleSeriesUpdate(BaseModel):
     series_texto: str = ""
     usuario: str = ""
@@ -1149,6 +1208,7 @@ def migrate_schema():
             ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        ensure_usuario_permisos_table(cur)
 
         for usuario, clave, rol in [
             ("Giomar", "43yk0rr21", "ADMIN"),
@@ -1564,18 +1624,18 @@ def login(data: dict):
     """,
                 (DEFAULT_SUCURSAL, data["usuario"], data["clave"]))
     user = dict_fetchone(cur)
-
-    conn.close()
-
     if not user:
+        conn.close()
         return {"ok": False}
+    user["permisos"] = permisos_usuario(cur, user.get("id"), user.get("usuario"), user.get("rol"))
+    conn.close()
     if str(user["usuario"]).strip().lower() != "giomar":
         user_branch = norm_sucursal(user.get("sucursal"))
         if user_branch != sucursal:
             return {"ok": False, "msg": "No tienes acceso a esta sucursal."}
         sucursal = user_branch
 
-    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "color_tema": norm_theme_color(user.get("color_tema")), "sucursal": sucursal, "empresa": sucursal}
+    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "color_tema": norm_theme_color(user.get("color_tema")), "sucursal": sucursal, "empresa": sucursal, "permisos": user.get("permisos") or dict(DEFAULT_FEATURES)}
 
 
 # ================= USUARIOS =================
@@ -1603,7 +1663,7 @@ def perfil_usuario(usuario: str = ""):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT usuario, rol, COALESCE(foto_url,'') AS foto_url,
+        SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
                COALESCE(sucursal,%s) AS sucursal,
                COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(color_tema,'#304fb8') AS color_tema
@@ -1611,9 +1671,11 @@ def perfil_usuario(usuario: str = ""):
         WHERE lower(usuario)=lower(%s)
     """, (DEFAULT_SUCURSAL, usuario.strip()))
     data = dict_fetchone(cur)
-    conn.close()
     if not data:
+        conn.close()
         return {"ok": False, "found": False}
+    data["permisos"] = permisos_usuario(cur, data.get("id"), data.get("usuario"), data.get("rol"))
+    conn.close()
     return {"ok": True, "found": True, **data}
 
 
@@ -1875,6 +1937,59 @@ def cambiar_color_usuario(data: UsuarioColorUpdate):
     return {"ok": True, "success": True, "id": row[0], "color_tema": color}
 
 
+@app.get("/usuarios/{usuario_id}/permisos")
+def obtener_permisos_usuario(usuario_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        ensure_usuario_permisos_table(cur)
+        cur.execute("SELECT id, usuario, rol FROM usuarios WHERE id=%s", (usuario_id,))
+        user = dict_fetchone(cur)
+        if not user:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Usuario no encontrado."}
+        permisos = permisos_usuario(cur, user.get("id"), user.get("usuario"), user.get("rol"))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "usuario_id": usuario_id, "permisos": permisos}
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.post("/usuarios/{usuario_id}/permisos")
+def guardar_permisos_usuario(usuario_id: int, data: dict):
+    admin = str(data.get("usuario") or data.get("admin") or "").strip().lower()
+    if admin != "giomar":
+        return {"ok": False, "success": False, "msg": "Solo Giomar maestro puede modificar permisos de usuarios."}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        ensure_usuario_permisos_table(cur)
+        cur.execute("SELECT id, usuario FROM usuarios WHERE id=%s", (usuario_id,))
+        user = dict_fetchone(cur)
+        if not user:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Usuario no encontrado."}
+        if str(user.get("usuario") or "").strip().lower() == "giomar":
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Giomar maestro siempre tiene todos los permisos."}
+        permisos = normalize_feature_permissions(data.get("permisos") or {})
+        cur.execute("""
+        INSERT INTO usuario_permisos (usuario_id, permisos, actualizado)
+        VALUES (%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (usuario_id)
+        DO UPDATE SET permisos=EXCLUDED.permisos, actualizado=CURRENT_TIMESTAMP
+        """, (usuario_id, json.dumps(permisos, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "usuario_id": usuario_id, "permisos": permisos}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
 @app.get("/usuarios/online")
 def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
@@ -1898,6 +2013,8 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
         ORDER BY online DESC, u.usuario
     """, (DEFAULT_SUCURSAL,))
     data = dict_fetchall(cur)
+    for item in data:
+        item["permisos"] = permisos_usuario(cur, item.get("id"), item.get("usuario"), item.get("rol"))
     conn.close()
     return {"ok": True, "success": True, "data": data}
 
@@ -3092,7 +3209,7 @@ def guardar_serie_producto(data: SerieProducto):
             FROM producto_series
             WHERE producto_id=%s
               AND COALESCE(sucursal,%s)=%s
-              AND UPPER(COALESCE(serie,''))=UPPER(%s)
+              AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
             LIMIT 1
             """, (data.producto_id, DEFAULT_SUCURSAL, sucursal, serie))
             existing = cur.fetchone()
@@ -3194,7 +3311,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
                COALESCE(p.nombre,'') AS producto_nombre
         FROM producto_series ps
         LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
-        WHERE UPPER(ps.serie)=UPPER(%s)
+        WHERE regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s
           AND COALESCE(ps.sucursal,%s)=%s
           AND ps.id<>%s
           AND COALESCE(ps.producto_id,0)=%s
@@ -3421,7 +3538,7 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(sucursal)
-        serie = (data.serie or "").strip().upper()
+        serie = normalize_serie_key(data.serie)
         if not serie:
             conn.close()
             return {"ok": False, "success": False, "msg": "Escanea o ingresa una serie."}
@@ -3439,7 +3556,7 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
             return {"ok": False, "success": False, "msg": "Este inventario ya esta cerrado."}
         cur.execute("""
         SELECT id FROM inventario_conteo_scans
-        WHERE conteo_id=%s AND UPPER(serie)=UPPER(%s)
+        WHERE conteo_id=%s AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
         LIMIT 1
         """, (conteo_id, serie))
         if cur.fetchone():
@@ -3451,7 +3568,7 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
                UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado
         FROM producto_series ps
         LEFT JOIN productos p ON p.id=ps.producto_id
-        WHERE UPPER(ps.serie)=UPPER(%s) AND COALESCE(ps.sucursal,%s)=%s
+        WHERE regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s AND COALESCE(ps.sucursal,%s)=%s
         LIMIT 1
         """, (serie, DEFAULT_SUCURSAL, sucursal))
         row = dict_fetchone(cur)
@@ -3991,7 +4108,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
         cur.execute("""
         SELECT ps.id AS serie_id,
-               UPPER(ps.serie) AS serie,
+               regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g') AS serie,
                ps.producto_id,
                UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
                COALESCE(p.nombre,'') AS producto_nombre,
@@ -4001,7 +4118,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         FROM producto_series ps
         LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
         WHERE COALESCE(ps.sucursal,%s)=%s
-          AND UPPER(ps.serie)=ANY(%s)
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
         """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, series))
         found = {str(r.get("serie") or "").upper(): r for r in dict_fetchall(cur)}
         faltantes = [serie for serie in series if serie not in found]
@@ -4095,6 +4212,111 @@ def crear_proforma(data: Venta):
     if not data.cliente_nombre:
         data.cliente_nombre = "CLIENTE GENERAL"
     return crear_venta(data)
+
+
+@app.post("/documentos/{documento_id}/convertir")
+def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpdate):
+    sucursal = norm_sucursal(data.sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+        SELECT id, tipo, numero, cliente, COALESCE(documento_cliente,'') AS documento_cliente,
+               COALESCE(direccion_cliente,'') AS direccion_cliente,
+               COALESCE(observacion,'') AS observacion,
+               COALESCE(sucursal,%s) AS sucursal
+        FROM ventas
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+        """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
+        doc = dict_fetchone(cur)
+        if not doc:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Proforma no encontrada."}
+        if str(doc.get("tipo") or "").upper() != "PROFORMA":
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Solo se puede convertir una PROFORMA."}
+
+        cur.execute("""
+        SELECT vd.producto_id,
+               COALESCE(vd.descripcion, p.nombre, '') AS descripcion,
+               COALESCE(vd.marca, p.marca, '') AS marca,
+               COALESCE(vd.modelo, p.modelo, '') AS modelo,
+               COALESCE(vd.series_texto, '') AS series_texto,
+               COALESCE(vd.cantidad, 1) AS cantidad,
+               COALESCE(vd.precio, 0) AS precio,
+               COALESCE(vd.total, COALESCE(vd.cantidad,1) * COALESCE(vd.precio,0)) AS total
+        FROM ventas_detalle vd
+        LEFT JOIN productos p ON p.id=vd.producto_id
+        WHERE vd.venta_id=%s
+        ORDER BY vd.id
+        """, (documento_id,))
+        rows = dict_fetchall(cur)
+        conn.close()
+        if not rows:
+            return {"ok": False, "success": False, "msg": "La proforma no tiene productos."}
+
+        tipo_doc_cliente = ""
+        numero_doc_cliente = str(doc.get("documento_cliente") or "").strip()
+        m = re.match(r"^\s*(DNI|RUC|CE|PASAPORTE)\s*:\s*(.+)$", numero_doc_cliente, flags=re.I)
+        if m:
+            tipo_doc_cliente = m.group(1).upper()
+            numero_doc_cliente = m.group(2).strip()
+
+        target_tipo = str(data.tipo or "BOLETA").strip().upper()
+        if target_tipo not in ("BOLETA", "FACTURA"):
+            target_tipo = "BOLETA"
+        estado_pago = str(data.estado_pago or "PAGADO").strip().upper()
+        if estado_pago not in ("PAGADO", "CREDITO", "DEUDA"):
+            estado_pago = "PAGADO"
+
+        venta = Venta(
+            tipo=target_tipo,
+            cliente_nombre=doc.get("cliente") or "CLIENTE GENERAL",
+            items=[
+                ItemVenta(
+                    id=int(row.get("producto_id") or 0),
+                    producto_id=row.get("producto_id"),
+                    nombre=row.get("descripcion") or "",
+                    marca=row.get("marca") or "",
+                    modelo=row.get("modelo") or "",
+                    series_texto=row.get("series_texto") or "",
+                    cantidad=int(float(row.get("cantidad") or 1)),
+                    precio=float(row.get("precio") or 0),
+                    total=float(row.get("total") or 0),
+                ) for row in rows
+            ],
+            fecha_emision=lima_now().strftime("%Y-%m-%d %H:%M:%S"),
+            tipo_documento_cliente=tipo_doc_cliente,
+            numero_documento_cliente=numero_doc_cliente,
+            direccion_cliente=doc.get("direccion_cliente") or "",
+            usuario_emisor=data.usuario_emisor or "",
+            observacion=(data.observacion or f"Convertido desde PROFORMA {doc.get('numero')}").strip(),
+            estado_pago=estado_pago,
+            metodo_pago="" if estado_pago != "PAGADO" else str(data.metodo_pago or "EFECTIVO").upper(),
+            sucursal=sucursal,
+        )
+        res = crear_venta(venta)
+        if not (isinstance(res, dict) and (res.get("ok") or res.get("success"))):
+            return res
+
+        conn2 = get_conn()
+        cur2 = conn2.cursor()
+        cur2.execute("""
+        UPDATE ventas
+        SET estado='PROCESADO', estado_pago='PROCESADO',
+            observacion=TRIM(COALESCE(observacion,'') || %s)
+        WHERE id=%s
+        """, (f"\nConvertida a {target_tipo} {res.get('numero') or ''}", documento_id))
+        conn2.commit()
+        conn2.close()
+        return {"ok": True, "success": True, "msg": f"Proforma convertida a {target_tipo} {res.get('numero')}", "documento_origen_id": documento_id, "documento_nuevo": res}
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return {"ok": False, "success": False, "msg": str(e)}
 
 
 @app.get("/documentos")
@@ -4613,14 +4835,13 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
         doc = cur.fetchone() or ("DOCUMENTO", str(venta_id))
         doc_ref = f"{doc[0]} {doc[1]}"
 
-        raw_series = re.split(r"[,;\n\r]+", series_texto)
-        series = [s.strip() for s in raw_series if s.strip()]
+        series = split_series_text(series_texto)
         for serie in series:
             cur.execute("""
             UPDATE producto_series
             SET estado='VENDIDO',
                 fecha_salida=COALESCE(fecha_salida, TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'))
-            WHERE UPPER(serie)=UPPER(%s)
+            WHERE regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
               AND producto_id=%s
               AND COALESCE(sucursal,%s)=%s
             """, (serie, producto_id, DEFAULT_SUCURSAL, sucursal))
@@ -4669,7 +4890,7 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
                     SET estado='DISPONIBLE', fecha_salida=NULL
                     WHERE producto_id=%s
                       AND COALESCE(sucursal,%s)=%s
-                      AND UPPER(serie)=ANY(%s)
+                      AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
                     """, (producto_id, DEFAULT_SUCURSAL, sucursal, series))
                     sync_producto_stock_from_series(cur, producto_id, sucursal)
                 else:
