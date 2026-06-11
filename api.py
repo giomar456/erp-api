@@ -570,6 +570,59 @@ def producto_tiene_series_activas(cur, producto_id, sucursal):
     return bool(row and int(row[0] or 0) > 0)
 
 
+def es_ram_kingston(nombre):
+    text = str(nombre or "").upper()
+    return "KINGSTON" in text and ("RAM" in text or "MEM" in text or "MEMORIA" in text)
+
+
+def resolver_producto_por_series_venta(cur, producto_id, nombre_doc, cantidad, series_texto, sucursal):
+    selected = split_series_text(series_texto)
+    if not selected:
+        return producto_id, None
+    if len(selected) != max(0, int(float(cantidad or 0))):
+        return producto_id, None
+
+    resolved_ids = set()
+    for serie in selected:
+        cur.execute("""
+        SELECT ps.id,
+               ps.producto_id,
+               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, serie))
+        rows = dict_fetchall(cur)
+        active_rows = [r for r in rows if str(r.get("estado") or "").upper() in ("DISPONIBLE", "RESERVADO")]
+        if not active_rows:
+            continue
+
+        if len(active_rows) > 1:
+            names = [r.get("producto_nombre") for r in active_rows]
+            if any(es_ram_kingston(n) for n in names) or es_ram_kingston(nombre_doc):
+                return producto_id, f"{nombre_doc}: la serie {serie} esta duplicada en memorias Kingston. Selecciona el producto real para evitar descontar una RAM incorrecta."
+            same_product = [r for r in active_rows if str(r.get("producto_id")) == str(producto_id)]
+            if len(same_product) == 1:
+                resolved_ids.add(same_product[0].get("producto_id"))
+                continue
+            product_ids = {r.get("producto_id") for r in active_rows if r.get("producto_id")}
+            if len(product_ids) != 1:
+                opciones = ", ".join(sorted({str(r.get("producto_nombre") or r.get("producto_id")) for r in active_rows}))
+                return producto_id, f"{nombre_doc}: la serie {serie} existe en varios productos ({opciones}). Selecciona el producto real antes de vender."
+
+        picked = active_rows[0]
+        if picked.get("producto_id"):
+            resolved_ids.add(picked.get("producto_id"))
+
+    if len(resolved_ids) == 1:
+        return list(resolved_ids)[0], None
+    if len(resolved_ids) > 1:
+        return producto_id, f"{nombre_doc}: las series escaneadas pertenecen a productos diferentes. Separa cada producto en una linea."
+    return producto_id, None
+
+
 def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
     cantidad = max(0, int(float(cantidad or 0)))
     if cantidad <= 0 or not producto_id:
@@ -4000,8 +4053,9 @@ def crear_venta(data: Venta):
             estado_pago = "DEUDA"
             metodo_pago = ""
 
+        resolved_product_ids = {}
         if mueve_stock:
-            for item in data.items:
+            for item_index, item in enumerate(data.items):
                 producto_id = item.producto_id or item.id
                 descripcion = item.nombre
                 marca = item.marca
@@ -4021,6 +4075,19 @@ def crear_venta(data: Venta):
                         conn.close()
                         return {"ok": False, "success": False, "msg": error_combo}
                     continue
+                producto_id, error_resolver = resolver_producto_por_series_venta(
+                    cur,
+                    producto_id,
+                    descripcion,
+                    item.cantidad,
+                    series_texto,
+                    sucursal,
+                )
+                if error_resolver:
+                    conn.rollback()
+                    conn.close()
+                    return {"ok": False, "success": False, "msg": error_resolver}
+                resolved_product_ids[item_index] = producto_id
                 error_series = validar_y_marcar_series_venta(
                     cur,
                     producto_id,
@@ -4051,8 +4118,8 @@ def crear_venta(data: Venta):
 
         venta_id = cur.fetchone()[0]
 
-        for item in data.items:
-            producto_id = item.producto_id or item.id
+        for item_index, item in enumerate(data.items):
+            producto_id = resolved_product_ids.get(item_index) or item.producto_id or item.id
             descripcion = item.nombre
             marca = item.marca
             modelo = item.modelo
