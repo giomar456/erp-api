@@ -2395,18 +2395,49 @@ def _pdf_text_lines(canvas_obj, text, max_width, font_name, font_size, max_lines
     words = str(text or "").replace("\n", " ").split()
     lines = []
     current = ""
+    def split_long_word(word):
+        parts = []
+        chunk = ""
+        for ch in str(word or ""):
+            test = f"{chunk}{ch}"
+            if chunk and canvas_obj.stringWidth(test, font_name, font_size) > max_width:
+                parts.append(chunk)
+                chunk = ch
+            else:
+                chunk = test
+        if chunk:
+            parts.append(chunk)
+        return parts or [word]
     for word in words:
-        test = f"{current} {word}".strip()
-        if canvas_obj.stringWidth(test, font_name, font_size) <= max_width or not current:
-            current = test
-        else:
-            lines.append(current)
-            current = word
-            if len(lines) >= max_lines:
-                break
+        expanded = split_long_word(word) if canvas_obj.stringWidth(word, font_name, font_size) > max_width else [word]
+        for word in expanded:
+            test = f"{current} {word}".strip()
+            if canvas_obj.stringWidth(test, font_name, font_size) <= max_width or not current:
+                current = test
+            else:
+                lines.append(current)
+                current = word
+                if len(lines) >= max_lines:
+                    break
+        if len(lines) >= max_lines:
+            break
     if current and len(lines) < max_lines:
         lines.append(current)
     return lines or [""]
+
+
+def _pdf_series_items(value):
+    seen = set()
+    out = []
+    for item in re.split(r"[,;\n\r|]+", str(value or "")):
+        serie = re.sub(r"^(s\s*/?\s*n|sn|serie)\s*[:\-]?\s*", "", str(item or "").strip(), flags=re.I).strip()
+        if not serie:
+            continue
+        key = re.sub(r"[^A-Z0-9]+", "", serie.upper())
+        if key and key not in seen:
+            seen.add(key)
+            out.append(serie.upper())
+    return out
 
 
 def _pdf_money(value):
@@ -2547,12 +2578,13 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         "NOTA DE VENTA": "NOTA DE VENTA",
     }.get(doc_type, doc_type)
     editor = cfg.get("doc_editor") if isinstance(cfg.get("doc_editor"), dict) else {}
-    layout = editor.get("layout") if isinstance(editor.get("layout"), dict) else {}
-    max_rows = max(1, min(int(float(layout.get("max_productos", 12) or 12)), 12))
+    # Formato fijo restaurado del respaldo 20260609_123145. No usar medidas guardadas
+    # en app_config para evitar que la boleta se mueva entre actualizaciones.
+    max_rows = 12
 
     # Plantilla fija A4 alineada al formato Computer Army usado en PC/Android.
-    logo_w = min(max(float(layout.get("logo_ancho_mm", 24) or 24), 16), 36)
-    logo_h = min(max(float(layout.get("logo_alto_mm", 15) or 15), 10), 26)
+    logo_w = 24
+    logo_h = 15
     _draw_pdf_logo(c, cfg, 16, 25, logo_w, logo_h, mm, page_h)
 
     empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
@@ -2590,7 +2622,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
 
     tx, ty, tw = 7.0, 69.5, 199.0
     header_h = 4.8
-    row_h = max(5.8, min(float(layout.get("alto_fila_mm", 6.5) or 6.5), 8.2))
+    row_h = 6.5
     th = header_h + (row_h * max_rows)
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
@@ -2612,11 +2644,27 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         series = str(item.get("series_texto") or item.get("serie") or "").strip()
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
-        desc_lines = fit(desc, 108, "Helvetica-Bold", 7.0, 3)
+        series_items = _pdf_series_items(series)
+        desc_max = 2 if series_items else 3
+        desc_font = 5.45 if len(series_items) >= 3 else 6.8
+        desc_gap = 1.75 if len(series_items) >= 3 else 1.85
+        serie_font = 4.3 if len(series_items) >= 3 else 5.35
+        serie_gap = 1.0 if len(series_items) >= 3 else 1.65
+        desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
+        cursor_y = row_y
         for j, ln in enumerate(desc_lines):
-            txt(cols[2] + 1.6, row_y + j * 2.6, ln, 7.0, True)
-        if series:
-            txt(cols[2] + 1.6, row_y + min(len(desc_lines), 3) * 2.5, "SN:" + series[:92], 6.0)
+            txt(cols[2] + 1.6, cursor_y, ln, desc_font, True)
+            cursor_y += desc_gap
+        if series_items:
+            remaining_slots = max(1, 5 - len(desc_lines))
+            shown = series_items[:remaining_slots]
+            for sidx, serie_line in enumerate(shown):
+                prefix = "SN: " if sidx == 0 else "    "
+                for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 1):
+                    txt(cols[2] + 1.6, cursor_y, ln, serie_font)
+                    cursor_y += serie_gap
+            if len(series_items) > len(shown):
+                txt(cols[2] + 1.6, cursor_y, f"    +{len(series_items) - len(shown)} series", 5.2)
         txt_r(cols[4] - 1.2, row_y, f"{qty:.2f}", 8.0)
         txt_r(cols[5] - 1.2, row_y, _pdf_money(total), 8.0)
         txt_r(cols[6] - 1.2, row_y, _pdf_money(price), 8.0)
