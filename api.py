@@ -1174,6 +1174,7 @@ class Producto(BaseModel):
     imagen_url: Optional[str] = ""
     observacion: Optional[str] = ""
     almacen: Optional[str] = "TIENDA"
+    sku_woo: Optional[str] = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1639,7 +1640,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.66 permite venta directa con series no registradas, mejora PDF y agrega movimiento masivo de series por almacen."
+    latest_notes = "Actualizacion G&G ERP: web v1.67 mejora precio decimal, PDF legible, miniaturas en productos y codigo web/SKU WooCommerce."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1653,12 +1654,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.66")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.67")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.66: permite venta directa con series no registradas, mejora PDF y agrega movimiento masivo de series por almacen.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.67: mejora precio decimal, PDF legible, miniaturas en productos y codigo web/SKU WooCommerce.")
     return {
         "ok": True,
         "success": True,
@@ -2714,17 +2715,17 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
         series_items = _pdf_series_items(series)
         desc_max = 3
-        desc_font = 4.85 if (series_items or len(desc) > 82) else 6.55
-        desc_gap = 1.35 if (series_items or len(desc) > 82) else 1.85
-        serie_font = 4.05 if len(series_items) >= 3 else 5.1
-        serie_gap = 1.02 if len(series_items) >= 3 else 1.45
+        desc_font = 5.65 if (series_items or len(desc) > 82) else 6.85
+        desc_gap = 1.85 if (series_items or len(desc) > 82) else 2.05
+        serie_font = 5.0 if len(series_items) >= 3 else 5.65
+        serie_gap = 1.45 if len(series_items) >= 3 else 1.8
         desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
         cursor_y = row_y
         for j, ln in enumerate(desc_lines):
             txt(cols[2] + 1.6, cursor_y, ln, desc_font, True)
             cursor_y += desc_gap
         if series_items:
-            remaining_slots = max(1, 6 - len(desc_lines))
+            remaining_slots = max(1, 5 - len(desc_lines))
             shown = series_items[:remaining_slots]
             for sidx, serie_line in enumerate(shown):
                 prefix = "SN: " if sidx == 0 else "SN: "
@@ -3125,14 +3126,15 @@ def crear_producto(data: Producto):
     sucursal = norm_sucursal(data.sucursal)
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
 
     cur.execute("""
-    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal,sku_woo)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (data.nombre, data.categoria, data.marca,
           data.modelo, data.precio_compra,
-          data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), sucursal))
+          data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), sucursal, (data.sku_woo or "").strip().upper()))
     producto_id = cur.fetchone()[0]
 
     conn.commit()
@@ -3148,12 +3150,14 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
 
     cur.execute("""
     SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
            COALESCE(imagen_url, '') AS imagen_url,
            COALESCE(observacion, '') AS observacion,
            COALESCE(almacen, 'TIENDA') AS almacen,
+           COALESCE(sku_woo, '') AS sku_woo,
            COALESCE(sucursal,%s) AS sucursal
     FROM productos
     WHERE COALESCE(sucursal,%s)=%s
@@ -3174,15 +3178,16 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
     try:
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
-            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s
+            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s, sku_woo=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
             data.nombre, data.categoria, data.marca, data.modelo,
-            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), producto_id, DEFAULT_SUCURSAL, sucursal
+            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), (data.sku_woo or "").strip().upper(), producto_id, DEFAULT_SUCURSAL, sucursal
         ))
         row = cur.fetchone()
         if not row:
@@ -5672,7 +5677,7 @@ def woo_category_for_name(name: str, sucursal: str = DEFAULT_SUCURSAL):
 
 
 def woo_payload_from_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
-    sku = f"ERP-{p['id']}"
+    sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{p['id']}"
     payload = {
         "name": p.get("nombre") or f"Producto {p['id']}",
         "sku": sku,
@@ -5779,7 +5784,7 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url
+        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
         FROM productos
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
@@ -5801,7 +5806,7 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sql = """
-        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url
+        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
         FROM productos
         WHERE COALESCE(sucursal,%s)=%s
     """
