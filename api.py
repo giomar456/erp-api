@@ -677,9 +677,18 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
             LIMIT 1
             """, (serie, DEFAULT_SUCURSAL, sucursal))
             other = dict_fetchone(cur)
-            if other:
+            if other and str(other.get("estado") or "").upper() in ("DISPONIBLE", "RESERVADO"):
                 return f"{prod_nombre}: la serie {serie} pertenece a otro producto ({other.get('producto_nombre')}) o esta en estado {other.get('estado')}."
-            return f"{prod_nombre}: la serie {serie} no esta registrada para este producto. Corrige series antes de pasar a Caja."
+            cur.execute("""
+            INSERT INTO producto_series (
+                producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal, usuario_ingreso
+            )
+            VALUES (%s,%s,'VENTA DIRECTA','VENDIDO','VENTA',
+                    TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),
+                    TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),
+                    %s,'SISTEMA')
+            """, (producto_id, serie, sucursal))
+            continue
         if row and row.get("estado") not in ("DISPONIBLE", "RESERVADO"):
             return f"{prod_nombre}: la serie {serie} esta en estado {row.get('estado')}."
         cur.execute("""
@@ -999,6 +1008,12 @@ class SerieProducto(BaseModel):
     fecha_ingreso: str = ""
     fecha_salida: Optional[str] = None
     usuario_ingreso: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
+class SeriesMoverAlmacen(BaseModel):
+    serie_ids: List[int]
+    almacen: str
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1624,7 +1639,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.65 aplica PDF estable en vista previa/impresion y rastreo interno de series por producto real."
+    latest_notes = "Actualizacion G&G ERP: web v1.66 permite venta directa con series no registradas, mejora PDF y agrega movimiento masivo de series por almacen."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1638,12 +1653,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.65")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.66")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.65: aplica PDF estable en vista previa/impresion y rastreo interno de series por producto real.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.66: permite venta directa con series no registradas, mejora PDF y agrega movimiento masivo de series por almacen.")
     return {
         "ok": True,
         "success": True,
@@ -2698,21 +2713,21 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
         series_items = _pdf_series_items(series)
-        desc_max = 2 if series_items else 3
-        desc_font = 5.45 if len(series_items) >= 3 else 6.8
-        desc_gap = 1.75 if len(series_items) >= 3 else 1.85
-        serie_font = 4.3 if len(series_items) >= 3 else 5.35
-        serie_gap = 1.0 if len(series_items) >= 3 else 1.65
+        desc_max = 3
+        desc_font = 4.85 if (series_items or len(desc) > 82) else 6.55
+        desc_gap = 1.35 if (series_items or len(desc) > 82) else 1.85
+        serie_font = 4.05 if len(series_items) >= 3 else 5.1
+        serie_gap = 1.02 if len(series_items) >= 3 else 1.45
         desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
         cursor_y = row_y
         for j, ln in enumerate(desc_lines):
             txt(cols[2] + 1.6, cursor_y, ln, desc_font, True)
             cursor_y += desc_gap
         if series_items:
-            remaining_slots = max(1, 5 - len(desc_lines))
+            remaining_slots = max(1, 6 - len(desc_lines))
             shown = series_items[:remaining_slots]
             for sidx, serie_line in enumerate(shown):
-                prefix = "SN: " if sidx == 0 else "    "
+                prefix = "SN: " if sidx == 0 else "SN: "
                 for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 1):
                     txt(cols[2] + 1.6, cursor_y, ln, serie_font)
                     cursor_y += serie_gap
@@ -3757,6 +3772,35 @@ def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_S
         conn.rollback()
         conn.close()
         return {"ok": False, "msg": str(e)}
+
+
+@app.post("/series/mover-almacen")
+def mover_series_almacen(data: SeriesMoverAlmacen, sucursal: str = DEFAULT_SUCURSAL):
+    ids = [int(x) for x in (data.serie_ids or []) if str(x).strip()]
+    almacen = (data.almacen or "").strip().upper()
+    if not ids:
+        return {"ok": False, "success": False, "msg": "Selecciona una o mas series."}
+    if not almacen:
+        return {"ok": False, "success": False, "msg": "Ingresa el almacen destino."}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.sucursal or sucursal)
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("""
+        UPDATE producto_series
+        SET almacen=%s
+        WHERE id = ANY(%s) AND COALESCE(sucursal,%s)=%s
+        RETURNING id, producto_id
+        """, (almacen, ids, DEFAULT_SUCURSAL, sucursal))
+        rows = cur.fetchall()
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "actualizadas": len(rows), "almacen": almacen}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
 
 
 @app.get("/productos/{producto_id}/movimientos")
