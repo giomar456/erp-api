@@ -1624,7 +1624,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.64 corrige pantalla negra, nombres editables por usuario y validacion de series por producto interno."
+    latest_notes = "Actualizacion G&G ERP: web v1.65 aplica PDF estable en vista previa/impresion y rastreo interno de series por producto real."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1638,12 +1638,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.64")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.65")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.64: corrige pantalla negra, nombres editables por usuario y validacion de series por producto interno.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.65: aplica PDF estable en vista previa/impresion y rastreo interno de series por producto real.")
     return {
         "ok": True,
         "success": True,
@@ -3209,6 +3209,7 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     texto = f"%{(q or '').lower()}%"
+    serie_norm = re.sub(r"[^A-Z0-9]", "", str(q or "").upper())
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
@@ -3232,6 +3233,7 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     WHERE COALESCE(ps.sucursal,%s)=%s
       AND (%s = '%%'
        OR LOWER(COALESCE(ps.serie,'')) LIKE %s
+       OR (%s <> '' AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g') = %s)
        OR LOWER(COALESCE(ps.proveedor,'')) LIKE %s
        OR LOWER(COALESCE(ps.almacen,'')) LIKE %s
        OR LOWER(COALESCE(ps.estado,'')) LIKE %s
@@ -3239,7 +3241,7 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
        OR LOWER(COALESCE(p.marca,'')) LIKE %s
        OR LOWER(COALESCE(p.modelo,'')) LIKE %s)
     ORDER BY ps.id DESC
-    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto, texto, texto, texto))
+    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, serie_norm, serie_norm, texto, texto, texto, texto, texto, texto))
     data = dict_fetchall(cur)
     conn.close()
     return data
