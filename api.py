@@ -851,8 +851,9 @@ def buscar_cliente_db(documento, sucursal=DEFAULT_SUCURSAL):
         return None
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS telefono TEXT DEFAULT ''")
     cur.execute("""
-    SELECT id, tipo_documento, numero_documento, nombre, direccion, COALESCE(sucursal,%s) AS sucursal
+    SELECT id, tipo_documento, numero_documento, nombre, direccion, COALESCE(telefono,'') AS telefono, COALESCE(sucursal,%s) AS sucursal
     FROM clientes
     WHERE numero_documento=%s AND COALESCE(sucursal,%s)=%s
     LIMIT 1
@@ -974,6 +975,7 @@ class Cliente(BaseModel):
     numero_documento: str
     nombre: str
     direccion: str
+    telefono: str = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1025,6 +1027,20 @@ class DocumentoManualSeries(BaseModel):
     series_texto: str = ""
     usuario_emisor: str = ""
     observacion: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+
+
+class ServicioTecnico(BaseModel):
+    tipo_documento: str = "DNI"
+    numero_documento: str = ""
+    cliente_nombre: str = ""
+    telefono: str = ""
+    equipo: str = ""
+    servicio: str = ""
+    diagnostico: str = ""
+    observacion: str = ""
+    precio: float = 0
+    usuario: str = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1647,7 +1663,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP web v1.73: stock sincronizado con series, buscador global por producto en boletas/documentos y flechas por dia."
+    latest_notes = "Actualizacion G&G ERP web v1.74: salida manual sobre boletas existentes, anulacion con restauracion de stock, PDF mas legible y servicios tecnicos."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1661,12 +1677,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.73")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.74")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.73: stock sincronizado con series, buscador global por producto en boletas/documentos y flechas por dia.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.74: salida manual sobre boletas existentes, anulacion con restauracion de stock, PDF mas legible y servicios tecnicos.")
     return {
         "ok": True,
         "success": True,
@@ -2771,10 +2787,10 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
         series_items = _pdf_series_items(series)
         desc_max = 3
-        desc_font = 5.65 if (series_items or len(desc) > 82) else 6.85
-        desc_gap = 1.85 if (series_items or len(desc) > 82) else 2.05
-        serie_font = 5.0 if len(series_items) >= 3 else 5.65
-        serie_gap = 1.45 if len(series_items) >= 3 else 1.8
+        desc_font = 6.25 if (series_items or len(desc) > 82) else 7.35
+        desc_gap = 2.05 if (series_items or len(desc) > 82) else 2.25
+        serie_font = 5.65 if len(series_items) >= 3 else 6.2
+        serie_gap = 1.75 if len(series_items) >= 3 else 2.05
         desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
         cursor_y = row_y
         for j, ln in enumerate(desc_lines):
@@ -2878,6 +2894,7 @@ def crear_cliente(data: Cliente):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal)
+    cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS telefono TEXT DEFAULT ''")
 
     cur.execute("""
     SELECT id FROM clientes
@@ -2887,16 +2904,16 @@ def crear_cliente(data: Cliente):
     if row:
         cur.execute("""
         UPDATE clientes
-        SET tipo_documento=%s, nombre=%s, direccion=%s
+        SET tipo_documento=%s, nombre=%s, direccion=%s, telefono=%s
         WHERE id=%s
         RETURNING id
-        """, (data.tipo_documento, data.nombre, data.direccion, row[0]))
+        """, (data.tipo_documento, data.nombre, data.direccion, data.telefono or "", row[0]))
     else:
         cur.execute("""
-        INSERT INTO clientes (tipo_documento,numero_documento,nombre,direccion,sucursal)
-        VALUES (%s,%s,%s,%s,%s)
+        INSERT INTO clientes (tipo_documento,numero_documento,nombre,direccion,telefono,sucursal)
+        VALUES (%s,%s,%s,%s,%s,%s)
         RETURNING id
-        """, (data.tipo_documento, data.numero_documento, data.nombre, data.direccion, sucursal))
+        """, (data.tipo_documento, data.numero_documento, data.nombre, data.direccion, data.telefono or "", sucursal))
     cliente_id = cur.fetchone()[0]
 
     conn.commit()
@@ -2910,9 +2927,10 @@ def listar_clientes(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS telefono TEXT DEFAULT ''")
 
     cur.execute("""
-    SELECT id, tipo_documento, numero_documento, nombre, direccion, COALESCE(sucursal,%s) AS sucursal
+    SELECT id, tipo_documento, numero_documento, nombre, direccion, COALESCE(telefono,'') AS telefono, COALESCE(sucursal,%s) AS sucursal
     FROM clientes
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY id DESC
@@ -2922,6 +2940,103 @@ def listar_clientes(sucursal: str = DEFAULT_SUCURSAL):
     conn.close()
 
     return data
+
+
+def asegurar_tabla_servicios(cur):
+    cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS telefono TEXT DEFAULT ''")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS servicios_tecnicos (
+        id SERIAL PRIMARY KEY,
+        fecha TIMESTAMP DEFAULT (timezone('America/Lima', now())),
+        tipo_documento TEXT DEFAULT 'DNI',
+        numero_documento TEXT DEFAULT '',
+        cliente_nombre TEXT DEFAULT '',
+        telefono TEXT DEFAULT '',
+        equipo TEXT DEFAULT '',
+        servicio TEXT DEFAULT '',
+        diagnostico TEXT DEFAULT '',
+        observacion TEXT DEFAULT '',
+        precio NUMERIC DEFAULT 0,
+        usuario TEXT DEFAULT '',
+        estado TEXT DEFAULT 'RECIBIDO',
+        sucursal TEXT DEFAULT 'computer_army'
+    )
+    """)
+
+
+@app.get("/servicios-tecnicos")
+def listar_servicios_tecnicos(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        asegurar_tabla_servicios(cur)
+        texto = f"%{(q or '').lower()}%"
+        cur.execute("""
+        SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
+               tipo_documento, numero_documento, cliente_nombre, telefono,
+               equipo, servicio, diagnostico, observacion, COALESCE(precio,0) AS precio,
+               usuario, estado, COALESCE(sucursal,%s) AS sucursal
+        FROM servicios_tecnicos
+        WHERE COALESCE(sucursal,%s)=%s
+          AND (%s='%%'
+               OR LOWER(COALESCE(numero_documento,'')) LIKE %s
+               OR LOWER(COALESCE(cliente_nombre,'')) LIKE %s
+               OR LOWER(COALESCE(telefono,'')) LIKE %s
+               OR LOWER(COALESCE(equipo,'')) LIKE %s
+               OR LOWER(COALESCE(servicio,'')) LIKE %s)
+        ORDER BY id DESC
+        LIMIT 200
+        """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto, texto))
+        return dict_fetchall(cur)
+    finally:
+        conn.close()
+
+
+@app.post("/servicios-tecnicos")
+def guardar_servicio_tecnico(data: ServicioTecnico):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.sucursal)
+        asegurar_tabla_servicios(cur)
+        numero = only_digits(data.numero_documento)
+        tipo = (data.tipo_documento or ("DNI" if len(numero) == 8 else "RUC" if len(numero) == 11 else "DNI")).upper()
+        cliente = (data.cliente_nombre or "CLIENTE SERVICIO").strip().upper()
+        telefono = (data.telefono or "").strip()
+        if numero:
+            cur.execute("""
+            INSERT INTO clientes (tipo_documento, numero_documento, nombre, direccion, telefono, sucursal)
+            VALUES (%s,%s,%s,'',%s,%s)
+            ON CONFLICT DO NOTHING
+            """, (tipo, numero, cliente, telefono, sucursal))
+            cur.execute("""
+            UPDATE clientes
+            SET tipo_documento=%s,
+                nombre=CASE WHEN %s<>'' THEN %s ELSE nombre END,
+                telefono=CASE WHEN %s<>'' THEN %s ELSE COALESCE(telefono,'') END
+            WHERE numero_documento=%s AND COALESCE(sucursal,%s)=%s
+            """, (tipo, cliente, cliente, telefono, telefono, numero, DEFAULT_SUCURSAL, sucursal))
+        cur.execute("""
+        INSERT INTO servicios_tecnicos (
+            tipo_documento, numero_documento, cliente_nombre, telefono, equipo,
+            servicio, diagnostico, observacion, precio, usuario, sucursal
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id, to_char(fecha, 'YYYY-MM-DD HH24:MI')
+        """, (
+            tipo, numero, cliente, telefono, data.equipo or "", data.servicio or "",
+            data.diagnostico or "", data.observacion or "", data.precio or 0,
+            data.usuario or "", sucursal,
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": row[0], "fecha": row[1]}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
 
 
 @app.post("/reservas")
@@ -4340,9 +4455,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
           AND COALESCE(sucursal,%s)=%s
         LIMIT 1
         """, (doc_tipo, numero, DEFAULT_SUCURSAL, sucursal))
-        if cur.fetchone():
-            conn.close()
-            return {"ok": False, "success": False, "msg": f"{doc_tipo} {numero} ya existe."}
+        existing_doc = cur.fetchone()
 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
@@ -4373,20 +4486,23 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         fecha_emision = parse_fecha_emision(data.fecha_emision)
         cliente = (data.cliente_nombre or "CLIENTE MANUAL").strip() or "CLIENTE MANUAL"
         total = round(sum(float(found[s].get("precio_venta") or 0) for s in series if s in found), 2)
-        cur.execute("""
-        INSERT INTO ventas (
-            fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
-            subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor,
-            estado, estado_pago, metodo_pago, sucursal
-        )
-        VALUES (%s,%s,%s,%s,'','',%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s)
-        RETURNING id
-        """, (
-            fecha_emision, doc_tipo, numero, cliente, total, total,
-            data.observacion or f"{doc_tipo} manual ingresado por series",
-            fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal
-        ))
-        venta_id = cur.fetchone()[0]
+        if existing_doc:
+            venta_id = existing_doc[0]
+        else:
+            cur.execute("""
+            INSERT INTO ventas (
+                fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
+                subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor,
+                estado, estado_pago, metodo_pago, sucursal
+            )
+            VALUES (%s,%s,%s,%s,'','',%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s)
+            RETURNING id
+            """, (
+                fecha_emision, doc_tipo, numero, cliente, total, total,
+                data.observacion or f"{doc_tipo} manual ingresado por series",
+                fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal
+            ))
+            venta_id = cur.fetchone()[0]
 
         touched_products = set()
         for serie in series:
@@ -4423,22 +4539,23 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         for producto_id in touched_products:
             sync_producto_stock_from_series(cur, producto_id, sucursal)
 
-        cur.execute("""
-        INSERT INTO caja_movimientos (
-            fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, observacion, sucursal
-        )
-        VALUES (%s,'INGRESO',%s,%s,%s,%s,%s,'PAGADO','MANUAL',%s,%s)
-        """, (
-            fecha_emision, f"{doc_tipo} {numero} - {cliente}",
-            total, data.usuario_emisor or "", doc_tipo, numero, data.observacion or "", sucursal
-        ))
+        if not existing_doc:
+            cur.execute("""
+            INSERT INTO caja_movimientos (
+                fecha, tipo, detalle, monto, usuario, documento_tipo, documento_numero, estado_pago, metodo_pago, observacion, sucursal
+            )
+            VALUES (%s,'INGRESO',%s,%s,%s,%s,%s,'PAGADO','MANUAL',%s,%s)
+            """, (
+                fecha_emision, f"{doc_tipo} {numero} - {cliente}",
+                total, data.usuario_emisor or "", doc_tipo, numero, data.observacion or "", sucursal
+            ))
 
         conn.commit()
         conn.close()
         return {
             "ok": True,
             "success": True,
-            "msg": f"{doc_tipo} {numero} registrado. Las series quedaron en historial como VENDIDO, no fueron eliminadas.",
+            "msg": f"{doc_tipo} {numero} {'actualizado' if existing_doc else 'registrado'}. Las series quedaron en historial como VENDIDO, no fueron eliminadas.",
             "id": venta_id,
             "tipo": doc_tipo,
             "numero": numero,
@@ -5141,6 +5258,85 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
         return {"ok": False, "msg": str(e)}
 
 
+def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
+    cur.execute("""
+    SELECT producto_id, COALESCE(cantidad, 0), COALESCE(series_texto, '')
+    FROM ventas_detalle
+    WHERE venta_id=%s AND producto_id IS NOT NULL
+    """, (documento_id,))
+    detalles = cur.fetchall()
+    touched = set()
+    if str(tipo or "").upper() in STOCK_DOC_TYPES:
+        for producto_id, cantidad, series_texto in detalles:
+            series = split_series_text(series_texto)
+            if series:
+                cur.execute("""
+                UPDATE producto_series
+                SET estado='DISPONIBLE', fecha_salida=NULL
+                WHERE producto_id=%s
+                  AND COALESCE(sucursal,%s)=%s
+                  AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
+                """, (producto_id, DEFAULT_SUCURSAL, sucursal, series))
+                touched.add(producto_id)
+            else:
+                cur.execute("""
+                UPDATE productos
+                SET stock = COALESCE(stock, 0) + %s
+                WHERE id = %s AND COALESCE(sucursal,%s)=%s
+                """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal))
+        for producto_id in touched:
+            sync_producto_stock_from_series(cur, producto_id, sucursal)
+
+
+@app.post("/documentos/{documento_id}/anular")
+def anular_documento(documento_id: int, data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        payload = data or {}
+        sucursal = norm_sucursal(payload.get("sucursal") or sucursal)
+        usuario = str(payload.get("usuario") or "").strip()
+        motivo = str(payload.get("motivo") or "Anulado desde ERP").strip()
+        cur.execute("""
+        SELECT tipo, numero, COALESCE(estado,'EMITIDO'), COALESCE(sucursal,%s)
+        FROM ventas
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
+        venta = cur.fetchone()
+        if not venta:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Documento no encontrado"}
+        tipo, numero, estado, sucursal = venta
+        if str(estado or "").upper() == "ANULADO":
+            conn.close()
+            return {"ok": False, "success": False, "msg": f"{tipo} {numero} ya esta anulado."}
+
+        restaurar_stock_documento(cur, documento_id, tipo, sucursal)
+        cur.execute("""
+        UPDATE ventas
+        SET estado='ANULADO',
+            observacion_interna=TRIM(COALESCE(observacion_interna,'') || CASE WHEN COALESCE(observacion_interna,'')='' THEN '' ELSE E'\n' END || %s)
+        WHERE id=%s
+        """, (f"ANULADO: {motivo}", documento_id))
+        cur.execute("""
+        UPDATE caja_movimientos
+        SET estado_pago='ANULADO',
+            observacion=TRIM(COALESCE(observacion,'') || CASE WHEN COALESCE(observacion,'')='' THEN '' ELSE E'\n' END || %s)
+        WHERE documento_tipo=%s AND documento_numero=%s AND COALESCE(sucursal,%s)=%s
+        """, (f"ANULADO por {usuario or 'SISTEMA'}: {motivo}", tipo, numero, DEFAULT_SUCURSAL, sucursal))
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,'',%s,'DOCUMENTO ANULADO',%s)
+        """, (usuario, sucursal, f"{tipo} {numero} - {motivo}"))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero, "msg": f"{tipo} {numero} anulado. Stock restaurado."}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
 @app.delete("/documentos/{documento_id}")
 def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -5155,31 +5351,7 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
 
         tipo, numero, sucursal = venta
 
-        cur.execute("""
-        SELECT producto_id, COALESCE(cantidad, 0), COALESCE(series_texto, '')
-        FROM ventas_detalle
-        WHERE venta_id=%s AND producto_id IS NOT NULL
-        """, (documento_id,))
-        detalles = cur.fetchall()
-
-        if str(tipo or "").upper() in STOCK_DOC_TYPES:
-            for producto_id, cantidad, series_texto in detalles:
-                series = split_series_text(series_texto)
-                if series:
-                    cur.execute("""
-                    UPDATE producto_series
-                    SET estado='DISPONIBLE', fecha_salida=NULL
-                    WHERE producto_id=%s
-                      AND COALESCE(sucursal,%s)=%s
-                      AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
-                    """, (producto_id, DEFAULT_SUCURSAL, sucursal, series))
-                    sync_producto_stock_from_series(cur, producto_id, sucursal)
-                else:
-                    cur.execute("""
-                    UPDATE productos
-                    SET stock = COALESCE(stock, 0) + %s
-                    WHERE id = %s AND COALESCE(sucursal,%s)=%s
-                    """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal))
+        restaurar_stock_documento(cur, documento_id, tipo, sucursal)
 
         cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
         cur.execute("""
