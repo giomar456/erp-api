@@ -1647,7 +1647,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.71 mejora seleccion de productos y administracion de series."
+    latest_notes = "Actualizacion G&G ERP: web v1.72 agrega catalogo CompuVision para importar productos al ERP."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1661,12 +1661,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.71")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.72")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.71: mejora seleccion de productos y administracion de series.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.72: agrega catalogo CompuVision para importar productos al ERP.")
     return {
         "ok": True,
         "success": True,
@@ -5792,6 +5792,191 @@ def woo_sync_price_by_sku(sku: str, price, sucursal: str = DEFAULT_SUCURSAL):
     if not updated.get("ok"):
         return updated
     return {"ok": True, "sku": sku, "woo_id": woo_id, "regular_price": regular_price, "data": updated.get("data", {})}
+
+
+# ================= CATALOGO EXTERNO: COMPUVISION =================
+COMPUVISION_HOME_URL = "https://compuvisionperu.pe/CYM/"
+COMPUVISION_AJAX_PRODUCTS_URL = "https://compuvisionperu.pe/ajax/ajs_productos.php"
+
+
+def compuvision_request_product(product_id):
+    product_id = str(product_id or "").strip()
+    if not product_id:
+        return {"ok": False, "msg": "ID de producto requerido."}
+    body = urllib.parse.urlencode({"idProd": product_id, "tipo": "prod-s-data"}).encode("utf-8")
+    req = urllib.request.Request(
+        COMPUVISION_AJAX_PRODUCTS_URL,
+        data=body,
+        headers={
+            "Accept": "application/json,text/plain,*/*",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": "Mozilla/5.0 G&G ERP",
+            "Referer": COMPUVISION_HOME_URL,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict) or not data.get("prod_id"):
+            return {"ok": False, "msg": "Producto CompuVision no encontrado.", "raw": raw[:300]}
+        return {"ok": True, "data": compuvision_normalize_product(data)}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+def compuvision_home_data():
+    req = urllib.request.Request(COMPUVISION_HOME_URL, headers={"User-Agent": "Mozilla/5.0 G&G ERP"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def compuvision_exchange_rate(html_text=None):
+    try:
+        text = html_text if html_text is not None else compuvision_home_data()
+        match = re.search(r"Tc:\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+        if match:
+            return float(match.group(1))
+    except Exception:
+        pass
+    return 3.45
+
+
+def compuvision_image_url(value):
+    src = str(value or "").strip()
+    if not src:
+        return ""
+    if src.startswith(("http://", "https://")):
+        return src
+    if src.startswith("../"):
+        src = src[3:]
+    if src.startswith("/"):
+        return f"https://compuvisionperu.pe{src}"
+    return f"https://compuvisionperu.pe/{src.lstrip('/')}"
+
+
+def compuvision_normalize_product(raw):
+    tc = compuvision_exchange_rate()
+    price_usd = float(raw.get("precio") or raw.get("precio_prod") or 0)
+    sale_usd = raw.get("precio_oferta")
+    try:
+        sale_usd = float(sale_usd) if sale_usd not in (None, "") else None
+    except Exception:
+        sale_usd = None
+    final_usd = sale_usd if sale_usd and sale_usd > 0 else price_usd
+    images = raw.get("imagenes") if isinstance(raw.get("imagenes"), list) else []
+    image_url = ""
+    if images:
+        first = images[0] if isinstance(images[0], dict) else {}
+        image_url = compuvision_image_url(first.get("imagen_url") or first.get("imagen") or first.get("url"))
+    return {
+        "proveedor": "COMPUVISION",
+        "external_id": str(raw.get("prod_id") or ""),
+        "codigo_proveedor": f"CV-{raw.get('prod_id')}",
+        "codigo": str(raw.get("prod_cod") or raw.get("cod_esp") or ""),
+        "nombre": html.unescape(str(raw.get("nom_prod") or raw.get("nombre") or "")).strip(),
+        "categoria": html.unescape(str(raw.get("categoria") or "")).strip().upper(),
+        "marca": html.unescape(str(raw.get("marca") or "")).strip().upper(),
+        "modelo": html.unescape(str(raw.get("cod_esp") or raw.get("prod_cod") or "")).strip().upper(),
+        "precio_usd": round(final_usd, 2),
+        "precio_regular_usd": round(price_usd, 2),
+        "precio_oferta_usd": sale_usd,
+        "tc": tc,
+        "precio_soles": round(final_usd * tc, 2),
+        "stock": int(float(raw.get("stock") or raw.get("stock_prod") or 0)),
+        "garantia": html.unescape(str(raw.get("garantia") or "")).strip(),
+        "imagen_url": image_url,
+        "url": f"https://compuvisionperu.pe/CYM/producto/{raw.get('prod_id')}",
+    }
+
+
+@app.get("/web/compuvision/product/{product_id}")
+def compuvision_product(product_id: str):
+    return compuvision_request_product(product_id)
+
+
+@app.get("/web/compuvision/products")
+def compuvision_products(q: str = "", limit: int = 40):
+    limit = max(1, min(int(limit or 40), 80))
+    try:
+        page = compuvision_home_data()
+        ids = []
+        for match in re.finditer(r"espe_prod_carr\((\d+)\)", page):
+            pid = match.group(1)
+            if pid not in ids:
+                ids.append(pid)
+        query = str(q or "").strip().lower()
+        data = []
+        for pid in ids[: max(limit * 3, limit)]:
+            r = compuvision_request_product(pid)
+            if not r.get("ok"):
+                continue
+            item = r.get("data") or {}
+            haystack = f"{item.get('nombre','')} {item.get('categoria','')} {item.get('marca','')} {item.get('modelo','')} {item.get('codigo','')} {item.get('external_id','')}".lower()
+            if query and query not in haystack:
+                continue
+            data.append(item)
+            if len(data) >= limit:
+                break
+        return {"ok": True, "success": True, "total": len(data), "data": data}
+    except Exception as e:
+        return {"ok": False, "success": False, "msg": str(e), "data": []}
+
+
+@app.post("/web/compuvision/import/{product_id}")
+def compuvision_import_product(product_id: str, data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal((data or {}).get("sucursal") or (data or {}).get("empresa") or sucursal)
+    r = compuvision_request_product(product_id)
+    if not r.get("ok"):
+        return r
+    p = r.get("data") or {}
+    codigo = p.get("codigo_proveedor") or f"CV-{product_id}"
+    precio = float(p.get("precio_soles") or 0)
+    stock = int(p.get("stock") or 0)
+    observacion = f"Proveedor COMPUVISION / ID {p.get('external_id')} / Codigo {p.get('codigo')} / USD {p.get('precio_usd')} / TC {p.get('tc')} / {p.get('garantia')}"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS codigo_proveedor TEXT DEFAULT ''")
+    cur.execute("""
+        SELECT id FROM productos
+        WHERE COALESCE(sucursal,%s)=%s AND codigo_proveedor=%s
+        LIMIT 1
+    """, (DEFAULT_SUCURSAL, sucursal, codigo))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute("""
+        UPDATE productos
+        SET nombre=%s, categoria=%s, marca=%s, modelo=%s, precio_compra=%s,
+            precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s
+        WHERE id=%s
+        RETURNING id
+        """, (
+            p.get("nombre") or f"Producto CompuVision {product_id}",
+            p.get("categoria") or "COMPUVISION",
+            p.get("marca") or "",
+            p.get("modelo") or "",
+            precio, precio, stock, p.get("imagen_url") or "", observacion, existing[0]
+        ))
+        producto_id = cur.fetchone()[0]
+        action = "actualizado"
+    else:
+        cur.execute("""
+        INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal,codigo_proveedor)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id
+        """, (
+            p.get("nombre") or f"Producto CompuVision {product_id}",
+            p.get("categoria") or "COMPUVISION",
+            p.get("marca") or "",
+            p.get("modelo") or "",
+            precio, precio, stock, p.get("imagen_url") or "", observacion, "TIENDA", sucursal, codigo
+        ))
+        producto_id = cur.fetchone()[0]
+        action = "importado"
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True, "msg": f"Producto {action} desde CompuVision: {p.get('nombre')}", "id": producto_id, "action": action, "producto": p}
 
 
 @app.get("/web/config")
