@@ -1057,6 +1057,7 @@ class Usuario(BaseModel):
     clave: str
     rol: str = "VENTAS"
     foto_url: Optional[str] = ""
+    fondo_url: Optional[str] = ""
     boquitoqui_enabled: bool = False
     sucursal: str = DEFAULT_SUCURSAL
     color_tema: Optional[str] = "#304fb8"
@@ -1073,6 +1074,11 @@ class UsuarioRadioUpdate(BaseModel):
 class UsuarioColorUpdate(BaseModel):
     usuario: Optional[str] = ""
     color_tema: str = "#304fb8"
+
+
+class UsuarioFondoUpdate(BaseModel):
+    usuario: Optional[str] = ""
+    fondo_url: str = ""
 
 
 class UsuarioOnlineHeartbeat(BaseModel):
@@ -1236,6 +1242,7 @@ def migrate_schema():
         );
         """)
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto_url TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fondo_url TEXT DEFAULT ''")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS boquitoqui_enabled BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS color_tema TEXT DEFAULT '#304fb8'")
@@ -1640,7 +1647,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.69 evita sincronizar precios web en cero por SKU."
+    latest_notes = "Actualizacion G&G ERP: web v1.70 permite fondo personalizado por usuario."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1654,12 +1661,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.69")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.70")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.69: evita sincronizar precios web en cero por SKU.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.70: permite fondo personalizado por usuario.")
     return {
         "ok": True,
         "success": True,
@@ -1685,6 +1692,7 @@ def login(data: dict):
 
     cur.execute("""
         SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
+               COALESCE(fondo_url,'') AS fondo_url,
                COALESCE(sucursal,%s) AS sucursal,
                COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(color_tema,'#304fb8') AS color_tema
@@ -1704,7 +1712,7 @@ def login(data: dict):
             return {"ok": False, "msg": "No tienes acceso a esta sucursal."}
         sucursal = user_branch
 
-    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "color_tema": norm_theme_color(user.get("color_tema")), "sucursal": sucursal, "empresa": sucursal, "permisos": user.get("permisos") or dict(DEFAULT_FEATURES)}
+    return {"ok": True, "id": user["id"], "usuario": user["usuario"], "rol": user["rol"], "foto_url": user.get("foto_url", ""), "fondo_url": user.get("fondo_url", ""), "boquitoqui_enabled": bool(user.get("boquitoqui_enabled")), "color_tema": norm_theme_color(user.get("color_tema")), "sucursal": sucursal, "empresa": sucursal, "permisos": user.get("permisos") or dict(DEFAULT_FEATURES)}
 
 
 # ================= USUARIOS =================
@@ -1715,6 +1723,7 @@ def listar_usuarios(sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
     cur.execute("""
         SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
+               COALESCE(fondo_url,'') AS fondo_url,
                COALESCE(sucursal,%s) AS sucursal,
                COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(color_tema,'#304fb8') AS color_tema
@@ -1733,6 +1742,7 @@ def perfil_usuario(usuario: str = ""):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, usuario, rol, COALESCE(foto_url,'') AS foto_url,
+               COALESCE(fondo_url,'') AS fondo_url,
                COALESCE(sucursal,%s) AS sucursal,
                COALESCE(boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(color_tema,'#304fb8') AS color_tema
@@ -1756,31 +1766,36 @@ def guardar_usuario(data: Usuario):
     clave = data.clave or ""
     rol = (data.rol or "VENTAS").upper()
     foto_url = data.foto_url or ""
+    fondo_url = data.fondo_url or ""
     radio_enabled = bool(data.boquitoqui_enabled)
     sucursal = norm_sucursal(data.sucursal)
     color_tema = norm_theme_color(data.color_tema)
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
-    if not usuario or not clave:
+    if not usuario:
         conn.close()
-        return {"ok": False, "msg": "Usuario y clave son obligatorios"}
+        return {"ok": False, "msg": "Usuario obligatorio"}
     cur.execute("SELECT id FROM usuarios WHERE lower(usuario)=lower(%s)", (usuario,))
     existing = cur.fetchone()
+    if not existing and not clave:
+        conn.close()
+        return {"ok": False, "msg": "Usuario y clave son obligatorios"}
     if existing:
         cur.execute("""
         UPDATE usuarios
-        SET usuario=%s, clave=%s, rol=%s, sucursal=%s, boquitoqui_enabled=%s,
+        SET usuario=%s, clave=CASE WHEN %s <> '' THEN %s ELSE clave END, rol=%s, sucursal=%s, boquitoqui_enabled=%s,
             color_tema=%s,
-            foto_url=CASE WHEN %s <> '' THEN %s ELSE COALESCE(foto_url,'') END
+            foto_url=CASE WHEN %s <> '' THEN %s ELSE COALESCE(foto_url,'') END,
+            fondo_url=%s
         WHERE id=%s
         RETURNING id
-        """, (usuario, clave, rol, sucursal, radio_enabled, color_tema, foto_url, foto_url, existing[0]))
+        """, (usuario, clave, clave, rol, sucursal, radio_enabled, color_tema, foto_url, foto_url, fondo_url, existing[0]))
     else:
         cur.execute("""
-        INSERT INTO usuarios (usuario, clave, rol, foto_url, sucursal, boquitoqui_enabled, color_tema)
-        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO usuarios (usuario, clave, rol, foto_url, fondo_url, sucursal, boquitoqui_enabled, color_tema)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING id
-        """, (usuario, clave, rol, foto_url, sucursal, radio_enabled, color_tema))
+        """, (usuario, clave, rol, foto_url, fondo_url, sucursal, radio_enabled, color_tema))
     user_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -1922,6 +1937,25 @@ def actualizar_foto_usuario(usuario_id: int, data: dict):
     return {"ok": True, "success": True}
 
 
+@app.put("/usuarios/{usuario_id}/fondo")
+def actualizar_fondo_usuario_admin(usuario_id: int, data: UsuarioFondoUpdate):
+    fondo_url = str(data.fondo_url or "").strip()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE usuarios
+        SET fondo_url=%s
+        WHERE id=%s
+        RETURNING id
+    """, (fondo_url, usuario_id))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True, "id": row[0], "fondo_url": fondo_url}
+
+
 @app.put("/usuarios/{usuario_id}/rol")
 def cambiar_rol_usuario(usuario_id: int, data: UsuarioRolUpdate):
     conn = get_conn()
@@ -2006,6 +2040,27 @@ def cambiar_color_usuario(data: UsuarioColorUpdate):
     return {"ok": True, "success": True, "id": row[0], "color_tema": color}
 
 
+@app.put("/usuarios/fondo")
+def cambiar_fondo_usuario(data: UsuarioFondoUpdate):
+    usuario = (data.usuario or "").strip()
+    if not usuario:
+        return {"ok": False, "msg": "Usuario requerido."}
+    fondo_url = str(data.fondo_url or "").strip()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE usuarios SET fondo_url=%s
+    WHERE lower(usuario)=lower(%s)
+    RETURNING id
+    """, (fondo_url, usuario))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Usuario no encontrado"}
+    return {"ok": True, "success": True, "id": row[0], "fondo_url": fondo_url}
+
+
 @app.get("/usuarios/{usuario_id}/permisos")
 def obtener_permisos_usuario(usuario_id: int):
     conn = get_conn()
@@ -2066,6 +2121,7 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     cur.execute("""
         SELECT u.id, u.usuario, u.rol, COALESCE(u.foto_url,'') AS foto_url,
+               COALESCE(u.fondo_url,'') AS fondo_url,
                COALESCE(u.sucursal,%s) AS sucursal,
                COALESCE(u.boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(u.color_tema,'#304fb8') AS color_tema,
