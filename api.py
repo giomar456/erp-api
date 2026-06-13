@@ -1640,7 +1640,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.68 sincroniza solo precios WooCommerce por SKU independiente."
+    latest_notes = "Actualizacion G&G ERP: web v1.69 evita sincronizar precios web en cero por SKU."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1654,12 +1654,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.68")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.69")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.68: sincroniza solo precios WooCommerce por SKU independiente.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.69: evita sincronizar precios web en cero por SKU.")
     return {
         "ok": True,
         "success": True,
@@ -5719,9 +5719,12 @@ def woo_sync_price_by_sku(sku: str, price, sucursal: str = DEFAULT_SUCURSAL):
     if not sku:
         return {"ok": False, "msg": "Producto sin codigo web/SKU."}
     try:
-        regular_price = f"{float(price or 0):.2f}"
+        price_value = float(price or 0)
     except Exception:
-        regular_price = "0.00"
+        return {"ok": False, "msg": f"Precio invalido para SKU {sku}."}
+    if price_value <= 0:
+        return {"ok": False, "msg": f"Precio no sincronizado para SKU {sku}: el precio ERP esta en cero."}
+    regular_price = f"{price_value:.2f}"
     found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
     if not found.get("ok"):
         return found
