@@ -1640,7 +1640,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.67 mejora precio decimal, PDF legible, miniaturas en productos y codigo web/SKU WooCommerce."
+    latest_notes = "Actualizacion G&G ERP: web v1.68 sincroniza solo precios WooCommerce por SKU independiente."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1654,12 +1654,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.67")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.68")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.67: mejora precio decimal, PDF legible, miniaturas en productos y codigo web/SKU WooCommerce.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.68: sincroniza solo precios WooCommerce por SKU independiente.")
     return {
         "ok": True,
         "success": True,
@@ -5714,6 +5714,27 @@ def woo_upsert_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
     return {"ok": True, "action": action, "data": r.get("data", {})}
 
 
+def woo_sync_price_by_sku(sku: str, price, sucursal: str = DEFAULT_SUCURSAL):
+    sku = str(sku or "").strip().upper()
+    if not sku:
+        return {"ok": False, "msg": "Producto sin codigo web/SKU."}
+    try:
+        regular_price = f"{float(price or 0):.2f}"
+    except Exception:
+        regular_price = "0.00"
+    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+    if not found.get("ok"):
+        return found
+    existing = found.get("data") or []
+    if not existing:
+        return {"ok": False, "msg": f"No existe producto WooCommerce con SKU {sku}."}
+    woo_id = existing[0].get("id")
+    updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"regular_price": regular_price})
+    if not updated.get("ok"):
+        return updated
+    return {"ok": True, "sku": sku, "woo_id": woo_id, "regular_price": regular_price, "data": updated.get("data", {})}
+
+
 @app.get("/web/config")
 def obtener_web_config(sucursal: str = DEFAULT_SUCURSAL):
     data = web_config_for_sucursal(sucursal)
@@ -5826,6 +5847,62 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
         else:
             errores.append({"id": p.get("id"), "nombre": p.get("nombre"), "msg": r.get("msg", "Error WooCommerce")})
     return {"ok": True, "success": True, "total": len(productos), "sync_ok": ok, "errores": errores[:20]}
+
+
+@app.post("/web/woocommerce/sync-price/{producto_id}")
+def woo_sync_product_price(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    cur.execute("""
+        SELECT id, nombre, precio_venta, COALESCE(sku_woo,'') AS sku_woo
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    p = dict_fetchone(cur)
+    conn.close()
+    if not p:
+        return {"ok": False, "success": False, "msg": "Producto ERP no encontrado."}
+    r = woo_sync_price_by_sku(p.get("sku_woo"), p.get("precio_venta"), sucursal=sucursal)
+    if not r.get("ok"):
+        return {"ok": False, "success": False, "msg": r.get("msg", "No se pudo sincronizar precio."), "producto": p}
+    return {"ok": True, "success": True, "msg": f"Precio sincronizado por SKU {r.get('sku')}: S/ {r.get('regular_price')}", "producto": p, "data": r}
+
+
+@app.post("/web/woocommerce/sync-prices")
+def woo_sync_prices(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    only_with_sku = bool((data or {}).get("only_with_sku", True))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    sql = """
+        SELECT id, nombre, precio_venta, COALESCE(sku_woo,'') AS sku_woo
+        FROM productos
+        WHERE COALESCE(sucursal,%s)=%s
+    """
+    params = [DEFAULT_SUCURSAL, sucursal]
+    if only_with_sku:
+        sql += " AND TRIM(COALESCE(sku_woo,''))<>''"
+    sql += " ORDER BY id LIMIT 500"
+    cur.execute(sql, params)
+    productos = dict_fetchall(cur)
+    conn.close()
+    ok = 0
+    omitidos = 0
+    errores = []
+    for p in productos:
+        sku = str(p.get("sku_woo") or "").strip()
+        if not sku:
+            omitidos += 1
+            continue
+        r = woo_sync_price_by_sku(sku, p.get("precio_venta"), sucursal=sucursal)
+        if r.get("ok"):
+            ok += 1
+        else:
+            errores.append({"id": p.get("id"), "nombre": p.get("nombre"), "sku": sku, "msg": r.get("msg", "Error WooCommerce")})
+    return {"ok": True, "success": True, "msg": f"Precios sincronizados: {ok}. Omitidos sin SKU: {omitidos}. Errores: {len(errores)}.", "total": len(productos), "sync_ok": ok, "omitidos": omitidos, "errores": errores[:30]}
 
 
 @app.post("/web/woocommerce/sync-images")
