@@ -487,7 +487,7 @@ def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
         for serie in selected:
             matches = found.get(serie, [])
             if not matches:
-                return f"Combo/PRUEBA: la serie {serie} no esta registrada."
+                continue
             disponibles = [r for r in matches if str(r.get("estado") or "").upper() in ("DISPONIBLE", "RESERVADO")]
             if not disponibles:
                 estados = ", ".join(sorted({str(r.get("estado") or "") for r in matches}))
@@ -1647,7 +1647,7 @@ def app_version():
     latest_version = "1.0.70"
     latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
-    latest_notes = "Actualizacion G&G ERP: web v1.72 agrega catalogo CompuVision para importar productos al ERP."
+    latest_notes = "Actualizacion G&G ERP web v1.73: stock sincronizado con series, buscador global por producto en boletas/documentos y flechas por dia."
 
     version = os.getenv("APP_VERSION", latest_version)
     download_url = os.getenv("APP_DOWNLOAD_URL", latest_url)
@@ -1661,12 +1661,12 @@ def app_version():
         exe_name = latest_name
         notes = latest_notes
 
-    android_version = os.getenv("ANDROID_APP_VERSION", "1.72")
+    android_version = os.getenv("ANDROID_APP_VERSION", "1.73")
     android_download_url = os.getenv("ANDROID_APP_DOWNLOAD_URL", "")
     android_apk_name = os.getenv("ANDROID_APP_APK_NAME", "GG_ERP_TELEFONO_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
     android_dex_download_url = os.getenv("ANDROID_APP_DEX_DOWNLOAD_URL", android_download_url)
     android_dex_apk_name = os.getenv("ANDROID_APP_DEX_APK_NAME", "GG_ERP_TABLET_DEX_v1.57_CAJA_PRODUCTOS_INSTALABLE.apk")
-    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.72: agrega catalogo CompuVision para importar productos al ERP.")
+    android_notes = os.getenv("ANDROID_APP_UPDATE_NOTES", "Actualizacion G&G ERP web v1.73: stock sincronizado con series, buscador global por producto en boletas/documentos y flechas por dia.")
     return {
         "ok": True,
         "success": True,
@@ -3207,6 +3207,23 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    cur.execute("""
+    UPDATE productos p
+    SET stock = (
+        SELECT COUNT(*)
+        FROM producto_series ps
+        WHERE ps.producto_id = p.id
+          AND COALESCE(ps.sucursal,%s)=%s
+          AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+    )
+    WHERE COALESCE(p.sucursal,%s)=%s
+      AND EXISTS (
+        SELECT 1
+        FROM producto_series ps
+        WHERE ps.producto_id = p.id
+          AND COALESCE(ps.sucursal,%s)=%s
+      )
+    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
 
     cur.execute("""
     SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
@@ -3221,6 +3238,7 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
 
+    conn.commit()
     conn.close()
 
     return data
@@ -4345,18 +4363,16 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         found = {str(r.get("serie") or "").upper(): r for r in dict_fetchall(cur)}
         faltantes = [serie for serie in series if serie not in found]
         bloqueadas = [f"{serie} ({found[serie].get('estado')})" for serie in series if serie in found and found[serie].get("estado") not in ("DISPONIBLE", "RESERVADO")]
-        if faltantes or bloqueadas:
+        if bloqueadas:
             conn.close()
             msg = []
-            if faltantes:
-                msg.append("Series no registradas: " + ", ".join(faltantes))
             if bloqueadas:
                 msg.append("Series no disponibles: " + ", ".join(bloqueadas))
             return {"ok": False, "success": False, "msg": " | ".join(msg), "faltantes": faltantes, "bloqueadas": bloqueadas}
 
         fecha_emision = parse_fecha_emision(data.fecha_emision)
         cliente = (data.cliente_nombre or "CLIENTE MANUAL").strip() or "CLIENTE MANUAL"
-        total = round(sum(float(found[s].get("precio_venta") or 0) for s in series), 2)
+        total = round(sum(float(found[s].get("precio_venta") or 0) for s in series if s in found), 2)
         cur.execute("""
         INSERT INTO ventas (
             fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
@@ -4374,6 +4390,15 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
 
         touched_products = set()
         for serie in series:
+            if serie not in found:
+                cur.execute("""
+                INSERT INTO ventas_detalle (
+                    venta_id, producto_id, descripcion, marca, modelo,
+                    series_texto, cantidad, precio, total, sucursal
+                )
+                VALUES (%s,NULL,%s,'','',%s,1,0,0,%s)
+                """, (venta_id, f"SERIE NO REGISTRADA {serie}", serie, sucursal))
+                continue
             row = found[serie]
             producto_id = row.get("producto_id")
             precio = float(row.get("precio_venta") or 0)
@@ -4542,51 +4567,85 @@ def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpda
 
 
 @app.get("/documentos")
-def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = ""):
+def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str = ""):
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
         sucursal = norm_sucursal(sucursal)
         filtro_fecha = (fecha or "").strip()
+        texto = f"%{(q or '').strip().lower()}%"
         cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''")
 
         cur.execute("""
         SELECT
-            id,
-            tipo,
-            numero,
-            cliente AS cliente_nombre,
+            v.id,
+            v.tipo,
+            v.numero,
+            v.cliente AS cliente_nombre,
             COALESCE(documento_cliente, '') AS documento_cliente,
             COALESCE(direccion_cliente, '') AS direccion_cliente,
-            fecha AS fecha_emision,
-            COALESCE(TO_CHAR(fecha_vencimiento, 'YYYY-MM-DD'), '') AS fecha_vencimiento,
-            COALESCE(subtotal, total, 0) AS subtotal,
-            COALESCE(igv, 0) AS igv,
-            COALESCE(total, 0) AS total,
-            COALESCE(observacion, '') AS observacion,
-            COALESCE(observacion_interna, '') AS observacion_interna,
-            COALESCE(usuario_emisor, '') AS usuario_emisor,
-            COALESCE(estado, 'EMITIDO') AS estado,
-            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
-            COALESCE(metodo_pago, '') AS metodo_pago,
-            COALESCE(monto_pagado, CASE WHEN COALESCE(estado_pago,'PAGADO')='PAGADO' THEN COALESCE(total,0) ELSE 0 END) AS monto_pagado,
-            COALESCE(pagos_detalle_json, '') AS pagos_detalle_json,
-            COALESCE(saldo_pago, GREATEST(COALESCE(total,0) - COALESCE(monto_pagado,0), 0)) AS saldo_pago,
-            COALESCE(observacion_pago, '') AS observacion_pago,
-            COALESCE(comprobante_pago, '') AS comprobante_pago,
-            COALESCE(comprobante_pago_nombre, '') AS comprobante_pago_nombre,
-            COALESCE(comprobante_pago_mime, '') AS comprobante_pago_mime,
-            COALESCE(comprobante_pago_tamano, 0) AS comprobante_pago_tamano,
-            COALESCE(comprobantes_pago_json, '') AS comprobantes_pago_json,
-            COALESCE(sunat_estado, 'PENDIENTE') AS sunat_estado,
-            COALESCE(sunat_modo, 'MANUAL') AS sunat_modo,
-            sunat_fecha
-        FROM ventas
-        WHERE COALESCE(sucursal,%s)=%s
-          AND (%s='' OR TO_CHAR(fecha, 'YYYY-MM-DD')=%s)
-        ORDER BY id DESC
-        """, (DEFAULT_SUCURSAL, sucursal, filtro_fecha, filtro_fecha))
+            v.fecha AS fecha_emision,
+            COALESCE(TO_CHAR(v.fecha_vencimiento, 'YYYY-MM-DD'), '') AS fecha_vencimiento,
+            COALESCE(v.subtotal, v.total, 0) AS subtotal,
+            COALESCE(v.igv, 0) AS igv,
+            COALESCE(v.total, 0) AS total,
+            COALESCE(v.observacion, '') AS observacion,
+            COALESCE(v.observacion_interna, '') AS observacion_interna,
+            COALESCE(v.usuario_emisor, '') AS usuario_emisor,
+            COALESCE(v.estado, 'EMITIDO') AS estado,
+            COALESCE(v.estado_pago, 'PAGADO') AS estado_pago,
+            COALESCE(v.metodo_pago, '') AS metodo_pago,
+            COALESCE(v.monto_pagado, CASE WHEN COALESCE(v.estado_pago,'PAGADO')='PAGADO' THEN COALESCE(v.total,0) ELSE 0 END) AS monto_pagado,
+            COALESCE(v.pagos_detalle_json, '') AS pagos_detalle_json,
+            COALESCE(v.saldo_pago, GREATEST(COALESCE(v.total,0) - COALESCE(v.monto_pagado,0), 0)) AS saldo_pago,
+            COALESCE(v.observacion_pago, '') AS observacion_pago,
+            COALESCE(v.comprobante_pago, '') AS comprobante_pago,
+            COALESCE(v.comprobante_pago_nombre, '') AS comprobante_pago_nombre,
+            COALESCE(v.comprobante_pago_mime, '') AS comprobante_pago_mime,
+            COALESCE(v.comprobante_pago_tamano, 0) AS comprobante_pago_tamano,
+            COALESCE(v.comprobantes_pago_json, '') AS comprobantes_pago_json,
+            COALESCE(v.sunat_estado, 'PENDIENTE') AS sunat_estado,
+            COALESCE(v.sunat_modo, 'MANUAL') AS sunat_modo,
+            v.sunat_fecha,
+            COALESCE((
+                SELECT string_agg(
+                    COALESCE(vd.descripcion,'') || ' ' ||
+                    COALESCE(vd.marca,'') || ' ' ||
+                    COALESCE(vd.modelo,'') || ' ' ||
+                    COALESCE(vd.series_texto,''),
+                    ' '
+                )
+                FROM ventas_detalle vd
+                WHERE vd.venta_id = v.id
+                  AND COALESCE(vd.sucursal,%s)=%s
+            ), '') AS detalle_busqueda
+        FROM ventas v
+        WHERE COALESCE(v.sucursal,%s)=%s
+          AND (%s='' OR TO_CHAR(v.fecha, 'YYYY-MM-DD')=%s)
+          AND (%s='%%'
+               OR LOWER(COALESCE(v.tipo,'')) LIKE %s
+               OR LOWER(COALESCE(v.numero,'')) LIKE %s
+               OR LOWER(COALESCE(v.cliente,'')) LIKE %s
+               OR LOWER(COALESCE(v.documento_cliente,'')) LIKE %s
+               OR LOWER(COALESCE(v.observacion,'')) LIKE %s
+               OR EXISTS (
+                    SELECT 1
+                    FROM ventas_detalle vd
+                    WHERE vd.venta_id = v.id
+                      AND COALESCE(vd.sucursal,%s)=%s
+                      AND (LOWER(COALESCE(vd.descripcion,'')) LIKE %s
+                           OR LOWER(COALESCE(vd.marca,'')) LIKE %s
+                           OR LOWER(COALESCE(vd.modelo,'')) LIKE %s
+                           OR LOWER(COALESCE(vd.series_texto,'')) LIKE %s)
+               ))
+        ORDER BY v.id DESC
+        """, (
+            DEFAULT_SUCURSAL, sucursal,
+            DEFAULT_SUCURSAL, sucursal, filtro_fecha, filtro_fecha,
+            texto, texto, texto, texto, texto, texto,
+            DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto,
+        ))
         data = dict_fetchall(cur)
         rows = []
         for r in data:
