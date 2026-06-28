@@ -1472,23 +1472,36 @@ def migrate_schema():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS series (
             id SERIAL PRIMARY KEY,
-            tipo TEXT UNIQUE,
+            tipo TEXT,
             serie TEXT,
             correlativo INT
         );
         """)
+        cur.execute("ALTER TABLE series DROP CONSTRAINT IF EXISTS series_tipo_key")
+        cur.execute("ALTER TABLE series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("UPDATE series SET sucursal='computer_army' WHERE COALESCE(sucursal,'')=''")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_series_tipo_sucursal ON series (tipo, sucursal)")
 
         cur.execute("""
-        INSERT INTO series (tipo, serie, correlativo)
+        INSERT INTO series (tipo, serie, correlativo, sucursal)
         VALUES
-            ('PROFORMA','P001',1),
-            ('NOTA DE VENTA','N001',1),
-            ('PASE','PA001',1),
-            ('BOLETA','B001',1),
-            ('FACTURA','F001',1)
-        ON CONFLICT (tipo) DO NOTHING;
+            ('PROFORMA','P001',1,'computer_army'),
+            ('NOTA DE VENTA','N001',1,'computer_army'),
+            ('PASE','PA001',1,'computer_army'),
+            ('BOLETA','B001',1,'computer_army'),
+            ('FACTURA','F001',1,'computer_army')
+        ON CONFLICT (tipo, sucursal) DO NOTHING;
         """)
-        cur.execute("ALTER TABLE series ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'")
+        cur.execute("""
+        INSERT INTO series (tipo, serie, correlativo, sucursal)
+        VALUES
+            ('PROFORMA','P001',1,'pc_fast_store'),
+            ('NOTA DE VENTA','N001',1,'pc_fast_store'),
+            ('PASE','PA001',1,'pc_fast_store'),
+            ('BOLETA','B001',1,'pc_fast_store'),
+            ('FACTURA','F001',1,'pc_fast_store')
+        ON CONFLICT (tipo, sucursal) DO NOTHING;
+        """)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS producto_series (
@@ -4323,11 +4336,16 @@ def exportar_backup(sucursal: str = DEFAULT_SUCURSAL):
 
 # ================= SERIES =================
 @app.get("/series/{tipo}")
-def get_serie(tipo: str):
+def get_serie(tipo: str, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
 
-    cur.execute("SELECT id, serie, correlativo FROM series WHERE tipo=%s", (tipo,))
+    cur.execute("""
+    SELECT id, serie, correlativo
+    FROM series
+    WHERE UPPER(tipo)=UPPER(%s) AND COALESCE(sucursal,%s)=%s
+    """, (tipo, DEFAULT_SUCURSAL, sucursal))
     row = cur.fetchone()
 
     conn.close()
@@ -4351,7 +4369,11 @@ def crear_venta(data: Venta):
         doc_tipo_upper = (data.tipo or "").strip().upper()
         if doc_tipo_upper:
             data.tipo = doc_tipo_upper
-        cur.execute("SELECT id, serie, correlativo FROM series WHERE UPPER(tipo)=%s", (doc_tipo_upper,))
+        cur.execute("""
+        SELECT id, serie, correlativo
+        FROM series
+        WHERE UPPER(tipo)=%s AND COALESCE(sucursal,%s)=%s
+        """, (doc_tipo_upper, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
 
         if not row:
