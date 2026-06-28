@@ -25,6 +25,21 @@ import urllib.error
 import io
 import tempfile
 import html
+import requests
+import zipfile
+import hashlib
+import xml.etree.ElementTree as ET
+try:
+    from lxml import etree as LET
+    from signxml import XMLSigner, methods
+    from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+    from cryptography.hazmat.primitives import serialization
+except Exception:
+    LET = None
+    XMLSigner = None
+    methods = None
+    load_key_and_certificates = None
+    serialization = None
 
 app = FastAPI()
 app.add_middleware(
@@ -137,6 +152,10 @@ def parse_fecha_emision(value):
 
 # ================= CONEXION (SIMPLE Y ESTABLE) =================
 DEFAULT_SUCURSAL = "computer_army"
+PC_FAST_SUCURSAL = "pc_fast_store"
+SHARED_STOCK_SUCURSALES = {
+    PC_FAST_SUCURSAL: DEFAULT_SUCURSAL,
+}
 MAX_COMPROBANTE_PAGO_BYTES = 15 * 1024 * 1024
 BOQUITOQUI_LIVE_TTL_SECONDS = 10
 BOQUITOQUI_LIVE_MAX_QUEUE = 30
@@ -156,6 +175,7 @@ DEFAULT_FEATURES = {
     "documentos": True,
     "radio": True,
     "usuarios": True,
+    "sunat": True,
     "garantias": True,
     "auditoria": True,
     "web": True,
@@ -168,6 +188,27 @@ DEFAULT_FEATURES = {
 def norm_sucursal(value: str = ""):
     value = (value or DEFAULT_SUCURSAL).strip().lower().replace(" ", "_")
     return value or DEFAULT_SUCURSAL
+
+
+DOCUMENT_EDIT_USERS = {"giomar", "jean", "mily"}
+
+
+def norm_usuario_permiso(value=""):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def usuario_puede_editar_documento(data):
+    if not isinstance(data, dict):
+        return False
+    for key in ("usuario", "usuario_emisor", "usuario_edicion", "editor", "user"):
+        if norm_usuario_permiso(data.get(key)) in DOCUMENT_EDIT_USERS:
+            return True
+    return False
+
+
+def inventario_sucursal(value: str = ""):
+    sucursal = norm_sucursal(value)
+    return SHARED_STOCK_SUCURSALES.get(sucursal, sucursal)
 
 
 def ensure_usuario_permisos_table(cur):
@@ -462,6 +503,7 @@ def normalize_match_text(value):
 
 
 def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
+    sucursal = inventario_sucursal(sucursal)
     texto_doc = normalize_match_text(descripcion_doc)
     selected = split_series_text(series_texto)
     touched_products = set()
@@ -544,6 +586,7 @@ def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
 
 
 def sync_producto_stock_from_series(cur, producto_id, sucursal):
+    sucursal = inventario_sucursal(sucursal)
     cur.execute("""
     UPDATE productos
     SET stock = (
@@ -557,6 +600,7 @@ def sync_producto_stock_from_series(cur, producto_id, sucursal):
 
 
 def producto_tiene_series_activas(cur, producto_id, sucursal):
+    sucursal = inventario_sucursal(sucursal)
     if not producto_id:
         return False
     cur.execute("""
@@ -576,6 +620,7 @@ def es_ram_kingston(nombre):
 
 
 def resolver_producto_por_series_venta(cur, producto_id, nombre_doc, cantidad, series_texto, sucursal):
+    sucursal = inventario_sucursal(sucursal)
     selected = split_series_text(series_texto)
     if not selected:
         return producto_id, None
@@ -624,6 +669,7 @@ def resolver_producto_por_series_venta(cur, producto_id, nombre_doc, cantidad, s
 
 
 def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
+    sucursal = inventario_sucursal(sucursal)
     cantidad = max(0, int(float(cantidad or 0)))
     if cantidad <= 0 or not producto_id:
         return None
@@ -703,6 +749,7 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
 
 
 def descontar_stock_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
+    sucursal = inventario_sucursal(sucursal)
     try:
         cantidad = int(cantidad or 0)
     except Exception:
@@ -794,8 +841,10 @@ def normalizar_comprobantes_pago(data, existentes=None):
     return combinados, principal, json.dumps(combinados, ensure_ascii=False)
 
 
-def http_get_json(url, headers=None, timeout=12):
-    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+def http_get_json(url, headers=None, timeout=5):
+    safe_headers = {"User-Agent": "G&G-ERP/1.0", "Accept": "application/json"}
+    safe_headers.update(headers or {})
+    req = urllib.request.Request(url, headers=safe_headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", "ignore")
         return json.loads(raw) if raw else {}
@@ -892,7 +941,7 @@ def consulta_documento_apis_net_pe(tipo, numero):
     base = os.getenv("APIS_NET_PE_BASE", "https://api.apis.net.pe/v2").strip().rstrip("/")
     endpoint = "reniec/dni" if tipo == "DNI" else "sunat/ruc"
     url = f"{base}/{endpoint}?numero={urllib.parse.quote(numero)}"
-    data = http_get_json(url, headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
+    data = http_get_json(url, headers={"Authorization": f"Bearer {token}"}, timeout=5)
     return normalizar_dni(data, numero, "apis_net_pe") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe")
 
 
@@ -902,7 +951,7 @@ def consulta_documento_apis_net_pe_v1(tipo, numero):
     base = os.getenv("APIS_NET_PE_V1_BASE", "https://api.apis.net.pe/v1").strip().rstrip("/")
     endpoint = "dni" if tipo == "DNI" else "ruc"
     url = f"{base}/{endpoint}?numero={urllib.parse.quote(numero)}"
-    data = http_get_json(url, headers={"Accept": "application/json"})
+    data = http_get_json(url, timeout=4)
     return normalizar_dni(data, numero, "apis_net_pe_v1") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe_v1")
 
 
@@ -1166,6 +1215,29 @@ class EstadoSunatUpdate(BaseModel):
     sunat_modo: str = "MANUAL"
 
 
+class SunatConfigUpdate(BaseModel):
+    ambiente: str = "BETA"
+    envio_automatico: bool = False
+    ruc: str = ""
+    razon_social: str = ""
+    nombre_comercial: str = ""
+    ubigeo: str = "150101"
+    direccion: str = ""
+    departamento: str = "LIMA"
+    provincia: str = "LIMA"
+    distrito: str = "LIMA"
+    usuario_sol: str = ""
+    clave_sol: str = ""
+    endpoint_url: str = ""
+    certificado_pfx_base64: str = ""
+    certificado_password: str = ""
+
+
+class SunatEnviarRequest(BaseModel):
+    regenerar: bool = False
+    permitir_sin_firma: bool = False
+
+
 class DocumentoObservacionInternaUpdate(BaseModel):
     observacion_interna: str = ""
     usuario: str = ""
@@ -1273,6 +1345,11 @@ def migrate_schema():
         cur.execute("""
         INSERT INTO sucursales (codigo, nombre, activa)
         VALUES ('computer_army','COMPUTER ARMY',TRUE)
+        ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
+        """)
+        cur.execute("""
+        INSERT INTO sucursales (codigo, nombre, activa)
+        VALUES ('pc_fast_store','PC FAST STORE',TRUE)
         ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
         """)
         cur.execute("""
@@ -1494,6 +1571,14 @@ def migrate_schema():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_estado TEXT DEFAULT 'PENDIENTE'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_modo TEXT DEFAULT 'MANUAL'",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_fecha TIMESTAMP",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_xml_nombre TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_xml_base64 TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_zip_nombre TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_zip_base64 TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_hash TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_ticket TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_cdr_base64 TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_respuesta_json TEXT DEFAULT ''",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
@@ -1661,7 +1746,7 @@ def init_http():
 @app.get("/app/version")
 def app_version():
     latest_version = "1.0.70"
-    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.70/erp_sql_pro_v20_v1.0.70.exe"
+    latest_url = "https://github.com/giomar456/erp-api/releases/download/v1.0.71/erp_sql_pro_v20_v1.0.71.exe"
     latest_name = "erp_sql_pro_v20_v1.0.70.exe"
     latest_notes = "Actualizacion G&G ERP web v1.74: salida manual sobre boletas existentes, anulacion con restauracion de stock, PDF mas legible y servicios tecnicos."
 
@@ -2744,7 +2829,7 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt_c(160, 24.5 + i * 5.4, ln, 16.0, True)
     txt_c(160, 40.5, numero, 11.6)
 
-    fecha = str(documento.get("fecha_emision") or documento.get("fecha") or local_date())[:10]
+    fecha = str(documento.get("fecha_emision") or documento.get("fecha") or lima_today_iso())[:10]
     venc = str(documento.get("fecha_vencimiento") or "-")[:10] if documento.get("fecha_vencimiento") else "-"
     client_y = 52
     doc_cliente = str(documento.get("documento_cliente") or "").upper()
@@ -3294,7 +3379,7 @@ def actualizar_reserva(reserva_id: int, data: dict):
 def crear_producto(data: Producto):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(data.sucursal)
+    sucursal = inventario_sucursal(data.sucursal)
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
@@ -3318,7 +3403,8 @@ def crear_producto(data: Producto):
 def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(sucursal)
+    sucursal_real = norm_sucursal(sucursal)
+    sucursal = inventario_sucursal(sucursal_real)
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
@@ -3346,11 +3432,12 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
            COALESCE(observacion, '') AS observacion,
            COALESCE(almacen, 'TIENDA') AS almacen,
            COALESCE(sku_woo, '') AS sku_woo,
-           COALESCE(sucursal,%s) AS sucursal
+           %s AS sucursal,
+           COALESCE(sucursal,%s) AS inventario_sucursal
     FROM productos
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY nombre
-    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
+    """, (sucursal_real, DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
 
     conn.commit()
@@ -3363,7 +3450,7 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
 def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(data.sucursal or sucursal)
+    sucursal = inventario_sucursal(data.sucursal or sucursal)
     try:
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
@@ -3395,7 +3482,7 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
 def eliminar_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(sucursal)
+    sucursal = inventario_sucursal(sucursal)
     try:
         cur.execute("DELETE FROM producto_series WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal))
         cur.execute("DELETE FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (producto_id, DEFAULT_SUCURSAL, sucursal))
@@ -3416,7 +3503,7 @@ def eliminar_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
 def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(sucursal)
+    sucursal = inventario_sucursal(sucursal)
     texto = f"%{(q or '').lower()}%"
     serie_norm = re.sub(r"[^A-Z0-9]", "", str(q or "").upper())
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
@@ -3461,7 +3548,7 @@ def listar_series_duplicadas(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     try:
-        sucursal = norm_sucursal(sucursal)
+        sucursal = inventario_sucursal(sucursal)
         cur.execute("""
         WITH normalizadas AS (
             SELECT
@@ -3498,7 +3585,7 @@ def guardar_serie_producto(data: SerieProducto):
     conn = get_conn()
     cur = conn.cursor()
     try:
-        sucursal = norm_sucursal(data.sucursal)
+        sucursal = inventario_sucursal(data.sucursal)
         series = split_series_text(data.serie)
         almacen = (data.almacen or "TIENDA").strip().upper()
         if not series:
@@ -3591,7 +3678,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
     conn = get_conn()
     cur = conn.cursor()
     try:
-        sucursal = norm_sucursal(data.sucursal or sucursal)
+        sucursal = inventario_sucursal(data.sucursal or sucursal)
         series = split_series_text(data.serie)
         almacen = (data.almacen or "TIENDA").strip().upper()
         if not series:
@@ -3695,7 +3782,7 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     try:
-        sucursal = norm_sucursal(sucursal)
+        sucursal = inventario_sucursal(sucursal)
         cur.execute("""
         DELETE FROM producto_series
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
@@ -3952,7 +4039,7 @@ def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_S
     conn = get_conn()
     cur = conn.cursor()
     try:
-        sucursal = norm_sucursal(sucursal)
+        sucursal = inventario_sucursal(sucursal)
         nuevo_stock = max(0, int(data.stock))
         cur.execute("UPDATE productos SET stock=%s WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (nuevo_stock, producto_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
@@ -3979,7 +4066,7 @@ def mover_series_almacen(data: SeriesMoverAlmacen, sucursal: str = DEFAULT_SUCUR
     conn = get_conn()
     cur = conn.cursor()
     try:
-        sucursal = norm_sucursal(data.sucursal or sucursal)
+        sucursal = inventario_sucursal(data.sucursal or sucursal)
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("""
         UPDATE producto_series
@@ -4260,6 +4347,7 @@ def crear_venta(data: Venta):
 
     try:
         sucursal = norm_sucursal(data.sucursal)
+        sucursal_inventario = inventario_sucursal(sucursal)
         doc_tipo_upper = (data.tipo or "").strip().upper()
         if doc_tipo_upper:
             data.tipo = doc_tipo_upper
@@ -4301,7 +4389,7 @@ def crear_venta(data: Venta):
                 marca = item.marca
                 modelo = item.modelo
                 if producto_id and not descripcion:
-                    cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal))
+                    cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal_inventario))
                     prod = cur.fetchone()
                     if prod:
                         descripcion = prod[0] or ""
@@ -4365,7 +4453,7 @@ def crear_venta(data: Venta):
             modelo = item.modelo
 
             if not descripcion:
-                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal))
+                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal_inventario))
                 prod = cur.fetchone()
                 if prod:
                     descripcion = prod[0] or ""
@@ -4403,6 +4491,13 @@ def crear_venta(data: Venta):
         conn.commit()
         conn.close()
 
+        sunat_auto = None
+        if doc_tipo_upper in ("BOLETA", "FACTURA"):
+            try:
+                sunat_auto = _sunat_auto_send_document(venta_id, sucursal)
+            except Exception as sunat_error:
+                sunat_auto = {"ok": False, "auto": True, "msg": str(sunat_error)}
+
         return {
             "ok": True,
             "success": True,
@@ -4415,7 +4510,8 @@ def crear_venta(data: Venta):
             "fecha_emision": fecha_emision.strftime("%Y-%m-%d %H:%M:%S"),
             "fecha_vencimiento": fecha_vencimiento or "",
             "estado_pago": estado_pago,
-            "metodo_pago": metodo_pago
+            "metodo_pago": metodo_pago,
+            "sunat_auto": sunat_auto,
         }
     except Exception as e:
         conn.rollback()
@@ -4869,8 +4965,8 @@ def preview_documento_pdf(data: Venta, sucursal: str = DEFAULT_SUCURSAL, inline:
         "documento_cliente": data.numero_documento_cliente or data.tipo_documento_cliente or "",
         "numero_documento_cliente": data.numero_documento_cliente or "",
         "direccion_cliente": data.direccion_cliente or "SIN DIRECCION",
-        "fecha_emision": data.fecha_emision or local_date(),
-        "fecha_vencimiento": data.fecha_vencimiento or (local_date() if doc_type == "PROFORMA" else ""),
+        "fecha_emision": data.fecha_emision or lima_today_iso(),
+        "fecha_vencimiento": data.fecha_vencimiento or (lima_today_iso() if doc_type == "PROFORMA" else ""),
         "estado_pago": data.estado_pago or ("PROFORMA" if doc_type == "PROFORMA" else "CONTADO"),
         "metodo_pago": data.metodo_pago or "",
         "usuario_emisor": data.usuario_emisor or "",
@@ -5087,7 +5183,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
     try:
         sucursal = norm_sucursal(data.get("sucursal") or sucursal)
         cur.execute("""
-        SELECT tipo, numero, COALESCE(sucursal,%s)
+        SELECT tipo, numero, COALESCE(sucursal,%s), COALESCE(estado,'EMITIDO')
         FROM ventas
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
@@ -5095,15 +5191,20 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         if not doc:
             conn.close()
             return {"ok": False, "success": False, "msg": "Documento no encontrado"}
-        tipo_actual, numero_actual, sucursal_doc = doc
-        if str(tipo_actual or "").upper() != "PROFORMA":
+        tipo_actual, numero_actual, sucursal_doc, estado_actual = doc
+        sucursal_inventario_doc = inventario_sucursal(sucursal_doc)
+        tipo_doc_upper = str(tipo_actual or "").upper()
+        if str(estado_actual or "").upper() == "ANULADO":
             conn.close()
-            return {"ok": False, "success": False, "msg": "Solo se puede editar PROFORMA desde este editor"}
+            return {"ok": False, "success": False, "msg": "No se puede editar un documento anulado."}
+        if not usuario_puede_editar_documento(data):
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Solo Giomar, Jean o Mily pueden cambiar boletas/facturas ya procesadas."}
 
         items = data.get("items") or data.get("detalle") or []
         if not isinstance(items, list) or not items:
             conn.close()
-            return {"ok": False, "success": False, "msg": "La proforma debe tener productos"}
+            return {"ok": False, "success": False, "msg": "El documento debe tener productos"}
 
         total = round(sum(float((i or {}).get("total") or 0) for i in items), 2)
         if total <= 0:
@@ -5118,6 +5219,65 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             documento_cliente = f"{tipo_cliente}: {documento_cliente}"
         elif data.get("documento_cliente"):
             documento_cliente = data.get("documento_cliente")
+
+        if tipo_doc_upper in STOCK_DOC_TYPES:
+            restaurar_stock_documento(cur, documento_id, tipo_doc_upper, sucursal_doc)
+
+        prepared_items = []
+        for item in items:
+            producto_id = item.get("producto_id") or item.get("id")
+            try:
+                producto_id = int(producto_id) if str(producto_id or "").strip() else None
+            except Exception:
+                producto_id = None
+            cantidad = int(float(item.get("cantidad") or 0))
+            precio = float(item.get("precio") or item.get("precio_unitario") or 0)
+            item_total = float(item.get("total") or (cantidad * precio))
+            descripcion = item.get("nombre") or item.get("descripcion") or ""
+            marca = item.get("marca") or ""
+            modelo = item.get("modelo") or ""
+            series_texto = item.get("series_texto") or item.get("serie") or ""
+            if producto_id and not descripcion:
+                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal_inventario_doc))
+                prod = cur.fetchone()
+                if prod:
+                    descripcion = prod[0] or ""
+                    marca = marca or (prod[1] or "")
+                    modelo = modelo or (prod[2] or "")
+            combo_procesado = False
+            if tipo_doc_upper in STOCK_DOC_TYPES:
+                if is_test_product_name(descripcion, marca, modelo) or ((not producto_id) and series_texto):
+                    error_combo = procesar_combo_generico_venta(cur, descripcion, series_texto, sucursal_doc)
+                    if error_combo:
+                        conn.rollback()
+                        conn.close()
+                        return {"ok": False, "success": False, "msg": error_combo}
+                    combo_procesado = True
+                if not combo_procesado:
+                    producto_id, error_resolver = resolver_producto_por_series_venta(
+                        cur, producto_id, descripcion, cantidad, series_texto, sucursal_doc
+                    )
+                    if error_resolver:
+                        conn.rollback()
+                        conn.close()
+                        return {"ok": False, "success": False, "msg": error_resolver}
+                    error_series = validar_y_marcar_series_venta(
+                        cur, producto_id, descripcion, marca, modelo, cantidad, series_texto, sucursal_doc
+                    )
+                    if error_series:
+                        conn.rollback()
+                        conn.close()
+                        return {"ok": False, "success": False, "msg": error_series}
+            prepared_items.append({
+                "producto_id": producto_id,
+                "cantidad": cantidad,
+                "precio": precio,
+                "total": item_total,
+                "descripcion": descripcion,
+                "marca": marca,
+                "modelo": modelo,
+                "series_texto": series_texto,
+            })
 
         cur.execute("""
         UPDATE ventas
@@ -5150,28 +5310,10 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         ))
         if not cur.fetchone():
             conn.close()
-            return {"ok": False, "success": False, "msg": "No se pudo actualizar la proforma"}
+            return {"ok": False, "success": False, "msg": "No se pudo actualizar el documento"}
 
         cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
-        for item in items:
-            producto_id = item.get("producto_id") or item.get("id")
-            try:
-                producto_id = int(producto_id) if str(producto_id or "").strip() else None
-            except Exception:
-                producto_id = None
-            cantidad = int(float(item.get("cantidad") or 0))
-            precio = float(item.get("precio") or item.get("precio_unitario") or 0)
-            item_total = float(item.get("total") or (cantidad * precio))
-            descripcion = item.get("nombre") or item.get("descripcion") or ""
-            marca = item.get("marca") or ""
-            modelo = item.get("modelo") or ""
-            if producto_id and not descripcion:
-                cur.execute("SELECT nombre, marca, modelo FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (producto_id, DEFAULT_SUCURSAL, sucursal_doc))
-                prod = cur.fetchone()
-                if prod:
-                    descripcion = prod[0] or ""
-                    marca = marca or (prod[1] or "")
-                    modelo = modelo or (prod[2] or "")
+        for item in prepared_items:
             cur.execute("""
             INSERT INTO ventas_detalle (
                 venta_id, producto_id, descripcion, marca, modelo,
@@ -5179,15 +5321,15 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             )
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
-                documento_id, producto_id, descripcion, marca, modelo,
-                item.get("series_texto") or item.get("serie") or "",
-                cantidad, precio, item_total, sucursal_doc
+                documento_id, item.get("producto_id"), item.get("descripcion"), item.get("marca"), item.get("modelo"),
+                item.get("series_texto") or "",
+                item.get("cantidad"), item.get("precio"), item.get("total"), sucursal_doc
             ))
 
         cur.execute("""
         INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
         VALUES (%s,%s,%s,%s,%s)
-        """, (data.get("usuario_emisor") or "", "", sucursal_doc, "PROFORMA ACTUALIZADA", f"{tipo_actual} {numero_actual} - {total}"))
+        """, (data.get("usuario_emisor") or "", "", sucursal_doc, "DOCUMENTO ACTUALIZADO", f"{tipo_actual} {numero_actual} - {total}"))
 
         conn.commit()
         conn.close()
@@ -5196,8 +5338,10 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             "success": True,
             "id": documento_id,
             "numero": numero_actual,
+            "tipo": tipo_actual,
             "total": total,
             "fecha_vencimiento": fecha_vencimiento,
+            "msg": f"{tipo_actual} {numero_actual} actualizado. Stock y series recalculados.",
         }
     except Exception as e:
         conn.rollback()
@@ -5259,6 +5403,7 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
 
 
 def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
+    sucursal_stock = inventario_sucursal(sucursal)
     cur.execute("""
     SELECT producto_id, COALESCE(cantidad, 0), COALESCE(series_texto, '')
     FROM ventas_detalle
@@ -5276,16 +5421,16 @@ def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
                 WHERE producto_id=%s
                   AND COALESCE(sucursal,%s)=%s
                   AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
-                """, (producto_id, DEFAULT_SUCURSAL, sucursal, series))
+                """, (producto_id, DEFAULT_SUCURSAL, sucursal_stock, series))
                 touched.add(producto_id)
             else:
                 cur.execute("""
                 UPDATE productos
                 SET stock = COALESCE(stock, 0) + %s
                 WHERE id = %s AND COALESCE(sucursal,%s)=%s
-                """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal))
+                """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal_stock))
         for producto_id in touched:
-            sync_producto_stock_from_series(cur, producto_id, sucursal)
+            sync_producto_stock_from_series(cur, producto_id, sucursal_stock)
 
 
 @app.post("/documentos/{documento_id}/anular")
@@ -5375,15 +5520,17 @@ def transferir_stock(data: StockTransferencia):
     cur = conn.cursor()
     try:
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
-        origen = norm_sucursal(data.sucursal_origen)
-        destino = norm_sucursal(data.sucursal_destino)
+        origen_real = norm_sucursal(data.sucursal_origen)
+        destino_real = norm_sucursal(data.sucursal_destino)
+        origen = inventario_sucursal(origen_real)
+        destino = inventario_sucursal(destino_real)
         cantidad = int(data.cantidad or 0)
         if cantidad <= 0:
             conn.close()
             return {"ok": False, "msg": "La cantidad debe ser mayor a 0"}
         if origen == destino:
             conn.close()
-            return {"ok": False, "msg": "La sucursal origen y destino deben ser diferentes"}
+            return {"ok": False, "msg": "La sucursal origen y destino usan el mismo inventario fisico."}
 
         cur.execute("""
         SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta,
@@ -5462,7 +5609,7 @@ def transferir_stock(data: StockTransferencia):
         RETURNING id
         """, (
             data.producto_id, producto.get("nombre") or "", cantidad,
-            origen, destino, data.usuario or "", data.nota or "",
+            origen_real, destino_real, data.usuario or "", data.nota or "",
         ))
         transferencia_id = cur.fetchone()[0]
 
@@ -5472,7 +5619,7 @@ def transferir_stock(data: StockTransferencia):
         """, (
             data.usuario or "", "", origen,
             "TRANSFERENCIA STOCK",
-            f"{cantidad} x {producto.get('nombre')} de {origen} a {destino}",
+            f"{cantidad} x {producto.get('nombre')} de {origen_real} a {destino_real}",
         ))
 
         conn.commit()
@@ -5659,6 +5806,655 @@ def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal
         return {"ok": False, "msg": str(e)}
 
 
+SUNAT_DEFAULT_ENDPOINTS = {
+    "BETA": "https://e-beta.sunat.gob.pe/ol-ti-itcpfegem-beta/billService",
+    "PRODUCCION": "https://e-factura.sunat.gob.pe/ol-ti-itcpfegem/billService",
+}
+
+SUNAT_NS = {
+    "": "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2",
+    "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
+    "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
+    "ext": "urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2",
+}
+for _sunat_prefix, _sunat_uri in SUNAT_NS.items():
+    ET.register_namespace(_sunat_prefix, _sunat_uri)
+
+
+def _sunat_tag(prefix, name):
+    uri = SUNAT_NS[prefix]
+    return f"{{{uri}}}{name}"
+
+
+def _sunat_el(parent, prefix, name, text=None, attrs=None):
+    node = ET.SubElement(parent, _sunat_tag(prefix, name), attrs or {})
+    if text is not None:
+        node.text = str(text)
+    return node
+
+
+def _sunat_money(value):
+    try:
+        return f"{float(value or 0):.2f}"
+    except Exception:
+        return "0.00"
+
+
+def _sunat_clean_ruc(value):
+    return re.sub(r"[^0-9]", "", str(value or ""))
+
+
+def _sunat_env_suffix(sucursal):
+    text = norm_sucursal(sucursal)
+    return re.sub(r"[^A-Z0-9]+", "_", text.upper()).strip("_")
+
+
+def _sunat_env(sucursal, name, default=""):
+    suffix = _sunat_env_suffix(sucursal)
+    specific = os.getenv(f"SUNAT_{suffix}_{name}")
+    if specific is not None:
+        return specific
+    return os.getenv(f"SUNAT_{name}", default)
+
+
+def _sunat_env_cert_pfx_base64(sucursal):
+    encoded = str(_sunat_env(sucursal, "CERT_PFX_BASE64", "") or "").strip()
+    if encoded:
+        return encoded
+    cert_path = str(_sunat_env(sucursal, "CERT_PFX_PATH", "") or "").strip()
+    if cert_path and os.path.exists(cert_path):
+        with open(cert_path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode("ascii")
+    return ""
+
+
+def _sunat_get_config(cur, sucursal):
+    sucursal = norm_sucursal(sucursal)
+    cfg = {
+        "ambiente": _sunat_env(sucursal, "AMBIENTE", "BETA").strip().upper() or "BETA",
+        "envio_automatico": str(_sunat_env(sucursal, "ENVIO_AUTOMATICO", "")).strip().lower() in ("1", "true", "si", "yes", "on"),
+        "ruc": _sunat_env(sucursal, "RUC", "").strip(),
+        "razon_social": _sunat_env(sucursal, "RAZON_SOCIAL", "").strip(),
+        "nombre_comercial": _sunat_env(sucursal, "NOMBRE_COMERCIAL", "").strip(),
+        "ubigeo": _sunat_env(sucursal, "UBIGEO", "150101").strip() or "150101",
+        "direccion": _sunat_env(sucursal, "DIRECCION", "").strip(),
+        "departamento": _sunat_env(sucursal, "DEPARTAMENTO", "LIMA").strip() or "LIMA",
+        "provincia": _sunat_env(sucursal, "PROVINCIA", "LIMA").strip() or "LIMA",
+        "distrito": _sunat_env(sucursal, "DISTRITO", "LIMA").strip() or "LIMA",
+        "usuario_sol": _sunat_env(sucursal, "USUARIO_SOL", "").strip(),
+        "clave_sol": _sunat_env(sucursal, "CLAVE_SOL", "").strip(),
+        "endpoint_url": _sunat_env(sucursal, "ENDPOINT_URL", "").strip(),
+        "certificado_pfx_base64": _sunat_env_cert_pfx_base64(sucursal),
+        "certificado_password": _sunat_env(sucursal, "CERT_PASSWORD", "").strip(),
+    }
+    try:
+        cur.execute("SELECT valor FROM app_config WHERE clave=%s", (f"sunat:{sucursal}",))
+        row = cur.fetchone()
+        if row and row[0]:
+            saved = json.loads(row[0])
+            if isinstance(saved, dict):
+                for key, value in saved.items():
+                    if value not in (None, ""):
+                        cfg[key] = str(value).strip()
+    except Exception:
+        pass
+    cfg["ambiente"] = str(cfg.get("ambiente") or "BETA").strip().upper()
+    if cfg["ambiente"] not in ("BETA", "PRODUCCION"):
+        cfg["ambiente"] = "BETA"
+    if not cfg.get("endpoint_url"):
+        cfg["endpoint_url"] = SUNAT_DEFAULT_ENDPOINTS[cfg["ambiente"]]
+    return cfg
+
+
+def _sunat_public_config(cfg):
+    public = dict(cfg)
+    for key in ("clave_sol", "certificado_pfx_base64", "certificado_password"):
+        public[key] = "CONFIGURADO" if cfg.get(key) else ""
+    public["ruc"] = _sunat_clean_ruc(public.get("ruc"))
+    public["listo_envio"] = bool(public.get("ruc") and public.get("usuario_sol") and cfg.get("clave_sol") and public.get("endpoint_url"))
+    public["firma_configurada"] = bool(cfg.get("certificado_pfx_base64") and cfg.get("certificado_password"))
+    public["envio_automatico"] = bool(str(cfg.get("envio_automatico")).lower() in ("1", "true", "si", "yes", "on"))
+    return public
+
+
+def _sunat_documento_payload(cur, documento_id, sucursal):
+    cur.execute("""
+    SELECT id, tipo, numero, cliente, COALESCE(documento_cliente,''), COALESCE(direccion_cliente,''),
+           COALESCE(subtotal,0), COALESCE(igv,0), COALESCE(total,0), fecha,
+           COALESCE(sucursal,%s), COALESCE(sunat_xml_nombre,''), COALESCE(sunat_xml_base64,''),
+           COALESCE(sunat_zip_nombre,''), COALESCE(sunat_zip_base64,''), COALESCE(sunat_hash,''),
+           COALESCE(sunat_estado,'PENDIENTE'), COALESCE(sunat_respuesta_json,'')
+    FROM ventas
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+      AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA')
+    """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if not row:
+        return None, []
+    doc = {
+        "id": row[0], "tipo": row[1], "numero": row[2], "cliente": row[3],
+        "documento_cliente": row[4], "direccion_cliente": row[5],
+        "subtotal": float(row[6] or 0), "igv": float(row[7] or 0), "total": float(row[8] or 0),
+        "fecha": row[9], "sucursal": row[10], "sunat_xml_nombre": row[11],
+        "sunat_xml_base64": row[12], "sunat_zip_nombre": row[13], "sunat_zip_base64": row[14],
+        "sunat_hash": row[15], "sunat_estado": row[16], "sunat_respuesta_json": row[17],
+    }
+    cur.execute("""
+    SELECT COALESCE(descripcion,''), COALESCE(cantidad,0), COALESCE(precio,0), COALESCE(total,0),
+           COALESCE(series_texto,''), COALESCE(producto_id,0)
+    FROM ventas_detalle
+    WHERE venta_id=%s
+    ORDER BY id
+    """, (documento_id,))
+    detalle = [
+        {
+            "descripcion": r[0] or "PRODUCTO",
+            "cantidad": int(r[1] or 0),
+            "precio": float(r[2] or 0),
+            "total": float(r[3] or 0),
+            "series_texto": r[4] or "",
+            "producto_id": r[5],
+        }
+        for r in cur.fetchall()
+    ]
+    return doc, detalle
+
+
+def _sunat_cliente_doc(documento_cliente):
+    text = str(documento_cliente or "").strip()
+    upper = text.upper()
+    number = re.sub(r"[^0-9]", "", text)
+    if "RUC" in upper or len(number) == 11:
+        return "6", number
+    if "DNI" in upper or len(number) == 8:
+        return "1", number
+    return "0", number or "-"
+
+
+def _sunat_build_invoice_xml(doc, detalle, cfg):
+    tipo = str(doc.get("tipo") or "").upper()
+    tipo_codigo = "01" if tipo == "FACTURA" else "03"
+    numero = str(doc.get("numero") or "").strip().upper()
+    ruc = _sunat_clean_ruc(cfg.get("ruc"))
+    if not ruc or len(ruc) != 11:
+        raise ValueError("Configura SUNAT_RUC o /sunat/config con un RUC valido de 11 digitos.")
+    if not numero or "-" not in numero:
+        raise ValueError("El documento debe tener serie-numero, por ejemplo B001-000001.")
+    fecha = doc.get("fecha")
+    if isinstance(fecha, datetime):
+        fecha_txt = fecha.date().isoformat()
+        hora_txt = fecha.strftime("%H:%M:%S")
+    else:
+        fecha_txt = lima_today_iso()
+        hora_txt = "00:00:00"
+    total = round(float(doc.get("total") or 0), 2)
+    igv = round(float(doc.get("igv") or 0), 2)
+    gravada = round(float(doc.get("subtotal") or 0), 2)
+    if total > 0 and (gravada <= 0 or igv <= 0):
+        gravada = round(total / 1.18, 2)
+        igv = round(total - gravada, 2)
+
+    invoice = ET.Element(_sunat_tag("", "Invoice"))
+    _sunat_el(invoice, "cbc", "UBLVersionID", "2.1")
+    _sunat_el(invoice, "cbc", "CustomizationID", "2.0")
+    _sunat_el(invoice, "cbc", "ID", numero)
+    _sunat_el(invoice, "cbc", "IssueDate", fecha_txt)
+    _sunat_el(invoice, "cbc", "IssueTime", hora_txt)
+    _sunat_el(invoice, "cbc", "InvoiceTypeCode", tipo_codigo, {
+        "listAgencyName": "PE:SUNAT",
+        "listName": "Tipo de Documento",
+        "listURI": "urn:pe:gob:sunat:cpe:see:gem:catalogos:catalogo01",
+    })
+    _sunat_el(invoice, "cbc", "DocumentCurrencyCode", "PEN")
+
+    supplier = _sunat_el(invoice, "cac", "AccountingSupplierParty")
+    party = _sunat_el(supplier, "cac", "Party")
+    ident = _sunat_el(party, "cac", "PartyIdentification")
+    _sunat_el(ident, "cbc", "ID", ruc, {"schemeID": "6"})
+    name = cfg.get("nombre_comercial") or cfg.get("razon_social") or "EMISOR"
+    pname = _sunat_el(party, "cac", "PartyName")
+    _sunat_el(pname, "cbc", "Name", name)
+    legal = _sunat_el(party, "cac", "PartyLegalEntity")
+    _sunat_el(legal, "cbc", "RegistrationName", cfg.get("razon_social") or name)
+    address = _sunat_el(legal, "cac", "RegistrationAddress")
+    _sunat_el(address, "cbc", "ID", cfg.get("ubigeo") or "150101")
+    _sunat_el(address, "cbc", "CityName", cfg.get("provincia") or "LIMA")
+    _sunat_el(address, "cbc", "CountrySubentity", cfg.get("departamento") or "LIMA")
+    _sunat_el(address, "cbc", "District", cfg.get("distrito") or "LIMA")
+    addr_line = _sunat_el(address, "cac", "AddressLine")
+    _sunat_el(addr_line, "cbc", "Line", cfg.get("direccion") or "-")
+    country = _sunat_el(address, "cac", "Country")
+    _sunat_el(country, "cbc", "IdentificationCode", "PE")
+
+    customer = _sunat_el(invoice, "cac", "AccountingCustomerParty")
+    cparty = _sunat_el(customer, "cac", "Party")
+    cdoc_type, cdoc_number = _sunat_cliente_doc(doc.get("documento_cliente"))
+    cident = _sunat_el(cparty, "cac", "PartyIdentification")
+    _sunat_el(cident, "cbc", "ID", cdoc_number, {"schemeID": cdoc_type})
+    clegal = _sunat_el(cparty, "cac", "PartyLegalEntity")
+    _sunat_el(clegal, "cbc", "RegistrationName", doc.get("cliente") or "CLIENTE GENERAL")
+
+    tax_total = _sunat_el(invoice, "cac", "TaxTotal")
+    _sunat_el(tax_total, "cbc", "TaxAmount", _sunat_money(igv), {"currencyID": "PEN"})
+    tax_sub = _sunat_el(tax_total, "cac", "TaxSubtotal")
+    _sunat_el(tax_sub, "cbc", "TaxableAmount", _sunat_money(gravada), {"currencyID": "PEN"})
+    _sunat_el(tax_sub, "cbc", "TaxAmount", _sunat_money(igv), {"currencyID": "PEN"})
+    tax_cat = _sunat_el(tax_sub, "cac", "TaxCategory")
+    tax_scheme = _sunat_el(tax_cat, "cac", "TaxScheme")
+    _sunat_el(tax_scheme, "cbc", "ID", "1000")
+    _sunat_el(tax_scheme, "cbc", "Name", "IGV")
+    _sunat_el(tax_scheme, "cbc", "TaxTypeCode", "VAT")
+
+    legal_total = _sunat_el(invoice, "cac", "LegalMonetaryTotal")
+    _sunat_el(legal_total, "cbc", "LineExtensionAmount", _sunat_money(gravada), {"currencyID": "PEN"})
+    _sunat_el(legal_total, "cbc", "TaxInclusiveAmount", _sunat_money(total), {"currencyID": "PEN"})
+    _sunat_el(legal_total, "cbc", "PayableAmount", _sunat_money(total), {"currencyID": "PEN"})
+
+    for idx, item in enumerate(detalle, start=1):
+        cantidad = max(1, int(item.get("cantidad") or 1))
+        line_total = round(float(item.get("total") or 0), 2)
+        unit = round(line_total / cantidad, 2) if cantidad else round(float(item.get("precio") or 0), 2)
+        line_gravada = round(line_total / 1.18, 2)
+        line_igv = round(line_total - line_gravada, 2)
+        line = _sunat_el(invoice, "cac", "InvoiceLine")
+        _sunat_el(line, "cbc", "ID", str(idx))
+        _sunat_el(line, "cbc", "InvoicedQuantity", str(cantidad), {"unitCode": "NIU"})
+        _sunat_el(line, "cbc", "LineExtensionAmount", _sunat_money(line_gravada), {"currencyID": "PEN"})
+        pricing = _sunat_el(line, "cac", "PricingReference")
+        alt_price = _sunat_el(pricing, "cac", "AlternativeConditionPrice")
+        _sunat_el(alt_price, "cbc", "PriceAmount", _sunat_money(unit), {"currencyID": "PEN"})
+        _sunat_el(alt_price, "cbc", "PriceTypeCode", "01")
+        ltax = _sunat_el(line, "cac", "TaxTotal")
+        _sunat_el(ltax, "cbc", "TaxAmount", _sunat_money(line_igv), {"currencyID": "PEN"})
+        lsub = _sunat_el(ltax, "cac", "TaxSubtotal")
+        _sunat_el(lsub, "cbc", "TaxableAmount", _sunat_money(line_gravada), {"currencyID": "PEN"})
+        _sunat_el(lsub, "cbc", "TaxAmount", _sunat_money(line_igv), {"currencyID": "PEN"})
+        lcat = _sunat_el(lsub, "cac", "TaxCategory")
+        _sunat_el(lcat, "cbc", "Percent", "18.00")
+        _sunat_el(lcat, "cbc", "TaxExemptionReasonCode", "10")
+        lscheme = _sunat_el(lcat, "cac", "TaxScheme")
+        _sunat_el(lscheme, "cbc", "ID", "1000")
+        _sunat_el(lscheme, "cbc", "Name", "IGV")
+        _sunat_el(lscheme, "cbc", "TaxTypeCode", "VAT")
+        desc = item.get("descripcion") or "PRODUCTO"
+        if item.get("series_texto"):
+            desc = f"{desc} S/N: {item.get('series_texto')}"
+        litem = _sunat_el(line, "cac", "Item")
+        _sunat_el(litem, "cbc", "Description", desc[:500])
+        price = _sunat_el(line, "cac", "Price")
+        _sunat_el(price, "cbc", "PriceAmount", _sunat_money(round(unit / 1.18, 2)), {"currencyID": "PEN"})
+
+    xml_bytes = ET.tostring(invoice, encoding="utf-8", xml_declaration=True)
+    file_name = f"{ruc}-{tipo_codigo}-{numero}.xml"
+    return file_name, xml_bytes
+
+
+def _sunat_zip_xml(xml_name, xml_bytes):
+    zip_buffer = io.BytesIO()
+    zip_name = xml_name.replace(".xml", ".zip")
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(xml_name, xml_bytes)
+    data = zip_buffer.getvalue()
+    return zip_name, data
+
+
+def _sunat_sign_xml(xml_bytes, cfg):
+    if not cfg.get("certificado_pfx_base64") or not cfg.get("certificado_password"):
+        return xml_bytes, False, "Certificado no configurado."
+    if not (LET and XMLSigner and methods and load_key_and_certificates and serialization):
+        raise RuntimeError("Instala dependencias de firma: signxml, cryptography y lxml.")
+    pfx_bytes = base64.b64decode(cfg.get("certificado_pfx_base64"))
+    private_key, certificate, extra_certs = load_key_and_certificates(
+        pfx_bytes,
+        str(cfg.get("certificado_password") or "").encode("utf-8"),
+    )
+    if not private_key or not certificate:
+        raise RuntimeError("El PFX no contiene llave privada/certificado valido.")
+    key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_chain = [certificate]
+    if extra_certs:
+        cert_chain.extend(extra_certs)
+    cert_pems = [
+        cert.public_bytes(serialization.Encoding.PEM)
+        for cert in cert_chain
+    ]
+    root = LET.fromstring(xml_bytes)
+    signed = XMLSigner(
+        method=methods.enveloped,
+        signature_algorithm="rsa-sha256",
+        digest_algorithm="sha256",
+        c14n_algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+    ).sign(root, key=key_pem, cert=cert_pems)
+    return LET.tostring(signed, xml_declaration=True, encoding="utf-8"), True, "XML firmado."
+
+
+def _sunat_save_artifacts(cur, documento_id, xml_name, xml_bytes, zip_name, zip_bytes, estado="GENERADO", respuesta=None):
+    xml_b64 = base64.b64encode(xml_bytes).decode("ascii")
+    zip_b64 = base64.b64encode(zip_bytes).decode("ascii")
+    digest = hashlib.sha256(xml_bytes).hexdigest()
+    respuesta_json = json.dumps(respuesta or {}, ensure_ascii=False)
+    cur.execute("""
+    UPDATE ventas
+    SET sunat_xml_nombre=%s,
+        sunat_xml_base64=%s,
+        sunat_zip_nombre=%s,
+        sunat_zip_base64=%s,
+        sunat_hash=%s,
+        sunat_estado=%s,
+        sunat_modo='API',
+        sunat_fecha=CURRENT_TIMESTAMP,
+        sunat_respuesta_json=%s
+    WHERE id=%s
+    """, (xml_name, xml_b64, zip_name, zip_b64, digest, estado, respuesta_json, documento_id))
+    return {"xml_nombre": xml_name, "zip_nombre": zip_name, "hash": digest, "xml_base64": xml_b64, "zip_base64": zip_b64}
+
+
+def _sunat_generate_for_document(cur, documento_id, sucursal):
+    doc, detalle = _sunat_documento_payload(cur, documento_id, sucursal)
+    if not doc:
+        raise ValueError("Documento no encontrado o no es BOLETA/FACTURA.")
+    if not detalle:
+        raise ValueError("El documento no tiene detalle.")
+    cfg = _sunat_get_config(cur, doc.get("sucursal") or sucursal)
+    xml_name, xml_bytes = _sunat_build_invoice_xml(doc, detalle, cfg)
+    xml_bytes, firmado, firma_msg = _sunat_sign_xml(xml_bytes, cfg)
+    zip_name, zip_bytes = _sunat_zip_xml(xml_name, xml_bytes)
+    artifacts = _sunat_save_artifacts(cur, documento_id, xml_name, xml_bytes, zip_name, zip_bytes, respuesta={"firmado": firmado, "firma_msg": firma_msg})
+    artifacts["firmado"] = firmado
+    artifacts["firma_msg"] = firma_msg
+    return doc, cfg, artifacts, xml_bytes, zip_bytes
+
+
+def _sunat_soap_send_bill(cfg, zip_name, zip_base64):
+    username = f"{_sunat_clean_ruc(cfg.get('ruc'))}{cfg.get('usuario_sol') or ''}"
+    password = cfg.get("clave_sol") or ""
+    endpoint = cfg.get("endpoint_url") or SUNAT_DEFAULT_ENDPOINTS["BETA"]
+    soap = f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ser="http://service.sunat.gob.pe" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+  <soapenv:Header>
+    <wsse:Security>
+      <wsse:UsernameToken>
+        <wsse:Username>{html.escape(username)}</wsse:Username>
+        <wsse:Password>{html.escape(password)}</wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </soapenv:Header>
+  <soapenv:Body>
+    <ser:sendBill>
+      <fileName>{html.escape(zip_name)}</fileName>
+      <contentFile>{zip_base64}</contentFile>
+    </ser:sendBill>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    response = requests.post(
+        endpoint,
+        data=soap.encode("utf-8"),
+        headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "urn:sendBill"},
+        timeout=60,
+    )
+    return response.status_code, response.text
+
+
+@app.get("/sunat/config")
+def obtener_sunat_config(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cfg = _sunat_get_config(cur, sucursal)
+        return {"ok": True, "success": True, "sucursal": sucursal, "data": _sunat_public_config(cfg)}
+    finally:
+        conn.close()
+
+
+@app.post("/sunat/config")
+def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        current = _sunat_get_config(cur, sucursal)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_config (
+            clave TEXT PRIMARY KEY,
+            valor TEXT,
+            actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        clean = data.dict()
+        clean["ambiente"] = str(clean.get("ambiente") or "BETA").upper()
+        clean["ruc"] = _sunat_clean_ruc(clean.get("ruc"))
+        if clean["ambiente"] not in ("BETA", "PRODUCCION"):
+            clean["ambiente"] = "BETA"
+        for secret_key in ("clave_sol", "certificado_pfx_base64", "certificado_password"):
+            value = str(clean.get(secret_key) or "").strip()
+            if value in ("", "CONFIGURADO"):
+                clean[secret_key] = current.get(secret_key) or ""
+        cur.execute("""
+        INSERT INTO app_config (clave, valor, actualizado)
+        VALUES (%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (clave) DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
+        """, (f"sunat:{sucursal}", json.dumps(clean, ensure_ascii=False)))
+        conn.commit()
+        return {"ok": True, "success": True, "sucursal": sucursal, "data": _sunat_public_config(clean)}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
+@app.post("/sunat/documentos/{documento_id}/xml")
+def generar_sunat_xml(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        doc, cfg, artifacts, xml_bytes, zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
+        conn.commit()
+        return {
+            "ok": True,
+            "success": True,
+            "id": documento_id,
+            "tipo": doc.get("tipo"),
+            "numero": doc.get("numero"),
+            "xml_nombre": artifacts["xml_nombre"],
+            "zip_nombre": artifacts["zip_nombre"],
+            "hash": artifacts["hash"],
+            "xml_base64": artifacts["xml_base64"],
+            "zip_base64": artifacts["zip_base64"],
+            "firmado": artifacts.get("firmado", False),
+            "msg": artifacts.get("firma_msg") or "XML UBL 2.1 y ZIP generados.",
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
+@app.get("/sunat/documentos/{documento_id}/xml")
+def descargar_sunat_xml(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        doc, detalle = _sunat_documento_payload(cur, documento_id, sucursal)
+        if not doc:
+            return {"ok": False, "msg": "Documento no encontrado o no es BOLETA/FACTURA."}
+        if not doc.get("sunat_xml_base64"):
+            doc, cfg, artifacts, xml_bytes, zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
+            conn.commit()
+        else:
+            xml_bytes = base64.b64decode(doc.get("sunat_xml_base64"))
+        return Response(content=xml_bytes, media_type="application/xml")
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
+@app.get("/sunat/documentos/{documento_id}/zip")
+def descargar_sunat_zip(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        doc, detalle = _sunat_documento_payload(cur, documento_id, sucursal)
+        if not doc:
+            return {"ok": False, "msg": "Documento no encontrado o no es BOLETA/FACTURA."}
+        if not doc.get("sunat_zip_base64"):
+            doc, cfg, artifacts, xml_bytes, zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
+            conn.commit()
+            zip_name = artifacts["zip_nombre"]
+        else:
+            zip_bytes = base64.b64decode(doc.get("sunat_zip_base64"))
+            zip_name = doc.get("sunat_zip_nombre") or "sunat.zip"
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
+@app.post("/sunat/documentos/{documento_id}/enviar")
+def enviar_documento_sunat(documento_id: int, data: SunatEnviarRequest = None, sucursal: str = DEFAULT_SUCURSAL):
+    data = data or SunatEnviarRequest()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        doc, detalle = _sunat_documento_payload(cur, documento_id, sucursal)
+        if not doc:
+            return {"ok": False, "success": False, "msg": "Documento no encontrado o no es BOLETA/FACTURA."}
+        cfg = _sunat_get_config(cur, doc.get("sucursal") or sucursal)
+        if data.regenerar or not doc.get("sunat_zip_base64"):
+            doc, cfg, artifacts, xml_bytes, zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
+            zip_name = artifacts["zip_nombre"]
+            zip_base64 = artifacts["zip_base64"]
+        else:
+            zip_name = doc.get("sunat_zip_nombre")
+            zip_base64 = doc.get("sunat_zip_base64")
+
+        public_cfg = _sunat_public_config(cfg)
+        if not public_cfg.get("listo_envio"):
+            cur.execute("""
+            UPDATE ventas
+            SET sunat_estado='PENDIENTE',
+                sunat_modo='API',
+                sunat_respuesta_json=%s,
+                sunat_fecha=CURRENT_TIMESTAMP
+            WHERE id=%s
+            """, (json.dumps({"msg": "Falta configurar RUC, usuario SOL, clave SOL o endpoint SUNAT."}, ensure_ascii=False), documento_id))
+            conn.commit()
+            return {"ok": False, "success": False, "msg": "Falta configurar RUC, usuario SOL, clave SOL o endpoint SUNAT.", "config": public_cfg}
+
+        if not public_cfg.get("firma_configurada") and not data.permitir_sin_firma:
+            cur.execute("""
+            UPDATE ventas
+            SET sunat_estado='PENDIENTE',
+                sunat_modo='API',
+                sunat_respuesta_json=%s,
+                sunat_fecha=CURRENT_TIMESTAMP
+            WHERE id=%s
+            """, (json.dumps({"msg": "Falta certificado digital/firma. No se envio a SUNAT."}, ensure_ascii=False), documento_id))
+            conn.commit()
+            return {"ok": False, "success": False, "msg": "Falta certificado digital/firma. Configura certificado o envia con permitir_sin_firma solo para pruebas tecnicas."}
+
+        status_code, response_text = _sunat_soap_send_bill(cfg, zip_name, zip_base64)
+        estado = "PROCESO"
+        if 200 <= int(status_code) < 300 and "applicationResponse" in response_text:
+            estado = "ACEPTADO"
+        elif int(status_code) >= 400 or "Fault" in response_text:
+            estado = "RECHAZADO"
+        cur.execute("""
+        UPDATE ventas
+        SET sunat_estado=%s,
+            sunat_modo='API',
+            sunat_fecha=CURRENT_TIMESTAMP,
+            sunat_respuesta_json=%s
+        WHERE id=%s
+        """, (estado, json.dumps({"http_status": status_code, "response": response_text[:12000]}, ensure_ascii=False), documento_id))
+        conn.commit()
+        return {"ok": estado != "RECHAZADO", "success": estado != "RECHAZADO", "id": documento_id, "sunat_estado": estado, "http_status": status_code, "respuesta": response_text[:4000]}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
+def _sunat_auto_send_document(documento_id, sucursal):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cfg = _sunat_get_config(cur, sucursal)
+        auto = str(cfg.get("envio_automatico")).lower() in ("1", "true", "si", "yes", "on")
+        if not auto:
+            return {"ok": True, "auto": False, "msg": "Envio automatico SUNAT desactivado."}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return enviar_documento_sunat(
+        int(documento_id),
+        SunatEnviarRequest(regenerar=True, permitir_sin_firma=False),
+        sucursal,
+    )
+
+
+@app.get("/sunat/documentos/{documento_id}/estado")
+def estado_documento_sunat(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        SELECT id, tipo, numero, COALESCE(sunat_estado,'PENDIENTE'), COALESCE(sunat_modo,'MANUAL'),
+               sunat_fecha, COALESCE(sunat_xml_nombre,''), COALESCE(sunat_zip_nombre,''),
+               COALESCE(sunat_hash,''), COALESCE(sunat_ticket,''), COALESCE(sunat_respuesta_json,'')
+        FROM ventas
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (documento_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+        respuesta = {}
+        try:
+            respuesta = json.loads(row[10] or "{}")
+        except Exception:
+            respuesta = {"raw": row[10] or ""}
+        return {
+            "ok": True,
+            "success": True,
+            "id": row[0],
+            "tipo": row[1],
+            "numero": row[2],
+            "sunat_estado": row[3],
+            "sunat_modo": row[4],
+            "sunat_fecha": row[5],
+            "xml_nombre": row[6],
+            "zip_nombre": row[7],
+            "hash": row[8],
+            "ticket": row[9],
+            "respuesta": respuesta,
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/caja")
 def listar_caja(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -5729,7 +6525,7 @@ def listar_proveedores(sucursal: str = DEFAULT_SUCURSAL):
 def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(sucursal)
+    sucursal = inventario_sucursal(sucursal)
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
     cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
