@@ -5,6 +5,9 @@ pyodbc
 requests
 reportlab
 pillow
+lxml
+cryptography
+signxml
 pymupdf
 tkcalendar
 pyinstaller
