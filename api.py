@@ -153,6 +153,7 @@ def parse_fecha_emision(value):
 # ================= CONEXION (SIMPLE Y ESTABLE) =================
 DEFAULT_SUCURSAL = "computer_army"
 PC_FAST_SUCURSAL = "pc_fast_store"
+FERRETERIA_SUCURSAL = "ferreteria"
 SHARED_STOCK_SUCURSALES = {
     PC_FAST_SUCURSAL: DEFAULT_SUCURSAL,
 }
@@ -209,6 +210,20 @@ def usuario_puede_editar_documento(data):
 def inventario_sucursal(value: str = ""):
     sucursal = norm_sucursal(value)
     return SHARED_STOCK_SUCURSALES.get(sucursal, sucursal)
+
+
+def seed_branch_series(cur, sucursal):
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    INSERT INTO series (tipo, serie, correlativo, sucursal)
+    VALUES
+        ('PROFORMA','P001',1,%s),
+        ('NOTA DE VENTA','N001',1,%s),
+        ('PASE','PA001',1,%s),
+        ('BOLETA','B001',1,%s),
+        ('FACTURA','F001',1,%s)
+    ON CONFLICT (tipo, sucursal) DO NOTHING;
+    """, (sucursal, sucursal, sucursal, sucursal, sucursal))
 
 
 def ensure_usuario_permisos_table(cur):
@@ -1353,6 +1368,11 @@ def migrate_schema():
         ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
         """)
         cur.execute("""
+        INSERT INTO sucursales (codigo, nombre, activa)
+        VALUES ('ferreteria','FERRETERIA',TRUE)
+        ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS boquitoqui_mensajes (
             id SERIAL PRIMARY KEY,
             sucursal TEXT DEFAULT 'computer_army',
@@ -1482,26 +1502,9 @@ def migrate_schema():
         cur.execute("UPDATE series SET sucursal='computer_army' WHERE COALESCE(sucursal,'')=''")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_series_tipo_sucursal ON series (tipo, sucursal)")
 
-        cur.execute("""
-        INSERT INTO series (tipo, serie, correlativo, sucursal)
-        VALUES
-            ('PROFORMA','P001',1,'computer_army'),
-            ('NOTA DE VENTA','N001',1,'computer_army'),
-            ('PASE','PA001',1,'computer_army'),
-            ('BOLETA','B001',1,'computer_army'),
-            ('FACTURA','F001',1,'computer_army')
-        ON CONFLICT (tipo, sucursal) DO NOTHING;
-        """)
-        cur.execute("""
-        INSERT INTO series (tipo, serie, correlativo, sucursal)
-        VALUES
-            ('PROFORMA','P001',1,'pc_fast_store'),
-            ('NOTA DE VENTA','N001',1,'pc_fast_store'),
-            ('PASE','PA001',1,'pc_fast_store'),
-            ('BOLETA','B001',1,'pc_fast_store'),
-            ('FACTURA','F001',1,'pc_fast_store')
-        ON CONFLICT (tipo, sucursal) DO NOTHING;
-        """)
+        seed_branch_series(cur, DEFAULT_SUCURSAL)
+        seed_branch_series(cur, PC_FAST_SUCURSAL)
+        seed_branch_series(cur, FERRETERIA_SUCURSAL)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS producto_series (
@@ -1946,6 +1949,7 @@ def guardar_sucursal(data: dict):
         ON CONFLICT (codigo) DO UPDATE SET nombre=EXCLUDED.nombre, activa=TRUE
         RETURNING codigo
     """, (codigo, nombre))
+    seed_branch_series(cur, codigo)
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "codigo": codigo, "nombre": nombre}
