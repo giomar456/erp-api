@@ -4,7 +4,7 @@ import tempfile
 import subprocess
 import requests
 
-APP_VERSION = "1.0.72"
+APP_VERSION = "1.0.73"
 VERSION_INFO_URL = os.getenv(
     "ERP_VERSION_INFO_URL",
     "https://erp-api-7x3d.onrender.com/app/version"
