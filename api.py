@@ -1311,6 +1311,12 @@ class Garantia(BaseModel):
     solucion: str = ""
     usuario: str = ""
     sucursal: str = DEFAULT_SUCURSAL
+    producto_cambio_id: Optional[int] = None
+    producto_cambio: str = ""
+    serie_cambio: str = ""
+    cantidad_cambio: int = 1
+    diferencia_precio: float = 0
+    aplicar_cambio: bool = False
 
 
 # ================= TEST CONEXION =================
@@ -1714,6 +1720,13 @@ def migrate_schema():
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS solucion TEXT DEFAULT ''",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS usuario TEXT DEFAULT ''",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS producto_cambio_id INT",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS producto_cambio TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS serie_cambio TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS cantidad_cambio INT DEFAULT 0",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS diferencia_precio NUMERIC DEFAULT 0",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS cambio_aplicado BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS cambio_fecha TIMESTAMP",
         ]:
             cur.execute(column_sql)
 
@@ -7323,6 +7336,92 @@ def woo_import_products_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURS
 
 
 # ================= GARANTIAS =================
+def _resolver_producto_cambio_garantia(cur, data: Garantia, sucursal):
+    sucursal_inv = inventario_sucursal(sucursal)
+    producto_id = int(data.producto_cambio_id or 0)
+    if producto_id:
+        cur.execute("""
+        SELECT id, COALESCE(nombre,''), COALESCE(marca,''), COALESCE(modelo,''), COALESCE(stock,0)
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal_inv))
+    else:
+        nombre = str(data.producto_cambio or "").strip()
+        if not nombre:
+            return None, "Selecciona el producto que se entregara como cambio."
+        cur.execute("""
+        SELECT id, COALESCE(nombre,''), COALESCE(marca,''), COALESCE(modelo,''), COALESCE(stock,0)
+        FROM productos
+        WHERE COALESCE(sucursal,%s)=%s AND UPPER(COALESCE(nombre,''))=UPPER(%s)
+        ORDER BY id DESC
+        LIMIT 1
+        """, (DEFAULT_SUCURSAL, sucursal_inv, nombre))
+    row = cur.fetchone()
+    if not row:
+        return None, "Producto de cambio no encontrado en esta sucursal."
+    return {
+        "id": int(row[0]),
+        "nombre": row[1] or "",
+        "marca": row[2] or "",
+        "modelo": row[3] or "",
+        "stock": int(row[4] or 0),
+    }, None
+
+
+def _aplicar_cambio_garantia(cur, garantia_id, data: Garantia, sucursal):
+    if not data.aplicar_cambio:
+        return None
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    SELECT COALESCE(cambio_aplicado,FALSE)
+    FROM garantias
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (garantia_id, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if row and bool(row[0]):
+        return "Esta garantia ya tiene cambio aplicado. No se descuenta stock dos veces."
+
+    cantidad = max(1, int(data.cantidad_cambio or 1))
+    producto, error = _resolver_producto_cambio_garantia(cur, data, sucursal)
+    if error:
+        return error
+    error_stock = validar_y_marcar_series_venta(
+        cur,
+        producto["id"],
+        producto["nombre"],
+        producto["marca"],
+        producto["modelo"],
+        cantidad,
+        data.serie_cambio,
+        sucursal,
+    )
+    if error_stock:
+        return error_stock
+    cur.execute("""
+    UPDATE garantias
+    SET producto_cambio_id=%s,
+        producto_cambio=%s,
+        serie_cambio=%s,
+        cantidad_cambio=%s,
+        diferencia_precio=%s,
+        cambio_aplicado=TRUE,
+        cambio_fecha=CURRENT_TIMESTAMP,
+        estado='ENTREGADO',
+        solucion=CASE
+            WHEN COALESCE(solucion,'')='' THEN %s
+            ELSE solucion
+        END
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (
+        producto["id"], producto["nombre"], data.serie_cambio, cantidad,
+        float(data.diferencia_precio or 0),
+        f"CAMBIO ENTREGADO: {producto['nombre']}",
+        garantia_id, DEFAULT_SUCURSAL, sucursal,
+    ))
+    return None
+
+
 @app.get("/garantias")
 def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -7338,7 +7437,14 @@ def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
                COALESCE(falla,'') AS falla,
                COALESCE(estado,'RECIBIDO') AS estado,
                COALESCE(solucion,'') AS solucion,
-               COALESCE(usuario,'') AS usuario
+               COALESCE(usuario,'') AS usuario,
+               COALESCE(producto_cambio_id,0) AS producto_cambio_id,
+               COALESCE(producto_cambio,'') AS producto_cambio,
+               COALESCE(serie_cambio,'') AS serie_cambio,
+               COALESCE(cantidad_cambio,0) AS cantidad_cambio,
+               COALESCE(diferencia_precio,0) AS diferencia_precio,
+               COALESCE(cambio_aplicado,FALSE) AS cambio_aplicado,
+               COALESCE(to_char(cambio_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS cambio_fecha
         FROM garantias
         WHERE COALESCE(sucursal,%s)=%s
           AND (%s = '%%'
@@ -7364,14 +7470,24 @@ def guardar_garantia(data: Garantia):
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal)
     cur.execute("""
-        INSERT INTO garantias (cliente, documento, producto, serie, falla, estado, solucion, usuario, sucursal)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO garantias (
+            cliente, documento, producto, serie, falla, estado, solucion, usuario, sucursal,
+            producto_cambio_id, producto_cambio, serie_cambio, cantidad_cambio, diferencia_precio
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING id
     """, (
         data.cliente, data.documento, data.producto, data.serie,
-        data.falla, estado, data.solucion, data.usuario, sucursal
+        data.falla, estado, data.solucion, data.usuario, sucursal,
+        data.producto_cambio_id, data.producto_cambio, data.serie_cambio,
+        max(0, int(data.cantidad_cambio or 0)), float(data.diferencia_precio or 0)
     ))
     garantia_id = cur.fetchone()[0]
+    error_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
+    if error_cambio:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": error_cambio}
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "id": garantia_id}
@@ -7386,14 +7502,28 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
     cur.execute("""
         UPDATE garantias
         SET cliente=%s, documento=%s, producto=%s, serie=%s,
-            falla=%s, estado=%s, solucion=%s, usuario=%s
+            falla=%s, estado=%s, solucion=%s, usuario=%s,
+            producto_cambio_id=COALESCE(%s, producto_cambio_id),
+            producto_cambio=%s,
+            serie_cambio=%s,
+            cantidad_cambio=%s,
+            diferencia_precio=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
     """, (
         data.cliente, data.documento, data.producto, data.serie,
-        data.falla, estado, data.solucion, data.usuario, garantia_id, DEFAULT_SUCURSAL, sucursal
+        data.falla, estado, data.solucion, data.usuario,
+        data.producto_cambio_id, data.producto_cambio, data.serie_cambio,
+        max(0, int(data.cantidad_cambio or 0)), float(data.diferencia_precio or 0),
+        garantia_id, DEFAULT_SUCURSAL, sucursal
     ))
     row = cur.fetchone()
+    if row:
+        error_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
+        if error_cambio:
+            conn.rollback()
+            conn.close()
+            return {"ok": False, "success": False, "msg": error_cambio}
     conn.commit()
     conn.close()
     if not row:
