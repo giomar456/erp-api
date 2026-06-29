@@ -9858,10 +9858,27 @@ class App:
         tk.Label(form, text="Solución", bg=CARD_BG, fg=TEXT).grid(row=3, column=0, sticky="ne", padx=6, pady=5)
         self.gar_solucion = tk.Text(form, height=3, width=58, wrap="word")
         self.gar_solucion.grid(row=3, column=1, columnspan=3, sticky="we", padx=6, pady=5)
+        self.gar_cambio_id = tk.StringVar(value="")
+        tk.Label(form, text="Producto cambio", bg=CARD_BG, fg=TEXT).grid(row=4, column=0, sticky="e", padx=6, pady=5)
+        self.gar_producto_cambio = tk.Entry(form, width=42)
+        self.gar_producto_cambio.grid(row=4, column=1, columnspan=2, sticky="we", padx=6, pady=5)
+        tk.Button(form, text="Buscar", command=self.buscar_producto_cambio_garantia, bg="#2563eb", fg="white", relief="flat").grid(row=4, column=3, sticky="w", padx=6, pady=5)
+        tk.Label(form, text="Serie cambio", bg=CARD_BG, fg=TEXT).grid(row=5, column=0, sticky="e", padx=6, pady=5)
+        self.gar_serie_cambio = tk.Entry(form, width=20)
+        self.gar_serie_cambio.grid(row=5, column=1, sticky="w", padx=6, pady=5)
+        tk.Label(form, text="Cant.", bg=CARD_BG, fg=TEXT).grid(row=5, column=2, sticky="e", padx=6, pady=5)
+        self.gar_cantidad_cambio = tk.Entry(form, width=8)
+        self.gar_cantidad_cambio.insert(0, "1")
+        self.gar_cantidad_cambio.grid(row=5, column=3, sticky="w", padx=6, pady=5)
+        tk.Label(form, text="Diferencia S/", bg=CARD_BG, fg=TEXT).grid(row=5, column=4, sticky="e", padx=6, pady=5)
+        self.gar_diferencia_cambio = tk.Entry(form, width=10)
+        self.gar_diferencia_cambio.insert(0, "0")
+        self.gar_diferencia_cambio.grid(row=5, column=5, sticky="w", padx=6, pady=5)
 
         actions = tk.Frame(card, bg=CARD_BG)
         actions.pack(fill="x", padx=12, pady=4)
         tk.Button(actions, text="Guardar garantía", command=self.save_garantia_ui, bg=ACCENT, fg="white", relief="flat").pack(side="left", padx=4)
+        tk.Button(actions, text="Guardar y aplicar cambio", command=lambda: self.save_garantia_ui(aplicar_cambio=True), bg="#dc2626", fg="white", relief="flat").pack(side="left", padx=4)
         tk.Button(actions, text="Nuevo", command=self.clear_garantia_form, bg="#334155", fg="white", relief="flat").pack(side="left", padx=4)
         tk.Label(actions, text="Buscar", bg=CARD_BG, fg=TEXT).pack(side="left", padx=(18, 4))
         self.gar_search = tk.Entry(actions, width=34)
@@ -9869,9 +9886,9 @@ class App:
         self.gar_search.bind("<Return>", lambda e: self.refresh_garantias())
         tk.Button(actions, text="Refrescar", command=self.refresh_garantias, bg="#0f766e", fg="white", relief="flat").pack(side="left", padx=4)
 
-        cols = ("ID", "Fecha", "Cliente", "Documento", "Producto", "Serie", "Estado", "Falla", "Solución", "Usuario")
+        cols = ("ID", "Fecha", "Cliente", "Documento", "Producto", "Serie", "Estado", "Cambio", "Falla", "Solución", "Usuario")
         self.tree_garantias = ttk.Treeview(card, columns=cols, show="headings", height=14)
-        widths = [55, 135, 180, 120, 230, 130, 95, 230, 210, 100]
+        widths = [55, 135, 180, 120, 230, 130, 95, 220, 230, 210, 100]
         for c, w in zip(cols, widths):
             self.tree_garantias.heading(c, text=c)
             self.tree_garantias.column(c, width=w, anchor="w")
@@ -9883,11 +9900,26 @@ class App:
         self.gar_id.set("")
         for ent in (self.gar_cliente, self.gar_doc, self.gar_producto, self.gar_serie):
             ent.delete(0, tk.END)
+        self.gar_cambio_id.set("")
+        self.gar_producto_cambio.delete(0, tk.END)
+        self.gar_serie_cambio.delete(0, tk.END)
+        self.gar_cantidad_cambio.delete(0, tk.END)
+        self.gar_cantidad_cambio.insert(0, "1")
+        self.gar_diferencia_cambio.delete(0, tk.END)
+        self.gar_diferencia_cambio.insert(0, "0")
         self.gar_estado.set("RECIBIDO")
         self.gar_falla.delete("1.0", tk.END)
         self.gar_solucion.delete("1.0", tk.END)
 
-    def save_garantia_ui(self):
+    def save_garantia_ui(self, aplicar_cambio=False):
+        try:
+            cantidad_cambio = max(0, int(float(self.gar_cantidad_cambio.get().strip() or 0)))
+        except Exception:
+            cantidad_cambio = 0
+        try:
+            diferencia_precio = float((self.gar_diferencia_cambio.get().strip() or "0").replace(",", "."))
+        except Exception:
+            diferencia_precio = 0
         payload = {
             "id": self.gar_id.get().strip(),
             "cliente": self.gar_cliente.get().strip(),
@@ -9898,14 +9930,26 @@ class App:
             "estado": self.gar_estado.get(),
             "solucion": self.gar_solucion.get("1.0", tk.END).strip(),
             "usuario": self.user.get("usuario", ""),
+            "producto_cambio_id": int(self.gar_cambio_id.get() or 0) or None,
+            "producto_cambio": self.gar_producto_cambio.get().strip(),
+            "serie_cambio": self.gar_serie_cambio.get().strip(),
+            "cantidad_cambio": cantidad_cambio,
+            "diferencia_precio": diferencia_precio,
+            "aplicar_cambio": bool(aplicar_cambio),
         }
         if not payload["cliente"] or not payload["producto"] or not payload["falla"]:
             messagebox.showwarning("Garantía", "Completa cliente, producto y falla.")
             return
+        if aplicar_cambio:
+            if not payload["producto_cambio"]:
+                messagebox.showwarning("Garantía", "Selecciona el producto que se entregará como cambio.")
+                return
+            if not messagebox.askyesno("Aplicar cambio", "Esto descontará stock del producto de cambio y marcará la garantía como ENTREGADO.\n\n¿Continuar?"):
+                return
         fn = getattr(api_client, "guardar_garantia", None) if api_client is not None else None
         r = fn(payload) if callable(fn) else _api_json("post", "/garantias", {"ok": False}, json=payload)
         if api_response_ok(r):
-            messagebox.showinfo("Garantía", "Garantía guardada.")
+            messagebox.showinfo("Garantía", "Garantía guardada." + (" Stock descontado por cambio." if aplicar_cambio else ""))
             self.registrar_accion("GARANTIA GUARDADA", f'{payload["cliente"]} / {payload["producto"]} / {payload["estado"]}')
             self.clear_garantia_form()
             self.refresh_garantias()
@@ -9921,10 +9965,15 @@ class App:
         fn = getattr(api_client, "obtener_garantias", None) if api_client is not None else None
         data = fn(q) if callable(fn) else (_api_json("get", f"/garantias?q={urllib.parse.quote(q)}", []) or [])
         for g in data or []:
+            cambio = g.get("producto_cambio", "") or ""
+            if g.get("cambio_aplicado"):
+                cambio = f"APLICADO: {cambio}"
+            elif cambio:
+                cambio = f"PENDIENTE: {cambio}"
             self.tree_garantias.insert("", "end", values=(
                 g.get("id", ""), g.get("fecha", ""), g.get("cliente", ""), g.get("documento", ""),
                 g.get("producto", ""), g.get("serie", ""), g.get("estado", ""),
-                g.get("falla", ""), g.get("solucion", ""), g.get("usuario", "")
+                cambio, g.get("falla", ""), g.get("solucion", ""), g.get("usuario", "")
             ))
 
     def load_selected_garantia(self, event=None):
@@ -9939,8 +9988,68 @@ class App:
         self.gar_producto.insert(0, vals[4])
         self.gar_serie.insert(0, vals[5])
         self.gar_estado.set(vals[6] or "RECIBIDO")
-        self.gar_falla.insert("1.0", vals[7])
-        self.gar_solucion.insert("1.0", vals[8])
+        cambio = str(vals[7] or "")
+        cambio = re.sub(r"^(APLICADO|PENDIENTE):\s*", "", cambio, flags=re.I)
+        self.gar_producto_cambio.insert(0, cambio)
+        self.gar_falla.insert("1.0", vals[8])
+        self.gar_solucion.insert("1.0", vals[9])
+
+    def buscar_producto_cambio_garantia(self):
+        win = tk.Toplevel(self.root)
+        win.title("Buscar producto para cambio")
+        win.geometry("860x520")
+        win.configure(bg=CARD_BG)
+        top = tk.Frame(win, bg=CARD_BG)
+        top.pack(fill="x", padx=12, pady=10)
+        tk.Label(top, text="Buscar producto", bg=CARD_BG, fg=TEXT).pack(side="left", padx=(0, 6))
+        search = tk.Entry(top, width=46)
+        search.pack(side="left", padx=6)
+        cols = ("ID", "Nombre", "Categoria", "Marca", "Stock", "Precio")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=16)
+        widths = [70, 360, 150, 120, 70, 90]
+        for c, w in zip(cols, widths):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w")
+        tree.pack(fill="both", expand=True, padx=12, pady=8)
+
+        def cargar():
+            for item in tree.get_children():
+                tree.delete(item)
+            q = search.get().strip().lower()
+            fn = getattr(api_client, "obtener_productos", None) if api_client is not None else None
+            productos = fn() if callable(fn) else (_api_json("get", "/productos", []) or [])
+            count = 0
+            for p in productos or []:
+                texto = f'{p.get("nombre","")} {p.get("categoria","")} {p.get("marca","")} {p.get("modelo","")}'.lower()
+                if q and q not in texto:
+                    continue
+                tree.insert("", "end", values=(
+                    p.get("id", ""),
+                    p.get("nombre", ""),
+                    p.get("categoria", ""),
+                    p.get("marca", ""),
+                    p.get("stock", 0),
+                    p.get("precio_venta", 0),
+                ))
+                count += 1
+                if count >= 120:
+                    break
+
+        def seleccionar():
+            sel = tree.selection()
+            if not sel:
+                return
+            vals = tree.item(sel[0], "values")
+            self.gar_cambio_id.set(str(vals[0] or ""))
+            self.gar_producto_cambio.delete(0, tk.END)
+            self.gar_producto_cambio.insert(0, str(vals[1] or ""))
+            win.destroy()
+
+        search.bind("<Return>", lambda e: cargar())
+        tree.bind("<Double-1>", lambda e: seleccionar())
+        tk.Button(top, text="Buscar", command=cargar, bg="#2563eb", fg="white", relief="flat").pack(side="left", padx=6)
+        tk.Button(top, text="Seleccionar", command=seleccionar, bg="#0f766e", fg="white", relief="flat").pack(side="left", padx=6)
+        cargar()
 
 
     def build_erp_moderno(self):
