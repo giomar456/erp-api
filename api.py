@@ -6605,17 +6605,34 @@ def _sunat_generate_for_document(cur, documento_id, sucursal):
     return doc, cfg, artifacts, xml_bytes, zip_bytes
 
 
-def _sunat_soap_send_bill(cfg, zip_name, zip_base64):
+def _sunat_soap_username(cfg):
     usuario_sol = str(cfg.get("usuario_sol") or "").strip().upper()
-    username = f"{_sunat_clean_ruc(cfg.get('ruc'))}{usuario_sol}"
-    password = cfg.get("clave_sol") or ""
+    return f"{_sunat_clean_ruc(cfg.get('ruc'))}{usuario_sol}"
+
+
+def _sunat_parse_soap_fault(response_text):
+    text = str(response_text or "")
+    fault_code = ""
+    fault_string = ""
+    m_code = re.search(r"<faultcode[^>]*>([^<]+)</faultcode>", text, flags=re.I)
+    if m_code:
+        fault_code = html.unescape(m_code.group(1).strip())
+    m_msg = re.search(r"<faultstring[^>]*>([^<]+)</faultstring>", text, flags=re.I)
+    if m_msg:
+        fault_string = html.unescape(m_msg.group(1).strip())
+    return fault_code, fault_string
+
+
+def _sunat_soap_send_bill(cfg, zip_name, zip_base64):
+    username = _sunat_soap_username(cfg)
+    password = str(cfg.get("clave_sol") or "")
     endpoint = cfg.get("endpoint_url") or SUNAT_DEFAULT_ENDPOINTS["BETA"]
     password_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
     soap = f"""<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ser="http://service.sunat.gob.pe" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
   <soapenv:Header>
-    <wsse:Security>
-      <wsse:UsernameToken>
+    <wsse:Security soapenv:mustUnderstand="1">
+      <wsse:UsernameToken Id="SUNAT-TOKEN">
         <wsse:Username>{html.escape(username)}</wsse:Username>
         <wsse:Password Type="{password_type}">{html.escape(password)}</wsse:Password>
       </wsse:UsernameToken>
@@ -6635,6 +6652,89 @@ def _sunat_soap_send_bill(cfg, zip_name, zip_base64):
         timeout=60,
     )
     return response.status_code, response.text
+
+
+@app.get("/sunat/diagnostico")
+def diagnostico_sunat(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cfg = _sunat_get_config(cur, sucursal)
+        public = _sunat_public_config(cfg)
+        clave = str(cfg.get("clave_sol") or "")
+        return {
+            "ok": True,
+            "success": True,
+            "sucursal": sucursal,
+            "portal_login": {
+                "ruc": public.get("ruc"),
+                "usuario_sol": public.get("usuario_sol"),
+                "nota": "En el portal SUNAT ingresas RUC y usuario por separado.",
+            },
+            "soap_login": {
+                "username": _sunat_soap_username(cfg),
+                "clave_configurada": bool(clave),
+                "clave_longitud": len(clave),
+                "nota": "El servicio web concatena RUC + usuario, por ejemplo 20613247603LOOKBAIL.",
+            },
+            "config": public,
+            "error_0110": {
+                "significado": "SUNAT no reconoce el tipo de usuario para facturacion electronica.",
+                "causas_frecuentes": [
+                    "LOOKBAIL entra al portal web pero no tiene perfil de Comprobantes de Pago / Factura Electronica.",
+                    "El usuario secundario fue creado bajo otro RUC distinto al configurado en el ERP.",
+                    "La clave guardada en el ERP no coincide con la que pruebas manualmente en el portal.",
+                ],
+                "que_revisar_en_sunat": [
+                    "Mis tramites > Administracion de usuarios secundarios > LOOKBAIL > Asignar programas.",
+                    "Tributarios > Comprobantes de pago: SEE-SOL, SEE-Contribuyente, Factura Electronica y subopciones.",
+                    "Confirmar que el RUC del portal sea 20613247603 (PC FAST), no otro RUC.",
+                ],
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/sunat/probar-credenciales")
+def probar_credenciales_sunat(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cfg = _sunat_get_config(cur, sucursal)
+        if not cfg.get("clave_sol"):
+            return {"ok": False, "success": False, "msg": "Falta clave SOL en la configuracion."}
+        doc, _detalle = _sunat_documento_payload(cur, documento_id, sucursal)
+        if not doc:
+            return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+        zip_name = doc.get("sunat_zip_nombre")
+        zip_base64 = doc.get("sunat_zip_base64")
+        if not zip_name or not zip_base64:
+            _doc, _cfg, artifacts, _xml_bytes, _zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
+            conn.commit()
+            zip_name = artifacts["zip_nombre"]
+            zip_base64 = artifacts["zip_base64"]
+        status_code, response_text = _sunat_soap_send_bill(cfg, zip_name, zip_base64)
+        fault_code, fault_string = _sunat_parse_soap_fault(response_text)
+        return {
+            "ok": not fault_code,
+            "success": not fault_code,
+            "documento_id": documento_id,
+            "numero": doc.get("numero"),
+            "soap_username": _sunat_soap_username(cfg),
+            "clave_longitud": len(str(cfg.get("clave_sol") or "")),
+            "http_status": status_code,
+            "fault_code": fault_code,
+            "fault_string": fault_string,
+            "respuesta": response_text[:2500],
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
 
 
 @app.get("/sunat/config")
