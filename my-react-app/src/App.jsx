@@ -4,7 +4,7 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 const TEST_API_URL = new URLSearchParams(window.location.search).get('api');
 const BASE_URL = TEST_API_URL || 'https://erp-api-7x3d.onrender.com';
 const EMPRESA = 'computer_army';
-const APP_VERSION = '1.76';
+const APP_VERSION = '1.77';
 const IS_NATIVE_APP = !!(Capacitor?.isNativePlatform && Capacitor.isNativePlatform());
 const IS_PC_TESTER = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('tester') === 'pc';
 const IS_PC_DESKTOP = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('desktop') === 'pc';
