@@ -1958,6 +1958,7 @@ def migrate_schema():
             "ALTER TABLE compras ADD COLUMN IF NOT EXISTS usuario_registro TEXT DEFAULT ''",
             "ALTER TABLE compras ADD COLUMN IF NOT EXISTS detalle TEXT DEFAULT ''",
             "ALTER TABLE compras ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
+            "ALTER TABLE compras ADD COLUMN IF NOT EXISTS items_json TEXT DEFAULT ''",
         ]:
             cur.execute(column_sql)
 
@@ -7322,6 +7323,16 @@ def guardar_proveedor(data: Proveedor):
     return {"ok": True, "success": True, "id": proveedor_id}
 
 
+def _parse_compra_items(raw):
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 @app.get("/compras")
 def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -7331,15 +7342,52 @@ def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
     SELECT id, fecha, COALESCE(proveedor_nombre,'') AS proveedor_nombre,
            COALESCE(comprobante,'') AS comprobante, COALESCE(total,0) AS total,
            COALESCE(usuario_registro,'') AS usuario_registro,
-           COALESCE(detalle,'') AS detalle, COALESCE(sucursal,%s) AS sucursal
+           COALESCE(detalle,'') AS detalle, COALESCE(sucursal,%s) AS sucursal,
+           COALESCE(items_json,'') AS items_json
     FROM compras
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY fecha DESC, id DESC
     LIMIT 500
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
-    data = [_jsonable_row(r) for r in dict_fetchall(cur)]
+    data = []
+    for row in dict_fetchall(cur):
+        item = _jsonable_row(row)
+        items = _parse_compra_items(item.get("items_json"))
+        item["items_count"] = len(items)
+        item["tiene_series"] = any(
+            isinstance(it, dict) and (
+                (isinstance(it.get("series_list"), list) and any(str(s).strip() for s in it.get("series_list")))
+                or str(it.get("series_texto") or "").strip()
+            )
+            for it in items
+        )
+        data.append(item)
     conn.close()
     return data
+
+
+@app.get("/compras/{compra_id}")
+def obtener_compra(compra_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    SELECT id, fecha, COALESCE(proveedor_nombre,'') AS proveedor_nombre,
+           COALESCE(comprobante,'') AS comprobante, COALESCE(total,0) AS total,
+           COALESCE(usuario_registro,'') AS usuario_registro,
+           COALESCE(detalle,'') AS detalle, COALESCE(sucursal,%s) AS sucursal,
+           COALESCE(items_json,'') AS items_json
+    FROM compras
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    LIMIT 1
+    """, (DEFAULT_SUCURSAL, compra_id, DEFAULT_SUCURSAL, sucursal))
+    row = dict_fetchone(cur)
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Compra no encontrada"}
+    compra = _jsonable_row(row)
+    compra["items"] = _parse_compra_items(compra.get("items_json"))
+    return {"ok": True, "compra": compra, "items": compra["items"]}
 
 
 @app.post("/compras")
@@ -7390,6 +7438,8 @@ def guardar_compra(data: Compra):
         compra_id = cur.fetchone()[0]
         usuario_op = str(data.usuario_registro or data.usuario or "").strip()
         resumen_series_compra = []
+        items_snapshot = []
+        cur.execute("ALTER TABLE compras ADD COLUMN IF NOT EXISTS items_json TEXT DEFAULT ''")
 
         for item in (data.items or []):
             try:
@@ -7460,6 +7510,25 @@ def guardar_compra(data: Compra):
                     UPDATE productos SET stock = COALESCE(stock,0) + %s
                     WHERE id=%s AND COALESCE(sucursal,%s)=%s
                 """, (cantidad, prod_id, DEFAULT_SUCURSAL, inv_sucursal))
+
+            items_snapshot.append({
+                "producto_id": prod_id,
+                "nombre": nombre,
+                "categoria": str(item.get("categoria") or "").strip(),
+                "marca": str(item.get("marca") or "").strip(),
+                "modelo": str(item.get("modelo") or "").strip(),
+                "cantidad": cantidad,
+                "precio": round(precio, 2),
+                "precio_venta": round(precio_venta, 2),
+                "series_list": series_list,
+                "series_texto": "\n".join(series_list),
+                "subtotal": round(cantidad * precio, 2),
+            })
+
+        cur.execute(
+            "UPDATE compras SET items_json=%s WHERE id=%s AND COALESCE(sucursal,%s)=%s",
+            (json.dumps(items_snapshot, ensure_ascii=False), compra_id, DEFAULT_SUCURSAL, sucursal),
+        )
 
         accion_compra = "COMPRA_SERIES_INGRESO" if resumen_series_compra else "COMPRA_REGISTRADA"
         detalle_compra = (

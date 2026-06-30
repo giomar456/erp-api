@@ -4805,6 +4805,97 @@ function resizeCompraSeriesList(current, qty) {
   return next.slice(0, n);
 }
 
+function parseCompraItems(compra) {
+  if (Array.isArray(compra?.items)) return compra.items;
+  try {
+    const parsed = JSON.parse(compra?.items_json || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function formatCompraFecha(value) {
+  if (!value) return '-';
+  return String(value).replace('T', ' ').slice(0, 16);
+}
+
+function compraDocumentFileName(compra) {
+  const prov = String(compra?.proveedor_nombre || compra?.proveedor || 'PROVEEDOR').trim().replace(/[^\w.-]+/g, '_');
+  return `COMPRA_${compra?.id || 'DOC'}_${prov}.pdf`;
+}
+
+function buildCompraDocumentHtml(compra, items, config = {}) {
+  const companyName = config.company_name || config.empresa || 'CORPORACION COMPUTER ARMY EIRL';
+  const ruc = config.ruc || '20611068701';
+  const logo = String(config.logo || config.document_logo || '').trim() || APP_LOGO_DATA_URL;
+  const rows = (items || []).map((item, idx) => {
+    const qty = Number(item.cantidad || 0);
+    const price = Number(item.precio || 0);
+    const total = Number(item.subtotal || qty * price || 0);
+    const series = (Array.isArray(item.series_list) ? item.series_list : [])
+      .map((s) => String(s || '').trim())
+      .filter(Boolean)
+      .join('\n') || String(item.series_texto || '').trim();
+    const meta = [item.categoria, item.marca, item.modelo].filter(Boolean).join(' - ');
+    return `<tr>
+      <td>${idx + 1}</td>
+      <td><b>${escapeHtml(String(item.nombre || '').toUpperCase())}</b>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}${series ? `<small>SERIES:<br>${textWithBreaks(series)}</small>` : '<small>SIN SERIES</small>'}</td>
+      <td>${qty}</td>
+      <td>${money(price)}</td>
+      <td>${money(total)}</td>
+    </tr>`;
+  }).join('');
+  const title = `COMPROBANTE DE COMPRA #${compra?.id || ''}`;
+  const proveedor = escapeHtml(String(compra?.proveedor_nombre || compra?.proveedor || '-').toUpperCase());
+  const comprobante = escapeHtml(String(compra?.comprobante || '-').toUpperCase());
+  const usuario = escapeHtml(String(compra?.usuario_registro || '-').toUpperCase());
+  const fecha = escapeHtml(formatCompraFecha(compra?.fecha));
+  const nota = String(compra?.detalle || '').trim();
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  @page{size:A4;margin:12mm}
+  body{margin:0;background:#fff;color:#111;font-family:Arial,Helvetica,sans-serif}
+  .page{max-width:210mm;margin:0 auto;padding:10mm;box-sizing:border-box}
+  .head{display:grid;grid-template-columns:34mm 1fr;gap:8mm;align-items:start;margin-bottom:8mm}
+  .logo img{max-width:34mm;max-height:24mm;object-fit:contain}
+  h1{margin:0 0 3mm;font-size:20px;font-weight:900;text-transform:uppercase}
+  .meta{display:grid;grid-template-columns:1fr 1fr;gap:2mm 8mm;font-size:11px;text-transform:uppercase;margin-bottom:8mm}
+  .meta b{display:block;font-size:10px;color:#475569}
+  table{width:100%;border-collapse:collapse;border:1px solid #111;font-size:10px}
+  th,td{border:1px solid #111;padding:2mm;vertical-align:top}
+  th{background:#111827;color:#fff}
+  td:nth-child(1),td:nth-child(3){text-align:center}
+  td:nth-child(4),td:nth-child(5){text-align:right;white-space:nowrap}
+  td small{display:block;margin-top:2px;font-size:8px;font-weight:500;white-space:pre-line;line-height:1.35}
+  .total{margin-top:6mm;text-align:right;font-size:14px;font-weight:900}
+  .note{margin-top:6mm;padding:3mm;background:#f8fafc;border:1px solid #dbe3ef;font-size:10px;white-space:pre-line}
+</style></head><body><main class="page">
+  <div class="head">
+    <div class="logo"><img src="${logo}" alt="logo"></div>
+    <div>
+      <h1>${escapeHtml(title)}</h1>
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase">${escapeHtml(companyName)} · RUC ${escapeHtml(ruc)}</div>
+      <div style="font-size:10px;margin-top:2mm">Ingreso de mercaderia / compra a proveedor</div>
+    </div>
+  </div>
+  <div class="meta">
+    <div><b>Proveedor</b>${proveedor}</div>
+    <div><b>Comprobante</b>${comprobante}</div>
+    <div><b>Fecha</b>${fecha}</div>
+    <div><b>Usuario</b>${usuario}</div>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>Producto / Series</th><th>Cant.</th><th>P. Unit.</th><th>Total</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="5">Sin productos registrados</td></tr>'}</tbody>
+  </table>
+  <div class="total">TOTAL COMPRA: ${money(compra?.total || 0)}</div>
+  ${nota ? `<div class="note"><b>Nota:</b><br>${textWithBreaks(nota)}</div>` : ''}
+</main></body></html>`;
+}
+
 function ComprasView({ user }) {
   const canSeries = canEditSeries(user);
   const [compras, setCompras] = useState([]);
@@ -4824,6 +4915,10 @@ function ComprasView({ user }) {
   const [newCategoryInputOpen, setNewCategoryInputOpen] = useState(false);
   const [creatingProduct, setCreatingProduct] = useState(false);
   const [msg, setMsg] = useState('');
+  const [selectedCompraId, setSelectedCompraId] = useState(null);
+  const [compraDetail, setCompraDetail] = useState(null);
+  const [loadingCompraDetail, setLoadingCompraDetail] = useState(false);
+  const [compraViewer, setCompraViewer] = useState(null);
 
   const load = async () => setCompras(asArray(await apiFetch('/compras')));
   const loadProveedores = async () => setProveedores(asArray(await apiFetch('/proveedores')));
@@ -4968,6 +5063,45 @@ function ComprasView({ user }) {
   };
 
   const total = compraItems.reduce((sum, i) => sum + (Number(i.cantidad) * Number(i.precio) || 0), 0);
+  const selectedCompraItems = compraDetail ? parseCompraItems(compraDetail) : [];
+
+  const loadCompraDetail = async (compraId) => {
+    if (!compraId) return;
+    setLoadingCompraDetail(true);
+    try {
+      const res = await apiFetch(`/compras/${compraId}`);
+      if (okResponse(res)) {
+        const compra = { ...(res.compra || {}), items: asArray(res.items) };
+        setSelectedCompraId(compraId);
+        setCompraDetail(compra);
+      } else {
+        alert(res.msg || res.detail || 'No se pudo cargar la compra');
+      }
+    } catch (e) {
+      alert('Error: ' + e.message);
+    }
+    setLoadingCompraDetail(false);
+  };
+
+  const openCompraDocument = async (compra) => {
+    if (!compra) return;
+    let detail = compra;
+    let items = parseCompraItems(compra);
+    if (!items.length && compra.id) {
+      const res = await apiFetch(`/compras/${compra.id}`);
+      if (okResponse(res)) {
+        detail = { ...(res.compra || {}), items: asArray(res.items) };
+        items = parseCompraItems(detail);
+      }
+    }
+    const config = await fetchDocumentConfig();
+    const title = `Compra #${detail.id || ''} · ${detail.proveedor_nombre || detail.proveedor || 'Proveedor'}`;
+    setCompraViewer({
+      title,
+      fileName: compraDocumentFileName(detail),
+      html: buildCompraDocumentHtml(detail, items, config),
+    });
+  };
 
   const saveCompra = async () => {
     if (!proveedorNombre && !comprobante) return alert('Proveedor o comprobante requerido');
@@ -5027,6 +5161,7 @@ function ComprasView({ user }) {
         setSelectedItemIndex(null);
         await load();
         await loadProveedores();
+        if (res.id) await loadCompraDetail(res.id);
       } else {
         alert(res.msg || res.detail || 'Error al guardar compra');
       }
@@ -5313,17 +5448,107 @@ function ComprasView({ user }) {
       )}
 
       <Card title="Compras registradas">
-        <div className="max-h-[680px] overflow-auto">
-          {compras.map((c) => (
-            <div key={c.id} className="grid border-b border-slate-100 p-3 text-sm">
-              <b>{c.proveedor_nombre || c.proveedor || 'Proveedor'}</b>
-              <span>{c.comprobante} / {money(c.total)}</span>
-              {c.detalle && <span className="text-xs text-slate-500">{c.detalle}</span>}
-            </div>
-          ))}
+        <div className="max-h-[360px] overflow-auto rounded-md border border-slate-100">
+          {compras.map((c) => {
+            const selected = String(selectedCompraId) === String(c.id);
+            return (
+              <div
+                key={c.id}
+                className={`grid gap-2 border-b border-slate-100 p-3 text-sm ${selected ? 'bg-sky-50' : 'bg-white'}`}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <button type="button" onClick={() => loadCompraDetail(c.id)} className="min-w-0 text-left">
+                    <div className="font-black uppercase text-slate-950">{c.proveedor_nombre || c.proveedor || 'Proveedor'}</div>
+                    <div className="text-xs font-semibold text-slate-500">{formatCompraFecha(c.fecha)} · #{c.id}</div>
+                    <div className="mt-1 text-xs font-bold text-slate-700">
+                      {c.comprobante || 'Sin comprobante'} · {money(c.total)}
+                      {Number(c.items_count || 0) > 0 ? ` · ${c.items_count} producto(s)` : ''}
+                      {c.tiene_series ? ' · con series' : ''}
+                    </div>
+                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <ActionButton tone="blue" className="!min-h-9 !px-3 !py-1.5 text-xs" onClick={() => loadCompraDetail(c.id)}>
+                      Ver detalle
+                    </ActionButton>
+                    <ActionButton tone="neutral" className="!min-h-9 !px-3 !py-1.5 text-xs" onClick={() => openCompraDocument(c)}>
+                      Abrir documento
+                    </ActionButton>
+                  </div>
+                </div>
+                {c.detalle && <div className="text-xs text-slate-500">{c.detalle}</div>}
+              </div>
+            );
+          })}
           {!compras.length && <Empty text="Sin compras registradas." />}
         </div>
+
+        {loadingCompraDetail && <div className="mt-3 text-sm font-bold text-slate-500">Cargando detalle...</div>}
+
+        {compraDetail && !loadingCompraDetail && (
+          <div className="mt-4 rounded-lg border border-sky-200 bg-sky-50/40 p-3">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-lg font-black uppercase text-slate-950">
+                  Compra #{compraDetail.id} · {compraDetail.proveedor_nombre || compraDetail.proveedor || 'Proveedor'}
+                </div>
+                <div className="text-xs font-semibold uppercase text-slate-500">
+                  {formatCompraFecha(compraDetail.fecha)} · {compraDetail.comprobante || 'Sin comprobante'} · {compraDetail.usuario_registro || '-'}
+                </div>
+              </div>
+              <ActionButton tone="blue" onClick={() => openCompraDocument(compraDetail)}>Abrir documento de compra</ActionButton>
+            </div>
+
+            {!selectedCompraItems.length ? (
+              <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-800">
+                Esta compra es anterior y no tiene detalle guardado de productos/series. Las compras nuevas si mostraran todo el ingreso.
+              </div>
+            ) : (
+              <div className="grid gap-2">
+                {selectedCompraItems.map((item, idx) => {
+                  const series = (Array.isArray(item.series_list) ? item.series_list : [])
+                    .map((s) => String(s || '').trim())
+                    .filter(Boolean);
+                  return (
+                    <div key={`${item.producto_id || 'item'}-${idx}`} className="rounded-md border border-white bg-white p-3">
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-sm font-black uppercase text-slate-950">{item.nombre || 'Producto'}</div>
+                          <div className="text-xs font-semibold uppercase text-slate-500">
+                            {[item.categoria, item.marca, item.modelo].filter(Boolean).join(' · ') || 'Sin categoria'}
+                          </div>
+                        </div>
+                        <div className="text-right text-xs font-black text-slate-700">
+                          <div>Cant. {item.cantidad || 0}</div>
+                          <div>P. unit. {money(item.precio)}</div>
+                          <div>Total {money(item.subtotal || Number(item.cantidad) * Number(item.precio))}</div>
+                        </div>
+                      </div>
+                      {series.length ? (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {series.map((serie) => (
+                            <span key={serie} className="rounded bg-slate-100 px-2 py-1 font-mono text-[11px] font-black uppercase text-slate-800">{serie}</span>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="mt-2 text-[11px] font-bold uppercase text-slate-400">Sin series registradas</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {compraDetail.detalle && (
+              <div className="mt-3 rounded-md bg-white p-3 text-sm text-slate-600">
+                <div className="text-[11px] font-black uppercase text-slate-500">Nota</div>
+                <div className="mt-1 whitespace-pre-line">{compraDetail.detalle}</div>
+              </div>
+            )}
+          </div>
+        )}
       </Card>
+
+      <DocumentViewerModal viewer={compraViewer} onClose={() => setCompraViewer(null)} />
     </div>
   );
 }
