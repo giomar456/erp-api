@@ -262,9 +262,10 @@ def seed_branch_series(cur, sucursal):
         ('PASE','PA001',1,%s),
         ('BOLETA','B001',1,%s),
         ('FACTURA','F001',1,%s),
-        ('GARANTIA','G001',1,%s)
+        ('GARANTIA','G001',1,%s),
+        ('NOTA DE CREDITO','NC001',1,%s)
     ON CONFLICT (tipo, sucursal) DO NOTHING;
-    """, (sucursal, sucursal, sucursal, sucursal, sucursal, sucursal))
+    """, (sucursal, sucursal, sucursal, sucursal, sucursal, sucursal, sucursal))
 
 
 def ensure_usuario_permisos_table(cur):
@@ -1362,6 +1363,31 @@ class Garantia(BaseModel):
     aplicar_cambio: bool = False
 
 
+class GarantiaSeguimiento(BaseModel):
+    tipo_resolucion: str = ""
+    observacion_seguimiento: str = ""
+    monto_devolucion: float = 0
+    proveedor_garantia: str = ""
+    estado: str = ""
+    solucion: str = ""
+    serie_nueva: str = ""
+    usuario: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+    generar_nota_credito: bool = True
+
+
+RESOLUCIONES_GARANTIA = {
+    "PROVEEDOR_RESPONDIO": "Proveedor respondio",
+    "CAMBIO_PRODUCTO": "Cambio de producto",
+    "DEVOLUCION_DINERO": "Devolucion de dinero",
+    "NOTA_CREDITO": "Nota de credito",
+    "REPARADO": "Reparado y entregado",
+    "RECHAZADO": "Rechazado",
+    "EN_PROCESO": "En proceso con proveedor",
+    "OTRO": "Otro",
+}
+
+
 # ================= TEST CONEXION =================
 @app.get("/")
 def home():
@@ -1773,6 +1799,14 @@ def migrate_schema():
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS cambio_fecha TIMESTAMP",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS documento_cambio_id INT",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS documento_cambio_numero TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS tipo_resolucion TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS observacion_seguimiento TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS monto_devolucion NUMERIC DEFAULT 0",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS proveedor_garantia TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS documento_seguimiento_id INT",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS documento_seguimiento_numero TEXT DEFAULT ''",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS seguimiento_fecha TIMESTAMP",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS seguimiento_usuario TEXT DEFAULT ''",
         ]:
             cur.execute(column_sql)
 
@@ -7913,7 +7947,15 @@ def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
                COALESCE(cambio_aplicado,FALSE) AS cambio_aplicado,
                COALESCE(to_char(cambio_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS cambio_fecha,
                COALESCE(documento_cambio_id,0) AS documento_cambio_id,
-               COALESCE(documento_cambio_numero,'') AS documento_cambio_numero
+               COALESCE(documento_cambio_numero,'') AS documento_cambio_numero,
+               COALESCE(tipo_resolucion,'') AS tipo_resolucion,
+               COALESCE(observacion_seguimiento,'') AS observacion_seguimiento,
+               COALESCE(monto_devolucion,0) AS monto_devolucion,
+               COALESCE(proveedor_garantia,'') AS proveedor_garantia,
+               COALESCE(documento_seguimiento_id,0) AS documento_seguimiento_id,
+               COALESCE(documento_seguimiento_numero,'') AS documento_seguimiento_numero,
+               COALESCE(to_char(seguimiento_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS seguimiento_fecha,
+               COALESCE(seguimiento_usuario,'') AS seguimiento_usuario
         FROM garantias
         WHERE COALESCE(sucursal,%s)=%s
           AND (%s = '%%'
@@ -7923,13 +7965,294 @@ def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
            OR serie ILIKE %s
            OR falla ILIKE %s
            OR serie_cambio ILIKE %s
-           OR documento_cambio_numero ILIKE %s)
+           OR documento_cambio_numero ILIKE %s
+           OR tipo_resolucion ILIKE %s
+           OR observacion_seguimiento ILIKE %s
+           OR documento_seguimiento_numero ILIKE %s
+           OR proveedor_garantia ILIKE %s)
         ORDER BY fecha DESC, id DESC
         LIMIT 300
-    """, (DEFAULT_SUCURSAL, sucursal, filtro, filtro, filtro, filtro, filtro, filtro, filtro, filtro))
+    """, (
+        DEFAULT_SUCURSAL, sucursal, filtro, filtro, filtro, filtro, filtro, filtro,
+        filtro, filtro, filtro, filtro, filtro, filtro,
+    ))
     data = dict_fetchall(cur)
     conn.close()
     return data
+
+
+def _garantia_select_sql():
+    return """
+        SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha,
+               COALESCE(cliente,'') AS cliente,
+               COALESCE(documento,'') AS documento,
+               COALESCE(producto,'') AS producto,
+               COALESCE(serie,'') AS serie,
+               COALESCE(falla,'') AS falla,
+               COALESCE(estado,'RECIBIDO') AS estado,
+               COALESCE(solucion,'') AS solucion,
+               COALESCE(usuario,'') AS usuario,
+               COALESCE(producto_cambio_id,0) AS producto_cambio_id,
+               COALESCE(producto_cambio,'') AS producto_cambio,
+               COALESCE(serie_cambio,'') AS serie_cambio,
+               COALESCE(cantidad_cambio,0) AS cantidad_cambio,
+               COALESCE(diferencia_precio,0) AS diferencia_precio,
+               COALESCE(cambio_aplicado,FALSE) AS cambio_aplicado,
+               COALESCE(to_char(cambio_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS cambio_fecha,
+               COALESCE(documento_cambio_id,0) AS documento_cambio_id,
+               COALESCE(documento_cambio_numero,'') AS documento_cambio_numero,
+               COALESCE(tipo_resolucion,'') AS tipo_resolucion,
+               COALESCE(observacion_seguimiento,'') AS observacion_seguimiento,
+               COALESCE(monto_devolucion,0) AS monto_devolucion,
+               COALESCE(proveedor_garantia,'') AS proveedor_garantia,
+               COALESCE(documento_seguimiento_id,0) AS documento_seguimiento_id,
+               COALESCE(documento_seguimiento_numero,'') AS documento_seguimiento_numero,
+               COALESCE(to_char(seguimiento_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS seguimiento_fecha,
+               COALESCE(seguimiento_usuario,'') AS seguimiento_usuario
+        FROM garantias
+    """
+
+
+def _fetch_garantia_row(cur, garantia_id, sucursal):
+    cur.execute(_garantia_select_sql() + """
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+    """, (garantia_id, DEFAULT_SUCURSAL, sucursal))
+    return dict_fetchone(cur)
+
+
+def _siguiente_numero_documento_tipo(cur, sucursal, tipo_doc):
+    sucursal = norm_sucursal(sucursal)
+    seed_branch_series(cur, sucursal)
+    cur.execute("""
+    SELECT id, serie, correlativo
+    FROM series
+    WHERE UPPER(tipo)=UPPER(%s) AND COALESCE(sucursal,%s)=%s
+    LIMIT 1
+    """, (tipo_doc, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if not row:
+        return None, None, f"No existe correlativo para {tipo_doc}."
+    serie_id, serie, corr = row
+    numero = f"{serie}-{str(corr).zfill(6)}"
+    return serie_id, numero, None
+
+
+def _append_seguimiento_documento_garantia(cur, venta_id, titulo, detalle_texto, sucursal, monto=0):
+    if not venta_id:
+        return
+    sucursal = norm_sucursal(sucursal)
+    stamp = lima_now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("""
+    SELECT COALESCE(observacion,'')
+    FROM ventas
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (venta_id, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    obs_prev = str(row[0] if row else "").strip()
+    bloque = f"[{stamp}] {titulo}: {detalle_texto}"
+    nueva_obs = f"{obs_prev}\n{bloque}".strip() if obs_prev else bloque
+    cur.execute("""
+    UPDATE ventas
+    SET observacion=%s
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (nueva_obs, venta_id, DEFAULT_SUCURSAL, sucursal))
+    cur.execute("""
+    INSERT INTO ventas_detalle (
+        venta_id, producto_id, descripcion, marca, modelo,
+        series_texto, cantidad, precio, total, sucursal
+    )
+    VALUES (%s,0,%s,'','',%s,1,%s,%s,%s)
+    """, (
+        venta_id, titulo, detalle_texto[:500],
+        float(monto or 0), float(monto or 0), sucursal,
+    ))
+
+
+def _crear_nota_credito_garantia(cur, garantia_row, data: GarantiaSeguimiento, sucursal):
+    monto = round(float(data.monto_devolucion or 0), 2)
+    if monto <= 0:
+        return None, None
+    serie_id, numero, error = _siguiente_numero_documento_tipo(cur, sucursal, "NOTA DE CREDITO")
+    if error:
+        return None, error
+    sucursal = norm_sucursal(sucursal)
+    cliente = (garantia_row.get("cliente") or "").strip() or "CLIENTE GARANTIA"
+    tipo_res = (data.tipo_resolucion or "NOTA_CREDITO").upper()
+    label = RESOLUCIONES_GARANTIA.get(tipo_res, tipo_res)
+    doc_garantia = garantia_row.get("documento_cambio_numero") or ""
+    doc_origen = garantia_row.get("documento") or ""
+    observacion = (
+        f"NOTA CREDITO GARANTIA #{garantia_row.get('id')} | Doc garantia: {doc_garantia or '-'} | "
+        f"Boleta origen: {doc_origen or '-'} | {label} | {data.observacion_seguimiento or ''}"
+    )
+    fecha_emision = lima_now()
+    cur.execute("""
+    INSERT INTO ventas (
+        fecha, tipo, es_pase, numero, cliente, documento_cliente, direccion_cliente,
+        subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor, estado,
+        estado_pago, metodo_pago, sucursal
+    )
+    VALUES (%s,'NOTA DE CREDITO',FALSE,%s,%s,'','',%s,0,%s,%s,NULL,%s,'EMITIDO','N/A','',%s)
+    RETURNING id
+    """, (
+        fecha_emision, numero, cliente, monto, monto, observacion,
+        data.usuario or "", sucursal,
+    ))
+    venta_id = cur.fetchone()[0]
+    producto = garantia_row.get("producto") or "PRODUCTO GARANTIA"
+    serie_ref = garantia_row.get("serie") or ""
+    cur.execute("""
+    INSERT INTO ventas_detalle (
+        venta_id, producto_id, descripcion, marca, modelo,
+        series_texto, cantidad, precio, total, sucursal
+    )
+    VALUES (%s,0,%s,'','',%s,1,%s,%s,%s)
+    """, (
+        venta_id,
+        f"NC GARANTIA - {producto} ({label})",
+        serie_ref,
+        monto, monto, sucursal,
+    ))
+    cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
+    try:
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (
+            data.usuario or "", "", sucursal, "NOTA CREDITO GARANTIA",
+            f"{numero} | Garantia #{garantia_row.get('id')} | Monto {monto:.2f} | {label}",
+        ))
+    except Exception:
+        pass
+    return {"id": venta_id, "numero": numero, "tipo": "NOTA DE CREDITO", "monto": monto}, None
+
+
+@app.get("/garantias/{garantia_id}")
+def detalle_garantia(garantia_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(sucursal)
+    row = _fetch_garantia_row(cur, garantia_id, sucursal)
+    conn.close()
+    if not row:
+        return {"ok": False, "msg": "Garantia no encontrada"}
+    return {"ok": True, "success": True, "data": _jsonable_row(row), "resoluciones": RESOLUCIONES_GARANTIA}
+
+
+@app.put("/garantias/{garantia_id}/seguimiento")
+def actualizar_seguimiento_garantia(garantia_id: int, data: GarantiaSeguimiento):
+    tipo_res = (data.tipo_resolucion or "").strip().upper()
+    if tipo_res not in RESOLUCIONES_GARANTIA:
+        return {"ok": False, "msg": "Selecciona un tipo de resolucion valido."}
+    obs = (data.observacion_seguimiento or "").strip()
+    if not obs:
+        return {"ok": False, "msg": "La observacion del seguimiento es obligatoria."}
+
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(data.sucursal)
+    garantia_row = _fetch_garantia_row(cur, garantia_id, sucursal)
+    if not garantia_row:
+        conn.close()
+        return {"ok": False, "msg": "Garantia no encontrada"}
+
+    label = RESOLUCIONES_GARANTIA.get(tipo_res, tipo_res)
+    estado_map = {
+        "REPARADO": "ENTREGADO",
+        "RECHAZADO": "RECHAZADO",
+        "EN_PROCESO": "REVISION",
+        "PROVEEDOR_RESPONDIO": "REVISION",
+        "DEVOLUCION_DINERO": "ENTREGADO",
+        "NOTA_CREDITO": "ENTREGADO",
+        "CAMBIO_PRODUCTO": "ENTREGADO",
+    }
+    nuevo_estado = (data.estado or estado_map.get(tipo_res) or garantia_row.get("estado") or "REVISION").upper()
+    if nuevo_estado not in ("RECIBIDO", "REVISION", "APROBADO", "RECHAZADO", "ENTREGADO"):
+        nuevo_estado = "REVISION"
+
+    solucion_prev = str(garantia_row.get("solucion") or "").strip()
+    solucion_nueva = (data.solucion or "").strip() or f"{label}: {obs}"
+    if solucion_prev:
+        solucion_nueva = f"{solucion_prev} | {solucion_nueva}"
+
+    documento_seguimiento = None
+    monto = round(float(data.monto_devolucion or 0), 2)
+    if tipo_res in ("DEVOLUCION_DINERO", "NOTA_CREDITO") and monto > 0 and data.generar_nota_credito:
+        documento_seguimiento, error_nc = _crear_nota_credito_garantia(cur, garantia_row, data, sucursal)
+        if error_nc:
+            conn.rollback()
+            conn.close()
+            return {"ok": False, "msg": error_nc}
+
+    detalle_doc = obs
+    if data.proveedor_garantia:
+        detalle_doc = f"Proveedor: {data.proveedor_garantia} | {detalle_doc}"
+    if data.serie_nueva:
+        detalle_doc = f"Serie nueva: {data.serie_nueva} | {detalle_doc}"
+    if monto > 0:
+        detalle_doc = f"Monto: {monto:.2f} | {detalle_doc}"
+    if documento_seguimiento:
+        detalle_doc = f"NC {documento_seguimiento.get('numero')} | {detalle_doc}"
+
+    doc_cambio_id = int(garantia_row.get("documento_cambio_id") or 0)
+    if doc_cambio_id:
+        _append_seguimiento_documento_garantia(
+            cur, doc_cambio_id, f"SEGUIMIENTO - {label}", detalle_doc, sucursal,
+            monto if tipo_res in ("DEVOLUCION_DINERO", "NOTA_CREDITO") else 0,
+        )
+
+    cur.execute("""
+    UPDATE garantias
+    SET tipo_resolucion=%s,
+        observacion_seguimiento=%s,
+        monto_devolucion=%s,
+        proveedor_garantia=%s,
+        estado=%s,
+        solucion=%s,
+        documento_seguimiento_id=COALESCE(%s, documento_seguimiento_id),
+        documento_seguimiento_numero=CASE
+            WHEN %s <> '' THEN %s
+            ELSE documento_seguimiento_numero
+        END,
+        seguimiento_fecha=CURRENT_TIMESTAMP,
+        seguimiento_usuario=%s
+    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    RETURNING id
+    """, (
+        tipo_res, obs, monto, (data.proveedor_garantia or "").strip(),
+        nuevo_estado, solucion_nueva,
+        documento_seguimiento.get("id") if documento_seguimiento else None,
+        documento_seguimiento.get("numero") if documento_seguimiento else "",
+        documento_seguimiento.get("numero") if documento_seguimiento else "",
+        data.usuario or "", garantia_id, DEFAULT_SUCURSAL, sucursal,
+    ))
+    if not cur.fetchone():
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "msg": "No se pudo actualizar la garantia"}
+
+    try:
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (
+            data.usuario or "", "", sucursal, "SEGUIMIENTO GARANTIA",
+            f"#{garantia_id} {label} | {obs[:240]}",
+        ))
+    except Exception:
+        pass
+
+    conn.commit()
+    updated = _fetch_garantia_row(cur, garantia_id, sucursal)
+    conn.close()
+    return {
+        "ok": True,
+        "success": True,
+        "id": garantia_id,
+        "data": _jsonable_row(updated) if updated else {},
+        "documento_seguimiento": documento_seguimiento,
+    }
 
 
 @app.post("/garantias")
