@@ -192,6 +192,7 @@ def norm_sucursal(value: str = ""):
 
 
 DOCUMENT_EDIT_USERS = {"giomar"}
+SERIES_EDIT_USERS = {"giomar", "mily"}
 
 
 def norm_usuario_permiso(value=""):
@@ -205,6 +206,57 @@ def usuario_puede_editar_documento(data):
         if norm_usuario_permiso(data.get(key)) in DOCUMENT_EDIT_USERS:
             return True
     return False
+
+
+def usuario_puede_editar_series(data):
+    if not isinstance(data, dict):
+        return False
+    for key in ("usuario", "usuario_ingreso", "usuario_emisor", "usuario_registro", "usuario_edicion", "editor", "user"):
+        if norm_usuario_permiso(data.get(key)) in SERIES_EDIT_USERS:
+            return True
+    return False
+
+
+AUDITORIA_SERIES_MAX_ITEMS = 8
+AUDITORIA_SERIES_MAX_CHARS = 900
+
+
+def _resumen_lista_auditoria(items, max_items=AUDITORIA_SERIES_MAX_ITEMS):
+    clean = [str(x or "").strip() for x in (items or []) if str(x or "").strip()]
+    if not clean:
+        return "0"
+    if len(clean) <= max_items:
+        return ", ".join(clean)
+    visibles = ", ".join(clean[:max_items])
+    return f"{visibles} ... (+{len(clean) - max_items} mas, total {len(clean)})"
+
+
+def _recortar_detalle_auditoria(texto, max_chars=AUDITORIA_SERIES_MAX_CHARS):
+    text = str(texto or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+def registrar_auditoria_mercaderia(cur, usuario="", sucursal=DEFAULT_SUCURSAL, accion="", detalle="", commit=True):
+    """Un solo registro por operacion para no saturar el servidor."""
+    if not accion:
+        return
+    try:
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (
+            str(usuario or "SISTEMA").strip() or "SISTEMA",
+            "",
+            inventario_sucursal(sucursal),
+            str(accion).strip(),
+            _recortar_detalle_auditoria(detalle),
+        ))
+        if commit:
+            cur.connection.commit()
+    except Exception:
+        pass
 
 
 def _line_resumen_documento(item):
@@ -1186,6 +1238,7 @@ class SerieProducto(BaseModel):
 class SeriesMoverAlmacen(BaseModel):
     serie_ids: List[int]
     almacen: str
+    usuario: str = ""
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -3779,6 +3832,9 @@ def listar_series_duplicadas(sucursal: str = DEFAULT_SUCURSAL):
 
 @app.post("/series")
 def guardar_serie_producto(data: SerieProducto):
+    usuario_op = str(data.usuario_ingreso or "").strip()
+    if not usuario_puede_editar_series({"usuario_ingreso": usuario_op, "usuario": usuario_op}):
+        return {"ok": False, "msg": "Solo giomar y mily pueden ingresar, editar o eliminar series."}
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -3800,6 +3856,8 @@ def guardar_serie_producto(data: SerieProducto):
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         serie_ids = []
+        series_nuevas = []
+        series_actualizadas = []
         for serie in series:
             cur.execute("""
             SELECT id
@@ -3826,6 +3884,7 @@ def guardar_serie_producto(data: SerieProducto):
                     data.fecha_ingreso or lima_today_iso(), data.fecha_salida,
                     data.usuario_ingreso or "", data.usuario_ingreso or "", existing[0]
                 ))
+                series_actualizadas.append(serie)
             else:
                 cur.execute("""
                 INSERT INTO producto_series (
@@ -3837,6 +3896,7 @@ def guardar_serie_producto(data: SerieProducto):
                     data.producto_id, serie, data.proveedor, data.estado, almacen,
                     data.fecha_ingreso or lima_today_iso(), data.fecha_salida, sucursal, data.usuario_ingreso or ""
                 ))
+                series_nuevas.append(serie)
             serie_ids.append(cur.fetchone()[0])
 
         estado_serie = (data.estado or "").upper()
@@ -3858,18 +3918,19 @@ def guardar_serie_producto(data: SerieProducto):
 
         conn.commit()
 
-        # Log detallado de ingreso/actualizacion de series con mercaderia
-        try:
-            cur.execute("""
-            INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
-            VALUES (%s,%s,%s,%s,%s)
-            """, (
-                data.usuario_ingreso or "SISTEMA", "", sucursal, "INGRESO MERCADERIA / SERIES",
-                f"Usuario '{data.usuario_ingreso or 'SISTEMA'}' añadió las series [{', '.join(series)}] al producto '{prod_nombre}' (ID {data.producto_id}) | Estado: {data.estado} | Almacén: {almacen} | Fecha: {data.fecha_ingreso or 'hoy'}"
-            ))
-            conn.commit()
-        except:
-            pass
+        accion_audit = "SERIES_INGRESO" if series_nuevas and not series_actualizadas else "SERIES_ACTUALIZAR" if series_actualizadas and not series_nuevas else "SERIES_INGRESO_ACTUALIZAR"
+        registrar_auditoria_mercaderia(
+            cur,
+            usuario=usuario_op,
+            sucursal=sucursal,
+            accion=accion_audit,
+            detalle=(
+                f"Usuario={usuario_op or 'SISTEMA'} | Producto={prod_nombre} (ID {data.producto_id}) | "
+                f"Nuevas={len(series_nuevas)} [{_resumen_lista_auditoria(series_nuevas)}] | "
+                f"Actualizadas={len(series_actualizadas)} [{_resumen_lista_auditoria(series_actualizadas)}] | "
+                f"Estado={data.estado} | Almacen={almacen} | Proveedor={data.proveedor or '-'}"
+            ),
+        )
 
         conn.close()
         return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
@@ -3887,6 +3948,9 @@ def guardar_serie_producto(data: SerieProducto):
 
 @app.put("/series/{serie_id}")
 def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str = DEFAULT_SUCURSAL):
+    usuario_op = str(data.usuario_ingreso or "").strip()
+    if not usuario_puede_editar_series({"usuario_ingreso": usuario_op, "usuario": usuario_op}):
+        return {"ok": False, "msg": "Solo giomar y mily pueden ingresar, editar o eliminar series."}
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -3898,14 +3962,21 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
         cur.execute("""
-        SELECT producto_id FROM producto_series
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        """, (serie_id, DEFAULT_SUCURSAL, sucursal))
-        old = cur.fetchone()
-        if not old:
+        SELECT ps.producto_id,
+               COALESCE(ps.serie,'') AS serie,
+               COALESCE(ps.estado,'DISPONIBLE') AS estado,
+               COALESCE(ps.almacen,'TIENDA') AS almacen,
+               COALESCE(ps.proveedor,'') AS proveedor,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE ps.id=%s AND COALESCE(ps.sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, sucursal, serie_id, DEFAULT_SUCURSAL, sucursal))
+        old_row = dict_fetchone(cur)
+        if not old_row:
             conn.close()
             return {"ok": False, "msg": "Serie no encontrada"}
-        producto_anterior = old[0]
+        producto_anterior = old_row.get("producto_id")
 
         cur.execute("SELECT id FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
         if not cur.fetchone():
@@ -3976,18 +4047,21 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
 
         conn.commit()
 
-        # Log detallado también en actualización
-        try:
-            cur.execute("""
-            INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
-            VALUES (%s,%s,%s,%s,%s)
-            """, (
-                data.usuario_ingreso or "SISTEMA", "", sucursal, "INGRESO MERCADERIA / SERIES (UPDATE)",
-                f"Usuario '{data.usuario_ingreso or 'SISTEMA'}' actualizó serie '{serie}' del producto ID {data.producto_id} | Estado: {data.estado} | Almacén: {almacen}"
-            ))
-            conn.commit()
-        except:
-            pass
+        cur.execute("SELECT COALESCE(nombre,'') FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
+        prod_row = cur.fetchone()
+        prod_nombre = (prod_row[0] if prod_row else "") or f"ID {data.producto_id}"
+        registrar_auditoria_mercaderia(
+            cur,
+            usuario=usuario_op,
+            sucursal=sucursal,
+            accion="SERIES_EDITAR",
+            detalle=(
+                f"Usuario={usuario_op or 'SISTEMA'} | SerieID={serie_id} | "
+                f"Antes: {old_row.get('serie')} / {old_row.get('estado')} / {old_row.get('almacen')} / {old_row.get('proveedor') or '-'} / "
+                f"Producto={old_row.get('producto_nombre') or producto_anterior} | "
+                f"Despues: {serie} / {data.estado} / {almacen} / {data.proveedor or '-'} / Producto={prod_nombre} (ID {data.producto_id})"
+            ),
+        )
 
         conn.close()
         return {"ok": True, "success": True, "id": serie_id, "series_guardadas": [serie]}
@@ -4004,21 +4078,33 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
 
 
 @app.delete("/series/{serie_id}")
-def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
+def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL, usuario: str = ""):
+    if not usuario_puede_editar_series({"usuario": usuario, "usuario_ingreso": usuario}):
+        return {"ok": False, "msg": "Solo giomar y mily pueden ingresar, editar o eliminar series."}
     conn = get_conn()
     cur = conn.cursor()
     try:
         sucursal = inventario_sucursal(sucursal)
         cur.execute("""
-        DELETE FROM producto_series
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        RETURNING producto_id
-        """, (serie_id, DEFAULT_SUCURSAL, sucursal))
-        row = cur.fetchone()
-        if not row:
+        SELECT ps.producto_id,
+               COALESCE(ps.serie,'') AS serie,
+               COALESCE(ps.estado,'DISPONIBLE') AS estado,
+               COALESCE(ps.almacen,'TIENDA') AS almacen,
+               COALESCE(ps.proveedor,'') AS proveedor,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE ps.id=%s AND COALESCE(ps.sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, sucursal, serie_id, DEFAULT_SUCURSAL, sucursal))
+        old_row = dict_fetchone(cur)
+        if not old_row:
             conn.close()
             return {"ok": False, "msg": "Serie no encontrada"}
-        producto_id = row[0]
+        producto_id = old_row.get("producto_id")
+        cur.execute("""
+        DELETE FROM producto_series
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (serie_id, DEFAULT_SUCURSAL, sucursal))
         cur.execute("""
         UPDATE productos
         SET stock = (
@@ -4028,6 +4114,17 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL):
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
         conn.commit()
+        registrar_auditoria_mercaderia(
+            cur,
+            usuario=usuario,
+            sucursal=sucursal,
+            accion="SERIES_ELIMINAR",
+            detalle=(
+                f"Usuario={usuario or 'SISTEMA'} | SerieID={serie_id} | Serie={old_row.get('serie')} | "
+                f"Estado={old_row.get('estado')} | Almacen={old_row.get('almacen')} | "
+                f"Producto={old_row.get('producto_nombre') or producto_id} (ID {producto_id})"
+            ),
+        )
         conn.close()
         return {"ok": True, "success": True, "id": serie_id}
     except Exception as e:
@@ -4283,6 +4380,8 @@ def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_S
 
 @app.post("/series/mover-almacen")
 def mover_series_almacen(data: SeriesMoverAlmacen, sucursal: str = DEFAULT_SUCURSAL):
+    if not usuario_puede_editar_series({"usuario": data.usuario, "usuario_ingreso": data.usuario}):
+        return {"ok": False, "success": False, "msg": "Solo giomar y mily pueden ingresar, editar o eliminar series."}
     ids = [int(x) for x in (data.serie_ids or []) if str(x).strip()]
     almacen = (data.almacen or "").strip().upper()
     if not ids:
@@ -4295,6 +4394,14 @@ def mover_series_almacen(data: SeriesMoverAlmacen, sucursal: str = DEFAULT_SUCUR
         sucursal = inventario_sucursal(data.sucursal or sucursal)
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("""
+        SELECT ps.id, COALESCE(ps.serie,'') AS serie, COALESCE(ps.almacen,'TIENDA') AS almacen,
+               COALESCE(p.nombre,'') AS producto_nombre, ps.producto_id
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE ps.id = ANY(%s) AND COALESCE(ps.sucursal,%s)=%s
+        """, (DEFAULT_SUCURSAL, sucursal, ids, DEFAULT_SUCURSAL, sucursal))
+        antes = dict_fetchall(cur)
+        cur.execute("""
         UPDATE producto_series
         SET almacen=%s
         WHERE id = ANY(%s) AND COALESCE(sucursal,%s)=%s
@@ -4302,6 +4409,17 @@ def mover_series_almacen(data: SeriesMoverAlmacen, sucursal: str = DEFAULT_SUCUR
         """, (almacen, ids, DEFAULT_SUCURSAL, sucursal))
         rows = cur.fetchall()
         conn.commit()
+        series_txt = _resumen_lista_auditoria([f"{r.get('serie')} ({r.get('almacen')})" for r in antes])
+        registrar_auditoria_mercaderia(
+            cur,
+            usuario=data.usuario,
+            sucursal=sucursal,
+            accion="SERIES_MOVER_ALMACEN",
+            detalle=(
+                f"Usuario={data.usuario or 'SISTEMA'} | Cantidad={len(rows)} | Destino={almacen} | "
+                f"Series={series_txt}"
+            ),
+        )
         conn.close()
         return {"ok": True, "success": True, "actualizadas": len(rows), "almacen": almacen}
     except Exception as e:
@@ -6880,6 +6998,22 @@ def guardar_compra(data: Compra):
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal)
     proveedor = (data.proveedor_nombre or data.proveedor or "").strip()
+    compra_tiene_series = False
+    for item in (data.items or []):
+        raw_series_list = item.get("series_list")
+        series_texto = item.get("series_texto", "")
+        if isinstance(raw_series_list, list) and any(str(s).strip() for s in raw_series_list):
+            compra_tiene_series = True
+            break
+        if series_texto and str(series_texto).strip():
+            compra_tiene_series = True
+            break
+    if compra_tiene_series and not usuario_puede_editar_series({
+        "usuario": data.usuario or data.usuario_registro,
+        "usuario_registro": data.usuario_registro or data.usuario,
+    }):
+        conn.close()
+        return {"ok": False, "msg": "Solo giomar y mily pueden ingresar series en compras."}
     # Guardar proveedor si no existe
     if proveedor:
         cur.execute("""
@@ -6896,6 +7030,8 @@ def guardar_compra(data: Compra):
         data.usuario_registro or data.usuario or "", data.detalle or "", sucursal
     ))
     compra_id = cur.fetchone()[0]
+    usuario_op = str(data.usuario_registro or data.usuario or "").strip()
+    resumen_series_compra = []
 
     # Procesar items: agregar al inventario y series
     for item in (data.items or []):
@@ -6928,18 +7064,27 @@ def guardar_compra(data: Compra):
                         INSERT INTO producto_series (producto_id, serie, proveedor, estado, almacen, fecha_ingreso, sucursal, usuario_ingreso)
                         VALUES (%s, %s, %s, 'DISPONIBLE', 'TIENDA', CURRENT_DATE, %s, %s)
                         ON CONFLICT DO NOTHING
-                    """, (prod_id, serie, proveedor, sucursal, data.usuario or ""))
-                    # Log detailed
-                    try:
-                        cur.execute("""
-                            INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
-                            VALUES (%s,%s,%s,%s,%s)
-                        """, (data.usuario or "", "", sucursal, "INGRESO MERCADERIA COMPRA",
-                              f"Compra {compra_id} - Producto ID {prod_id} Serie {serie} - Proveedor {proveedor}"))
-                    except:
-                        pass
+                    """, (prod_id, serie, proveedor, sucursal, usuario_op))
+                resumen_series_compra.append(
+                    f"{nombre or f'ID {prod_id}'} x{len(series_list)} [{_resumen_lista_auditoria(series_list, max_items=4)}]"
+                )
 
     conn.commit()
+    accion_compra = "COMPRA_SERIES_INGRESO" if resumen_series_compra else "COMPRA_REGISTRADA"
+    detalle_compra = (
+        f"Usuario={usuario_op or 'SISTEMA'} | CompraID={compra_id} | Proveedor={proveedor or '-'} | "
+        f"Comprobante={data.comprobante or '-'} | Total={float(data.total or 0):.2f} | "
+        f"Productos={len(data.items or [])}"
+    )
+    if resumen_series_compra:
+        detalle_compra += f" | Series={_resumen_lista_auditoria(resumen_series_compra, max_items=5)}"
+    registrar_auditoria_mercaderia(
+        cur,
+        usuario=usuario_op,
+        sucursal=sucursal,
+        accion=accion_compra,
+        detalle=detalle_compra,
+    )
     conn.close()
     return {"ok": True, "success": True, "id": compra_id}
 
