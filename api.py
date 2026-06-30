@@ -191,7 +191,7 @@ def norm_sucursal(value: str = ""):
     return value or DEFAULT_SUCURSAL
 
 
-DOCUMENT_EDIT_USERS = {"giomar", "jean", "mily"}
+DOCUMENT_EDIT_USERS = {"giomar"}
 
 
 def norm_usuario_permiso(value=""):
@@ -205,6 +205,46 @@ def usuario_puede_editar_documento(data):
         if norm_usuario_permiso(data.get(key)) in DOCUMENT_EDIT_USERS:
             return True
     return False
+
+
+def _line_resumen_documento(item):
+    if not isinstance(item, dict):
+        return {}
+    return {
+        "descripcion": str(item.get("descripcion") or item.get("nombre") or "").strip().upper(),
+        "cantidad": int(float(item.get("cantidad") or 0)),
+        "precio": round(float(item.get("precio") or item.get("precio_unitario") or 0), 2),
+        "series": str(item.get("series_texto") or item.get("serie") or "").strip().upper(),
+    }
+
+
+def _resumen_cambios_documento(old_items, new_items):
+    parts = []
+    old_rows = [_line_resumen_documento(x) for x in (old_items or [])]
+    new_rows = [_line_resumen_documento(x) for x in (new_items or [])]
+    max_len = max(len(old_rows), len(new_rows), 0)
+    for i in range(max_len):
+        old = old_rows[i] if i < len(old_rows) else None
+        new = new_rows[i] if i < len(new_rows) else None
+        n = i + 1
+        if old is None and new:
+            parts.append(f"L{n} agregado: {new['descripcion']} x{new['cantidad']} @ {new['precio']}")
+            continue
+        if new is None and old:
+            parts.append(f"L{n} quitado: {old['descripcion']}")
+            continue
+        line_changes = []
+        if old["descripcion"] != new["descripcion"]:
+            line_changes.append(f"desc {old['descripcion']} -> {new['descripcion']}")
+        if old["cantidad"] != new["cantidad"]:
+            line_changes.append(f"cant {old['cantidad']} -> {new['cantidad']}")
+        if old["precio"] != new["precio"]:
+            line_changes.append(f"precio {old['precio']} -> {new['precio']}")
+        if old["series"] != new["series"]:
+            line_changes.append("series cambiadas")
+        if line_changes:
+            parts.append(f"L{n}: " + "; ".join(line_changes))
+    return " | ".join(parts[:14])
 
 
 def inventario_sucursal(value: str = ""):
@@ -5293,7 +5333,28 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             return {"ok": False, "success": False, "msg": "No se puede editar un documento anulado."}
         if not usuario_puede_editar_documento(data):
             conn.close()
-            return {"ok": False, "success": False, "msg": "Solo Giomar, Jean o Mily pueden cambiar boletas/facturas ya procesadas."}
+            return {"ok": False, "success": False, "msg": "Solo Giomar puede cambiar boletas/facturas ya procesadas."}
+
+        motivo_cambio = str(data.get("observacion_cambio") or data.get("motivo_cambio") or "").strip()
+        if not motivo_cambio:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Debes indicar la observacion del cambio antes de guardar."}
+
+        cur.execute("""
+        SELECT COALESCE(observacion_interna,'')
+        FROM ventas
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (documento_id, DEFAULT_SUCURSAL, sucursal))
+        obs_row = cur.fetchone()
+        observacion_interna_prev = str(obs_row[0] if obs_row else "").strip()
+
+        cur.execute("""
+        SELECT descripcion, marca, modelo, series_texto, cantidad, precio, total
+        FROM ventas_detalle
+        WHERE venta_id=%s
+        ORDER BY id
+        """, (documento_id,))
+        detalle_previo = dict_fetchall(cur)
 
         items = data.get("items") or data.get("detalle") or []
         if not isinstance(items, list) or not items:
@@ -5373,6 +5434,16 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                 "series_texto": series_texto,
             })
 
+        usuario_edit = str(
+            data.get("usuario_emisor") or data.get("usuario") or data.get("editor") or data.get("user") or "giomar"
+        ).strip() or "giomar"
+        resumen_cambios = _resumen_cambios_documento(detalle_previo, prepared_items)
+        stamp = lima_now().strftime("%Y-%m-%d %H:%M")
+        log_line = f"[{stamp}] {usuario_edit.upper()}: {motivo_cambio}"
+        if resumen_cambios:
+            log_line += f" | {resumen_cambios}"
+        observacion_interna_nueva = f"{observacion_interna_prev}\n{log_line}".strip() if observacion_interna_prev else log_line
+
         cur.execute("""
         UPDATE ventas
         SET cliente=%s,
@@ -5382,6 +5453,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             igv=%s,
             total=%s,
             observacion=%s,
+            observacion_interna=%s,
             fecha_vencimiento=%s,
             usuario_emisor=COALESCE(NULLIF(%s,''), usuario_emisor),
             sucursal=%s
@@ -5395,6 +5467,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             igv,
             total,
             data.get("observacion") or "",
+            observacion_interna_nueva,
             fecha_vencimiento,
             data.get("usuario_emisor") or "",
             sucursal_doc,
@@ -5420,10 +5493,13 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                 item.get("cantidad"), item.get("precio"), item.get("total"), sucursal_doc
             ))
 
+        detalle_audit = f"{tipo_actual} {numero_actual} editado por {usuario_edit.upper()}. Motivo: {motivo_cambio}"
+        if resumen_cambios:
+            detalle_audit += f" | {resumen_cambios}"
         cur.execute("""
         INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
         VALUES (%s,%s,%s,%s,%s)
-        """, (data.get("usuario_emisor") or "", "", sucursal_doc, "DOCUMENTO ACTUALIZADO", f"{tipo_actual} {numero_actual} - {total}"))
+        """, (usuario_edit, "", sucursal_doc, "DOCUMENTO ACTUALIZADO", detalle_audit))
 
         conn.commit()
         conn.close()
@@ -5454,6 +5530,9 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(sucursal)
+        if not usuario_puede_editar_documento({"usuario": getattr(data, "usuario", "")}):
+            conn.close()
+            return {"ok": False, "msg": "Solo Giomar puede cambiar series de boletas ya procesadas."}
         series_texto = (data.series_texto or "").strip()
         cur.execute("""
         UPDATE ventas_detalle
