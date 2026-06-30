@@ -5028,7 +5028,7 @@ function ComprasView({ user }) {
         await load();
         await loadProveedores();
       } else {
-        alert(res.msg || 'Error al guardar compra');
+        alert(res.msg || res.detail || 'Error al guardar compra');
       }
     } catch (e) {
       alert('Error: ' + e.message);

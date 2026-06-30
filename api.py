@@ -7346,112 +7346,144 @@ def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
 def guardar_compra(data: Compra):
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(data.sucursal)
-    proveedor = (data.proveedor_nombre or data.proveedor or "").strip()
-    compra_tiene_series = False
-    for item in (data.items or []):
-        raw_series_list = item.get("series_list")
-        series_texto = item.get("series_texto", "")
-        if isinstance(raw_series_list, list) and any(str(s).strip() for s in raw_series_list):
-            compra_tiene_series = True
-            break
-        if series_texto and str(series_texto).strip():
-            compra_tiene_series = True
-            break
-    if compra_tiene_series and not usuario_puede_editar_series({
-        "usuario": data.usuario or data.usuario_registro,
-        "usuario_registro": data.usuario_registro or data.usuario,
-    }):
-        conn.close()
-        return {"ok": False, "msg": "Solo giomar y mily pueden ingresar series en compras."}
-    # Guardar proveedor si no existe
-    if proveedor:
-        cur.execute("""
-            INSERT INTO proveedores (nombre, sucursal)
-            VALUES (%s, %s)
-            ON CONFLICT (nombre, sucursal) DO NOTHING
-        """, (proveedor, sucursal))
-    cur.execute("""
-    INSERT INTO compras (proveedor_nombre, comprobante, total, usuario_registro, detalle, sucursal)
-    VALUES (%s,%s,%s,%s,%s,%s)
-    RETURNING id
-    """, (
-        proveedor, data.comprobante or "", float(data.total or 0),
-        data.usuario_registro or data.usuario or "", data.detalle or "", sucursal
-    ))
-    compra_id = cur.fetchone()[0]
-    usuario_op = str(data.usuario_registro or data.usuario or "").strip()
-    resumen_series_compra = []
+    try:
+        sucursal = norm_sucursal(data.sucursal)
+        inv_sucursal = inventario_sucursal(sucursal)
+        proveedor = (data.proveedor_nombre or data.proveedor or "").strip()
+        compra_tiene_series = False
+        for item in (data.items or []):
+            raw_series_list = item.get("series_list")
+            series_texto = item.get("series_texto", "")
+            if isinstance(raw_series_list, list) and any(str(s).strip() for s in raw_series_list):
+                compra_tiene_series = True
+                break
+            if series_texto and str(series_texto).strip():
+                compra_tiene_series = True
+                break
+        if compra_tiene_series and not usuario_puede_editar_series({
+            "usuario": data.usuario or data.usuario_registro,
+            "usuario_registro": data.usuario_registro or data.usuario,
+        }):
+            return {"ok": False, "msg": "Solo giomar y mily pueden ingresar series en compras."}
 
-    # Procesar items: agregar al inventario y series
-    for item in (data.items or []):
-        prod_id = int(item.get("producto_id") or 0)
-        nombre = str(item.get("nombre", "") or "").strip()
-        cantidad = int(item.get("cantidad") or 1)
-        precio = float(item.get("precio") or 0)
-        if not prod_id and nombre:
+        if proveedor:
             cur.execute("""
-                INSERT INTO productos (nombre, categoria, marca, modelo, precio_compra, precio_venta, stock, imagen_url, observacion, almacen, sucursal, sku_woo)
-                VALUES (%s,%s,%s,%s,%s,%s,0,'','','TIENDA',%s,'')
-                RETURNING id
-            """, (
-                nombre,
-                str(item.get("categoria") or "").strip(),
-                str(item.get("marca") or "").strip(),
-                str(item.get("modelo") or "").strip(),
-                precio,
-                float(item.get("precio_venta") or item.get("precio") or 0),
-                sucursal,
-            ))
-            prod_id = int(cur.fetchone()[0])
-        series_texto = item.get("series_texto", "")
-        raw_series_list = item.get("series_list")
-        if isinstance(raw_series_list, list):
-            series_list = [str(s).strip().upper() for s in raw_series_list if str(s).strip()]
-        elif series_texto:
-            series_list = [s.strip().upper() for s in series_texto.replace("\n", ",").split(",") if s.strip()]
-        else:
-            series_list = []
-        if series_list and len(series_list) != cantidad:
-            conn.rollback()
-            conn.close()
-            return {"ok": False, "msg": f"{nombre or 'Producto'}: se requieren {cantidad} serie(s), recibidas {len(series_list)}"}
-        if prod_id:
-            # Actualizar stock
-            cur.execute("""
-                UPDATE productos SET stock = COALESCE(stock,0) + %s
-                WHERE id=%s AND COALESCE(sucursal,%s)=%s
-            """, (cantidad, prod_id, DEFAULT_SUCURSAL, sucursal))
-            # Agregar series si hay
+                SELECT id FROM proveedores
+                WHERE LOWER(TRIM(COALESCE(nombre,''))) = LOWER(TRIM(%s))
+                  AND COALESCE(sucursal,%s)=%s
+                LIMIT 1
+            """, (proveedor, DEFAULT_SUCURSAL, sucursal))
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO proveedores (nombre, sucursal) VALUES (%s,%s)",
+                    (proveedor, sucursal),
+                )
+
+        cur.execute("""
+        INSERT INTO compras (proveedor_nombre, comprobante, total, usuario_registro, detalle, sucursal)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        RETURNING id
+        """, (
+            proveedor, data.comprobante or "", float(data.total or 0),
+            data.usuario_registro or data.usuario or "", data.detalle or "", sucursal
+        ))
+        compra_id = cur.fetchone()[0]
+        usuario_op = str(data.usuario_registro or data.usuario or "").strip()
+        resumen_series_compra = []
+
+        for item in (data.items or []):
+            try:
+                prod_id = int(item.get("producto_id") or 0)
+            except (TypeError, ValueError):
+                prod_id = 0
+            nombre = str(item.get("nombre", "") or "").strip()
+            try:
+                cantidad = max(1, int(float(item.get("cantidad") or 1)))
+            except (TypeError, ValueError):
+                cantidad = 1
+            try:
+                precio = float(item.get("precio") or 0)
+            except (TypeError, ValueError):
+                precio = 0.0
+            try:
+                precio_venta = float(item.get("precio_venta") or item.get("precio") or 0)
+            except (TypeError, ValueError):
+                precio_venta = precio
+
+            if not prod_id and nombre:
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+                cur.execute("""
+                    INSERT INTO productos (nombre, categoria, marca, modelo, precio_compra, precio_venta, stock, imagen_url, observacion, almacen, sucursal, sku_woo)
+                    VALUES (%s,%s,%s,%s,%s,%s,0,'','','TIENDA',%s,'')
+                    RETURNING id
+                """, (
+                    nombre,
+                    str(item.get("categoria") or "").strip(),
+                    str(item.get("marca") or "").strip(),
+                    str(item.get("modelo") or "").strip(),
+                    precio,
+                    precio_venta,
+                    inv_sucursal,
+                ))
+                prod_id = int(cur.fetchone()[0])
+
+            series_texto = item.get("series_texto", "")
+            raw_series_list = item.get("series_list")
+            if isinstance(raw_series_list, list):
+                series_list = [str(s).strip().upper() for s in raw_series_list if str(s).strip()]
+            elif series_texto:
+                series_list = [s.strip().upper() for s in series_texto.replace("\n", ",").split(",") if s.strip()]
+            else:
+                series_list = []
+
+            if series_list and len(series_list) != cantidad:
+                conn.rollback()
+                return {"ok": False, "msg": f"{nombre or 'Producto'}: se requieren {cantidad} serie(s), recibidas {len(series_list)}"}
+
+            if not prod_id:
+                continue
+
             if series_list:
                 for serie in series_list:
                     cur.execute("""
                         INSERT INTO producto_series (producto_id, serie, proveedor, estado, almacen, fecha_ingreso, sucursal, usuario_ingreso)
-                        VALUES (%s, %s, %s, 'DISPONIBLE', 'TIENDA', CURRENT_DATE, %s, %s)
-                        ON CONFLICT DO NOTHING
-                    """, (prod_id, serie, proveedor, sucursal, usuario_op))
+                        VALUES (%s, %s, %s, 'DISPONIBLE', 'TIENDA', TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'), %s, %s)
+                    """, (prod_id, serie, proveedor, inv_sucursal, usuario_op))
+                sync_producto_stock_from_series(cur, prod_id, inv_sucursal)
                 resumen_series_compra.append(
                     f"{nombre or f'ID {prod_id}'} x{len(series_list)} [{_resumen_lista_auditoria(series_list, max_items=4)}]"
                 )
+            else:
+                cur.execute("""
+                    UPDATE productos SET stock = COALESCE(stock,0) + %s
+                    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+                """, (cantidad, prod_id, DEFAULT_SUCURSAL, inv_sucursal))
 
-    conn.commit()
-    accion_compra = "COMPRA_SERIES_INGRESO" if resumen_series_compra else "COMPRA_REGISTRADA"
-    detalle_compra = (
-        f"Usuario={usuario_op or 'SISTEMA'} | CompraID={compra_id} | Proveedor={proveedor or '-'} | "
-        f"Comprobante={data.comprobante or '-'} | Total={float(data.total or 0):.2f} | "
-        f"Productos={len(data.items or [])}"
-    )
-    if resumen_series_compra:
-        detalle_compra += f" | Series={_resumen_lista_auditoria(resumen_series_compra, max_items=5)}"
-    registrar_auditoria_mercaderia(
-        cur,
-        usuario=usuario_op,
-        sucursal=sucursal,
-        accion=accion_compra,
-        detalle=detalle_compra,
-    )
-    conn.close()
-    return {"ok": True, "success": True, "id": compra_id}
+        accion_compra = "COMPRA_SERIES_INGRESO" if resumen_series_compra else "COMPRA_REGISTRADA"
+        detalle_compra = (
+            f"Usuario={usuario_op or 'SISTEMA'} | CompraID={compra_id} | Proveedor={proveedor or '-'} | "
+            f"Comprobante={data.comprobante or '-'} | Total={float(data.total or 0):.2f} | "
+            f"Productos={len(data.items or [])}"
+        )
+        if resumen_series_compra:
+            detalle_compra += f" | Series={_resumen_lista_auditoria(resumen_series_compra, max_items=5)}"
+        registrar_auditoria_mercaderia(
+            cur,
+            usuario=usuario_op,
+            sucursal=sucursal,
+            accion=accion_compra,
+            detalle=detalle_compra,
+            commit=False,
+        )
+        conn.commit()
+        return {"ok": True, "success": True, "id": compra_id}
+    except Exception as exc:
+        conn.rollback()
+        return {"ok": False, "msg": f"Error al guardar compra: {exc}"}
+    finally:
+        conn.close()
 
 
 # ================= WOOCOMMERCE POR SUCURSAL =================
