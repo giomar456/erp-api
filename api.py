@@ -6803,6 +6803,17 @@ def guardar_compra(data: Compra):
         cantidad = int(item.get("cantidad") or 1)
         precio = float(item.get("precio") or 0)
         series_texto = item.get("series_texto", "")
+        raw_series_list = item.get("series_list")
+        if isinstance(raw_series_list, list):
+            series_list = [str(s).strip().upper() for s in raw_series_list if str(s).strip()]
+        elif series_texto:
+            series_list = [s.strip().upper() for s in series_texto.replace("\n", ",").split(",") if s.strip()]
+        else:
+            series_list = []
+        if series_list and len(series_list) != cantidad:
+            conn.rollback()
+            conn.close()
+            return {"ok": False, "msg": f"{nombre or 'Producto'}: se requieren {cantidad} serie(s), recibidas {len(series_list)}"}
         if prod_id:
             # Actualizar stock
             cur.execute("""
@@ -6810,8 +6821,7 @@ def guardar_compra(data: Compra):
                 WHERE id=%s AND COALESCE(sucursal,%s)=%s
             """, (cantidad, prod_id, DEFAULT_SUCURSAL, sucursal))
             # Agregar series si hay
-            if series_texto:
-                series_list = [s.strip() for s in series_texto.replace("\n", ",").split(",") if s.strip()]
+            if series_list:
                 for serie in series_list:
                     cur.execute("""
                         INSERT INTO producto_series (producto_id, serie, proveedor, estado, almacen, fecha_ingreso, sucursal, usuario_ingreso)
@@ -7596,6 +7606,149 @@ def _aplicar_cambio_garantia(cur, garantia_id, data: Garantia, sucursal):
     return None
 
 
+def _marcar_serie_garantia(cur, serie_texto, sucursal):
+    serie_norm = normalize_serie_key(serie_texto)
+    if not serie_norm:
+        return
+    sucursal_inv = inventario_sucursal(sucursal)
+    cur.execute(f"""
+    UPDATE producto_series
+    SET estado='GARANTIA',
+        almacen='GARANTIA'
+    WHERE COALESCE(sucursal,%s)=%s
+      AND {SERIE_SQL_KEY}=%s
+    """, (DEFAULT_SUCURSAL, sucursal_inv, serie_norm))
+
+
+@app.get("/garantias/buscar-serie")
+def buscar_serie_garantia(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    serie_q = str(q or "").strip()
+    if not serie_q:
+        return {"ok": False, "msg": "Serie requerida"}
+    sucursal = norm_sucursal(sucursal)
+    sucursal_inv = inventario_sucursal(sucursal)
+    serie_norm = normalize_serie_key(serie_q)
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+        SELECT
+            ps.id,
+            ps.producto_id,
+            COALESCE(p.nombre,'') AS producto_nombre,
+            COALESCE(p.marca,'') AS marca,
+            COALESCE(p.modelo,'') AS modelo,
+            COALESCE(p.categoria,'') AS categoria,
+            COALESCE(p.imagen_url,'') AS imagen_url,
+            COALESCE(p.stock,0) AS stock,
+            ps.serie,
+            ps.proveedor,
+            ps.estado,
+            COALESCE(ps.almacen,'TIENDA') AS almacen,
+            ps.fecha_ingreso,
+            ps.fecha_salida
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id = ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND ({SERIE_SQL_KEY}=%s OR LOWER(COALESCE(ps.serie,'')) LIKE %s)
+        ORDER BY CASE WHEN {SERIE_SQL_KEY}=%s THEN 0 ELSE 1 END, ps.id DESC
+        LIMIT 5
+        """, (
+            DEFAULT_SUCURSAL, sucursal_inv,
+            DEFAULT_SUCURSAL, sucursal_inv,
+            serie_norm, f"%{serie_q.lower()}%",
+            serie_norm,
+        ))
+        series_rows = dict_fetchall(cur)
+        if not series_rows:
+            conn.close()
+            return {"ok": False, "msg": f"No se encontro la serie {serie_q}"}
+
+        serie_row = series_rows[0]
+        producto_id = int(serie_row.get("producto_id") or 0)
+
+        boleta = None
+        cur.execute("""
+        SELECT
+            v.id,
+            v.tipo,
+            v.numero,
+            COALESCE(v.cliente,'') AS cliente_nombre,
+            COALESCE(v.documento_cliente,'') AS documento_cliente,
+            to_char(v.fecha, 'YYYY-MM-DD') AS fecha_emision,
+            COALESCE(v.total,0) AS total,
+            vd.id AS detalle_id,
+            COALESCE(vd.descripcion,'') AS descripcion,
+            COALESCE(vd.marca,'') AS marca,
+            COALESCE(vd.modelo,'') AS modelo,
+            COALESCE(vd.series_texto,'') AS series_texto,
+            COALESCE(vd.cantidad,0) AS cantidad,
+            COALESCE(vd.precio,0) AS precio_unitario,
+            COALESCE(vd.total,0) AS linea_total,
+            COALESCE(vd.producto_id,0) AS producto_id
+        FROM ventas_detalle vd
+        JOIN ventas v ON v.id = vd.venta_id
+        WHERE COALESCE(v.sucursal,%s)=%s
+          AND COALESCE(vd.sucursal,%s)=%s
+          AND COALESCE(vd.series_texto,'')<>''
+          AND (
+            LOWER(COALESCE(vd.series_texto,'')) LIKE %s
+            OR (%s <> '' AND POSITION(%s IN regexp_replace(UPPER(COALESCE(vd.series_texto,'')), '[^A-Z0-9]', '', 'g')) > 0)
+          )
+        ORDER BY v.id DESC
+        LIMIT 30
+        """, (
+            DEFAULT_SUCURSAL, sucursal,
+            DEFAULT_SUCURSAL, sucursal,
+            f"%{serie_q.lower()}%",
+            serie_norm, serie_norm,
+        ))
+        doc_candidates = dict_fetchall(cur)
+        for doc_row in doc_candidates:
+            series_doc = split_series_text(doc_row.get("series_texto"))
+            if serie_norm in series_doc:
+                boleta = _jsonable_row(doc_row)
+                break
+        if not boleta and doc_candidates:
+            boleta = _jsonable_row(doc_candidates[0])
+
+        series_disponibles = []
+        if producto_id:
+            cur.execute(f"""
+            SELECT ps.id, ps.serie, ps.estado, COALESCE(ps.almacen,'TIENDA') AS almacen, ps.fecha_ingreso
+            FROM producto_series ps
+            WHERE ps.producto_id=%s AND COALESCE(ps.sucursal,%s)=%s
+              AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+              AND %s <> '' AND {SERIE_SQL_KEY} <> %s
+            ORDER BY
+                CASE UPPER(COALESCE(ps.estado,'DISPONIBLE')) WHEN 'DISPONIBLE' THEN 0 ELSE 1 END,
+                ps.id DESC
+            """, (producto_id, DEFAULT_SUCURSAL, sucursal_inv, serie_norm, serie_norm))
+            series_disponibles = dict_fetchall(cur)
+
+        producto = {
+            "id": producto_id,
+            "nombre": serie_row.get("producto_nombre") or "",
+            "marca": serie_row.get("marca") or "",
+            "modelo": serie_row.get("modelo") or "",
+            "categoria": serie_row.get("categoria") or "",
+            "imagen_url": serie_row.get("imagen_url") or "",
+            "stock": int(serie_row.get("stock") or 0),
+        }
+        conn.close()
+        return {
+            "ok": True,
+            "success": True,
+            "serie": _jsonable_row(serie_row),
+            "producto": producto,
+            "boleta": boleta,
+            "series_disponibles": [_jsonable_row(r) for r in series_disponibles],
+        }
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "msg": str(e)}
+
+
 @app.get("/garantias")
 def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -7657,6 +7810,8 @@ def guardar_garantia(data: Garantia):
         max(0, int(data.cantidad_cambio or 0)), float(data.diferencia_precio or 0)
     ))
     garantia_id = cur.fetchone()[0]
+    if data.serie:
+        _marcar_serie_garantia(cur, data.serie, sucursal)
     error_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
     if error_cambio:
         conn.rollback()
