@@ -78,6 +78,15 @@ const emptyProduct = {
   imagen_url: '',
 };
 
+const emptyCompraProductForm = {
+  nombre: '',
+  categoria: '',
+  marca: '',
+  modelo: '',
+  precio_compra: '',
+  precio_venta: '',
+};
+
 function NavIcon({ name, className = 'h-5 w-5' }) {
   const common = {
     fill: 'none',
@@ -4809,6 +4818,11 @@ function ComprasView({ user }) {
   const [selectedItemIndex, setSelectedItemIndex] = useState(null);
   const [loading, setLoading] = useState(false);
   const [creatingProveedor, setCreatingProveedor] = useState(false);
+  const [newProductOpen, setNewProductOpen] = useState(false);
+  const [newProductForm, setNewProductForm] = useState(emptyCompraProductForm);
+  const [newProductCategory, setNewProductCategory] = useState('');
+  const [newCategoryInputOpen, setNewCategoryInputOpen] = useState(false);
+  const [creatingProduct, setCreatingProduct] = useState(false);
   const [msg, setMsg] = useState('');
 
   const load = async () => setCompras(asArray(await apiFetch('/compras')));
@@ -4823,8 +4837,13 @@ function ComprasView({ user }) {
   );
   const showCreateProveedor = proveedorNombre && !proveedor.id && !proveedorExiste;
 
+  const productCategories = useMemo(
+    () => [...new Set(products.map((p) => String(p.categoria || '').trim()).filter(Boolean))].sort(),
+    [products],
+  );
   const filteredProducts = filterProductsBySearch(products, productQuery, { limit: 12 });
   const showProductSuggestions = productQuery.trim().length > 0;
+  const showCreateProductHint = productQuery.trim().length > 0 && !filteredProducts.length;
 
   const addProduct = (p) => {
     setCompraItems((current) => {
@@ -4869,6 +4888,61 @@ function ComprasView({ user }) {
     setCompraItems((current) => current.filter((_, i) => i !== idx));
     if (selectedItemIndex === idx) setSelectedItemIndex(null);
     else if (selectedItemIndex > idx) setSelectedItemIndex(selectedItemIndex - 1);
+  };
+
+  const openNewProduct = (prefillName = '') => {
+    const clean = String(prefillName || productQuery || '').trim();
+    setNewProductForm({
+      ...emptyCompraProductForm,
+      nombre: clean,
+    });
+    setNewProductCategory('');
+    setNewCategoryInputOpen(false);
+    setNewProductOpen(true);
+  };
+
+  const createProductAndAdd = async () => {
+    const nombre = newProductForm.nombre.trim();
+    if (!nombre) return alert('Ingresa el nombre del producto.');
+    setCreatingProduct(true);
+    try {
+      const payload = {
+        nombre,
+        categoria: newProductForm.categoria.trim(),
+        marca: newProductForm.marca.trim(),
+        modelo: newProductForm.modelo.trim(),
+        precio_compra: Number(newProductForm.precio_compra || 0),
+        precio_venta: Number(newProductForm.precio_venta || newProductForm.precio_compra || 0),
+        stock: 0,
+        almacen: 'TIENDA',
+      };
+      const res = await apiFetch('/productos', { method: 'POST', json: payload });
+      if (!okResponse(res)) {
+        alert(res.msg || 'No se pudo crear el producto');
+        return;
+      }
+      const rows = asArray(await apiFetch('/productos'));
+      setProducts(rows);
+      const created = rows.find((p) => String(p.id) === String(res.id)) || {
+        id: res.id,
+        nombre: payload.nombre,
+        categoria: payload.categoria,
+        marca: payload.marca,
+        modelo: payload.modelo,
+        precio_compra: payload.precio_compra,
+        precio_venta: payload.precio_venta,
+        stock: 0,
+      };
+      addProduct(created);
+      setNewProductOpen(false);
+      setNewProductForm(emptyCompraProductForm);
+      setNewProductCategory('');
+      setNewCategoryInputOpen(false);
+      setMsg(`Producto "${nombre}" creado y agregado a la compra.`);
+    } catch (e) {
+      alert('Error: ' + e.message);
+    }
+    setCreatingProduct(false);
   };
 
   const createProveedorManual = async () => {
@@ -4921,6 +4995,10 @@ function ComprasView({ user }) {
         return {
           producto_id: item.producto_id,
           nombre: item.nombre,
+          categoria: item.categoria || '',
+          marca: item.marca || '',
+          modelo: item.modelo || '',
+          precio_venta: Number(item.precio_venta || item.precio) || 0,
           cantidad: Number(item.cantidad) || 1,
           precio: Number(item.precio) || 0,
           series_list: series,
@@ -5098,6 +5176,12 @@ function ComprasView({ user }) {
           })()}
 
           <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-bold uppercase text-slate-500">Agregar productos a la compra</div>
+              <ActionButton tone="violet" className="!min-h-9 !px-3 !py-1.5 text-xs" onClick={() => openNewProduct('')}>
+                + Nuevo producto
+              </ActionButton>
+            </div>
             {showProductSuggestions && (
               <div className="mb-3 max-h-[28vh] overflow-auto rounded-md border border-slate-200 bg-white">
                 {filteredProducts.map((p) => (
@@ -5118,6 +5202,15 @@ function ComprasView({ user }) {
                 {!filteredProducts.length && <Empty text="No hay productos con esa busqueda." />}
               </div>
             )}
+            {showCreateProductHint && (
+              <div className="mb-3 rounded-md border border-violet-200 bg-violet-50 p-3">
+                <div className="text-xs font-bold uppercase text-violet-800">Este producto no esta en el sistema</div>
+                <div className="mt-1 text-sm font-black uppercase text-slate-900">{productQuery.trim()}</div>
+                <ActionButton tone="violet" className="mt-2" disabled={creatingProduct} onClick={() => openNewProduct(productQuery.trim())}>
+                  {creatingProduct ? 'Creando...' : 'Crear producto y agregar a compra'}
+                </ActionButton>
+              </div>
+            )}
             <TextInput placeholder="Buscar producto..." value={productQuery} onChange={(e) => setProductQuery(e.target.value)} className="h-12 text-lg" />
           </div>
 
@@ -5136,6 +5229,88 @@ function ComprasView({ user }) {
           {msg && <div className="text-sm font-bold text-emerald-700">{msg}</div>}
         </div>
       </Card>
+
+      {newProductOpen && (
+        <Modal title="Nuevo producto para compra" onClose={() => !creatingProduct && setNewProductOpen(false)}>
+          <div className="grid gap-3">
+            <Field label="Nombre">
+              <TextInput
+                value={newProductForm.nombre}
+                onChange={(e) => setNewProductForm({ ...newProductForm, nombre: e.target.value })}
+                className="font-black uppercase"
+                placeholder="Ej: MEMORIA DDR4 16GB KINGSTON"
+              />
+            </Field>
+            <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+              <Field label="Categoria">
+                <SelectInput
+                  value={newProductForm.categoria}
+                  onChange={(e) => setNewProductForm({ ...newProductForm, categoria: e.target.value })}
+                >
+                  <option value="">Sin categoria</option>
+                  {productCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+                </SelectInput>
+              </Field>
+              <ActionButton tone="violet" className="self-end" onClick={() => setNewCategoryInputOpen(true)}>
+                Nueva categoria
+              </ActionButton>
+            </div>
+            {newCategoryInputOpen && (
+              <div className="grid gap-2 rounded-md bg-violet-50 p-2 sm:grid-cols-[1fr_auto]">
+                <TextInput
+                  placeholder="Nombre de categoria nueva"
+                  value={newProductCategory}
+                  onChange={(e) => setNewProductCategory(e.target.value)}
+                  className="uppercase"
+                />
+                <ActionButton
+                  tone="violet"
+                  onClick={() => {
+                    const name = newProductCategory.trim().toUpperCase();
+                    if (!name) return;
+                    setNewProductForm((current) => ({ ...current, categoria: name }));
+                    setNewProductCategory('');
+                    setNewCategoryInputOpen(false);
+                  }}
+                >
+                  Agregar
+                </ActionButton>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Marca"><TextInput value={newProductForm.marca} onChange={(e) => setNewProductForm({ ...newProductForm, marca: e.target.value })} className="uppercase" /></Field>
+              <Field label="Modelo"><TextInput value={newProductForm.modelo} onChange={(e) => setNewProductForm({ ...newProductForm, modelo: e.target.value })} className="uppercase" /></Field>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Precio compra">
+                <TextInput
+                  value={newProductForm.precio_compra}
+                  inputMode="decimal"
+                  onChange={(e) => setNewProductForm({ ...newProductForm, precio_compra: e.target.value })}
+                  className="font-black"
+                />
+              </Field>
+              <Field label="Precio venta">
+                <TextInput
+                  value={newProductForm.precio_venta}
+                  inputMode="decimal"
+                  onChange={(e) => setNewProductForm({ ...newProductForm, precio_venta: e.target.value })}
+                  className="font-black"
+                />
+              </Field>
+            </div>
+            <div className="rounded-md bg-slate-50 p-2 text-xs font-semibold text-slate-600">
+              El producto se crea en inventario y se agrega a esta compra. Luego puedes ingresar series y guardar.
+            </div>
+            <div className="flex flex-wrap justify-end gap-2">
+              <ActionButton tone="neutral" disabled={creatingProduct} onClick={() => setNewProductOpen(false)}>Cancelar</ActionButton>
+              <ActionButton disabled={creatingProduct} onClick={createProductAndAdd}>
+                {creatingProduct ? 'Creando...' : 'Crear y agregar'}
+              </ActionButton>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       <Card title="Compras registradas">
         <div className="max-h-[680px] overflow-auto">

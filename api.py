@@ -7385,10 +7385,25 @@ def guardar_compra(data: Compra):
 
     # Procesar items: agregar al inventario y series
     for item in (data.items or []):
-        prod_id = item.get("producto_id") or 0
-        nombre = item.get("nombre", "")
+        prod_id = int(item.get("producto_id") or 0)
+        nombre = str(item.get("nombre", "") or "").strip()
         cantidad = int(item.get("cantidad") or 1)
         precio = float(item.get("precio") or 0)
+        if not prod_id and nombre:
+            cur.execute("""
+                INSERT INTO productos (nombre, categoria, marca, modelo, precio_compra, precio_venta, stock, imagen_url, observacion, almacen, sucursal, sku_woo)
+                VALUES (%s,%s,%s,%s,%s,%s,0,'','','TIENDA',%s,'')
+                RETURNING id
+            """, (
+                nombre,
+                str(item.get("categoria") or "").strip(),
+                str(item.get("marca") or "").strip(),
+                str(item.get("modelo") or "").strip(),
+                precio,
+                float(item.get("precio_venta") or item.get("precio") or 0),
+                sucursal,
+            ))
+            prod_id = int(cur.fetchone()[0])
         series_texto = item.get("series_texto", "")
         raw_series_list = item.get("series_list")
         if isinstance(raw_series_list, list):
