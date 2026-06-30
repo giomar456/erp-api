@@ -2942,8 +2942,22 @@ function VentasView({ user, sound, soundEnabled, setView }) {
           <ActionButton tone="blue" onClick={previewDocument}>Vista previa</ActionButton>
           <div className="flex gap-2">
             <ActionButton className="flex-1" disabled={saving} onClick={() => issue(false)}>{isProforma ? 'Procesar' : 'Procesar'}</ActionButton>
-            {canEmitLegalSunat(saleUserName) && !isProforma && ['BOLETA', 'FACTURA'].includes(docType) && (
-              <ActionButton tone="amber" className="min-w-[84px] px-2 text-xs font-black" disabled={saving} onClick={() => issue(true)}>EMITIR</ActionButton>
+            {canEmitLegalSunat(saleUserName) && (
+              <ActionButton
+                tone="amber"
+                className="flex-1 min-w-[150px] px-3 text-sm font-black"
+                disabled={saving || isProforma || !['BOLETA', 'FACTURA'].includes(docType)}
+                title={
+                  isProforma
+                    ? 'Desmarca PROFORMA y elige BOLETA o FACTURA para emitir legal a SUNAT'
+                    : !['BOLETA', 'FACTURA'].includes(docType)
+                      ? 'Elige BOLETA o FACTURA para EMITIR legal a SUNAT'
+                      : `Emitir ${docType} legal ${docType === 'BOLETA' ? 'B002' : 'F002'} y enviar a SUNAT`
+                }
+                onClick={() => issue(true)}
+              >
+                EMITIR {docType === 'BOLETA' ? 'B002' : docType === 'FACTURA' ? 'F002' : 'SUNAT'}
+              </ActionButton>
             )}
           </div>
         </div>

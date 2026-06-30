@@ -5,7 +5,8 @@ param(
     [string]$RenderServiceId = "srv-d7p6tn58nd3s73e49bf0",
     [string]$GitHubToken = "",
     [string]$RenderToken = "",
-    [switch]$SkipRender
+    [switch]$SkipRender,
+    [switch]$ForceRender
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,23 +57,45 @@ function Get-GitHubContentSha($path) {
     }
 }
 
-function Put-GitHubFile($path, $message) {
-    $local = Join-Path $Root $path
-    if (-not (Test-Path -LiteralPath $local)) {
-        Write-Host "No existe $path, se omite." -ForegroundColor Yellow
-        return
+function Publish-SingleCommit($paths, $message) {
+    $ref = Invoke-GitHubJson "Get" "https://api.github.com/repos/$Owner/$Repo/git/ref/heads/$Branch"
+    $baseCommit = $ref.object.sha
+    $commitMeta = Invoke-GitHubJson "Get" "https://api.github.com/repos/$Owner/$Repo/git/commits/$baseCommit"
+    $baseTree = $commitMeta.tree.sha
+    $treeItems = @()
+    foreach ($path in ($paths | Sort-Object)) {
+        $local = Join-Path $Root ($path -replace "/", [IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $local)) {
+            Write-Host "No existe $path, se omite." -ForegroundColor Yellow
+            continue
+        }
+        $blob = Invoke-GitHubJson "Post" "https://api.github.com/repos/$Owner/$Repo/git/blobs" @{
+            content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($local))
+            encoding = "base64"
+        }
+        $treeItems += @{
+            path = $path
+            mode = "100644"
+            type = "blob"
+            sha = $blob.sha
+        }
+        Write-Host "BLOB $path" -ForegroundColor DarkGray
     }
-    $encodedPath = [Uri]::EscapeDataString($path).Replace("%2F", "/")
-    $content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($local))
-    $sha = Get-GitHubContentSha $path
-    $body = @{
+    if (-not $treeItems.Count) { throw "No hay archivos para publicar." }
+    $newTree = Invoke-GitHubJson "Post" "https://api.github.com/repos/$Owner/$Repo/git/trees" @{
+        base_tree = $baseTree
+        tree = $treeItems
+    }
+    $newCommit = Invoke-GitHubJson "Post" "https://api.github.com/repos/$Owner/$Repo/git/commits" @{
         message = $message
-        content = $content
-        branch = $Branch
+        tree = $newTree.sha
+        parents = @($baseCommit)
     }
-    if ($sha) { $body["sha"] = $sha }
-    Invoke-GitHubJson "Put" "https://api.github.com/repos/$Owner/$Repo/contents/$encodedPath" $body | Out-Null
-    Write-Host "GitHub OK: $path" -ForegroundColor Green
+    Invoke-GitHubJson "Patch" "https://api.github.com/repos/$Owner/$Repo/git/refs/heads/$Branch" @{
+        sha = $newCommit.sha
+        force = $false
+    } | Out-Null
+    Write-Host "COMMIT_UNICO $($newCommit.sha.Substring(0, 12))" -ForegroundColor Green
 }
 
 Set-Content -LiteralPath $LogPath -Value ("Inicio publicacion completa {0}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
@@ -97,27 +120,32 @@ if (Test-Path (Join-Path $web "assets")) { Remove-Item -Recurse -Force (Join-Pat
 Copy-Item -Recurse -Force (Join-Path $dist "assets") (Join-Path $web "assets")
 Write-Host "webapp sincronizado desde dist" -ForegroundColor Green
 
-$commitMsg = "ERP: permisos series, auditoria mercaderia, garantias, compras, DNI/RUC y web"
-Write-Host "Subiendo a GitHub ($Owner/$Repo)..." -ForegroundColor Cyan
-Put-GitHubFile "api.py" $commitMsg
-Put-GitHubFile "requirements-api.txt" $commitMsg
-if (Test-Path (Join-Path $Root "Dockerfile")) { Put-GitHubFile "Dockerfile" $commitMsg }
-Put-GitHubFile "my-react-app/src/App.jsx" $commitMsg
-
+$commitMsg = "ERP: boton EMITIR SUNAT B002/F002 visible junto a Procesar, un solo deploy"
+Write-Host "Subiendo a GitHub ($Owner/$Repo) en UN solo commit..." -ForegroundColor Cyan
+$uploadPaths = @(
+    "api.py",
+    "requirements-api.txt",
+    "my-react-app/src/App.jsx",
+    "publicar_avance_completo.ps1",
+    "ABRIR_PUBLICAR_AVANCE.bat"
+)
+if (Test-Path (Join-Path $Root "Dockerfile")) { $uploadPaths += "Dockerfile" }
 Get-ChildItem -Path (Join-Path $Root "webapp") -Recurse -File | ForEach-Object {
-    $rel = $_.FullName.Substring($Root.Length + 1).Replace("\", "/")
-    Put-GitHubFile $rel $commitMsg
+    $uploadPaths += $_.FullName.Substring($Root.Length + 1).Replace("\", "/")
 }
+Publish-SingleCommit $uploadPaths $commitMsg
 
-if (-not $SkipRender) {
+if ($ForceRender -and -not $SkipRender) {
     $script:RenderToken = Read-PlainSecret "Render token" "RENDER_API_KEY" $RenderToken
     if ([string]::IsNullOrWhiteSpace($script:RenderToken)) {
-        Write-Host "Render token vacio. GitHub subido, pero sin deploy automatico." -ForegroundColor Yellow
+        Write-Host "Render token vacio. GitHub subido; Render usara auto-deploy del push." -ForegroundColor Yellow
     } else {
         $renderHeaders = @{ Authorization = "Bearer $script:RenderToken"; Accept = "application/json" }
         Invoke-RestMethod -Method Post -Headers $renderHeaders -Uri "https://api.render.com/v1/services/$RenderServiceId/deploys" -Body (@{ clearCache = "clear" } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-        Write-Host "Render deploy iniciado. Espera 2-3 min." -ForegroundColor Cyan
+        Write-Host "Render deploy manual iniciado. Espera 2-3 min." -ForegroundColor Cyan
     }
+} else {
+    Write-Host "Un solo deploy: Render auto-deploy por el push (sin deploy manual extra)." -ForegroundColor Cyan
 }
 
 Write-Host "Publicacion completa." -ForegroundColor Green
