@@ -6252,7 +6252,10 @@ SUNAT_NS = {
     "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
     "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
     "ext": "urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2",
+    "ds": "http://www.w3.org/2000/09/xmldsig#",
 }
+SUNAT_EXT_NS = SUNAT_NS["ext"]
+SUNAT_CBC_NS = SUNAT_NS["cbc"]
 for _sunat_prefix, _sunat_uri in SUNAT_NS.items():
     ET.register_namespace(_sunat_prefix, _sunat_uri)
 
@@ -6559,12 +6562,23 @@ def _sunat_sign_xml(xml_bytes, cfg):
         for cert in cert_chain
     ]
     root = LET.fromstring(xml_bytes)
+    extensions = LET.Element(f"{{{SUNAT_EXT_NS}}}UBLExtensions", nsmap={"ext": SUNAT_EXT_NS})
+    extension = LET.SubElement(extensions, f"{{{SUNAT_EXT_NS}}}UBLExtension")
+    ext_content = LET.SubElement(extension, f"{{{SUNAT_EXT_NS}}}ExtensionContent")
+    root.insert(0, extensions)
+
     signed = XMLSigner(
         method=methods.enveloped,
         signature_algorithm="rsa-sha256",
         digest_algorithm="sha256",
         c14n_algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     ).sign(root, key=key_pem, cert=cert_pems)
+    sig = signed.find(".//{http://www.w3.org/2000/09/xmldsig#}Signature")
+    if sig is not None:
+        sig_parent = sig.getparent()
+        if sig_parent is not None:
+            sig_parent.remove(sig)
+        ext_content.append(sig)
     return LET.tostring(signed, xml_declaration=True, encoding="utf-8"), True, "XML firmado."
 
 
