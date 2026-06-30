@@ -261,9 +261,10 @@ def seed_branch_series(cur, sucursal):
         ('NOTA DE VENTA','N001',1,%s),
         ('PASE','PA001',1,%s),
         ('BOLETA','B001',1,%s),
-        ('FACTURA','F001',1,%s)
+        ('FACTURA','F001',1,%s),
+        ('GARANTIA','G001',1,%s)
     ON CONFLICT (tipo, sucursal) DO NOTHING;
-    """, (sucursal, sucursal, sucursal, sucursal, sucursal))
+    """, (sucursal, sucursal, sucursal, sucursal, sucursal, sucursal))
 
 
 def ensure_usuario_permisos_table(cur):
@@ -1770,6 +1771,8 @@ def migrate_schema():
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS diferencia_precio NUMERIC DEFAULT 0",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS cambio_aplicado BOOLEAN DEFAULT FALSE",
             "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS cambio_fecha TIMESTAMP",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS documento_cambio_id INT",
+            "ALTER TABLE garantias ADD COLUMN IF NOT EXISTS documento_cambio_numero TEXT DEFAULT ''",
         ]:
             cur.execute(column_sql)
 
@@ -7553,9 +7556,149 @@ def _resolver_producto_cambio_garantia(cur, data: Garantia, sucursal):
     }, None
 
 
+def _buscar_fila_serie_producto(cur, serie_texto, sucursal, producto_id=None):
+    serie_norm = normalize_serie_key(serie_texto)
+    if not serie_norm:
+        return None, "Serie invalida."
+    sucursal_inv = inventario_sucursal(sucursal)
+    params = [DEFAULT_SUCURSAL, sucursal_inv, serie_norm]
+    filtro_prod = ""
+    if producto_id:
+        filtro_prod = " AND ps.producto_id=%s"
+        params.append(int(producto_id))
+    cur.execute(f"""
+    SELECT ps.id, ps.producto_id, ps.serie,
+           UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
+           COALESCE(ps.almacen,'TIENDA') AS almacen
+    FROM producto_series ps
+    WHERE COALESCE(ps.sucursal,%s)=%s
+      AND {SERIE_SQL_KEY}=%s
+      {filtro_prod}
+    ORDER BY ps.id DESC
+    LIMIT 1
+    """, tuple(params))
+    row = dict_fetchone(cur)
+    if not row:
+        return None, f"La serie {serie_texto} no esta registrada."
+    return row, None
+
+
+def _marcar_serie_garantia_ingreso(cur, serie_texto, sucursal, usuario=""):
+    serie_norm = normalize_serie_key(serie_texto)
+    if not serie_norm:
+        return None
+    sucursal_inv = inventario_sucursal(sucursal)
+    cur.execute(f"""
+    UPDATE producto_series
+    SET estado='GARANTIA_INGRESO',
+        almacen='GARANTIA',
+        fecha_salida=NULL
+    WHERE COALESCE(sucursal,%s)=%s
+      AND {SERIE_SQL_KEY}=%s
+    RETURNING producto_id
+    """, (DEFAULT_SUCURSAL, sucursal_inv, serie_norm))
+    row = cur.fetchone()
+    if row and row[0]:
+        sync_producto_stock_from_series(cur, int(row[0]), sucursal)
+    return serie_norm
+
+
+def _marcar_serie_garantia_cambio(cur, serie_texto, producto_id, sucursal, usuario=""):
+    row, error = _buscar_fila_serie_producto(cur, serie_texto, sucursal, producto_id)
+    if error:
+        return error
+    estado = str(row.get("estado") or "").upper()
+    if estado not in ("DISPONIBLE", "RESERVADO"):
+        return f"La serie {row.get('serie')} no esta disponible para cambio (estado {estado})."
+    cur.execute("""
+    UPDATE producto_series
+    SET estado='GARANTIA_CAMBIO',
+        almacen='CLIENTE',
+        fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+    WHERE id=%s
+    """, (row.get("id"),))
+    sync_producto_stock_from_series(cur, int(producto_id), sucursal)
+    return None
+
+
+def _siguiente_numero_garantia(cur, sucursal):
+    sucursal = norm_sucursal(sucursal)
+    seed_branch_series(cur, sucursal)
+    cur.execute("""
+    SELECT id, serie, correlativo
+    FROM series
+    WHERE UPPER(tipo)='GARANTIA' AND COALESCE(sucursal,%s)=%s
+    LIMIT 1
+    """, (DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if not row:
+        return None, None, "No existe correlativo interno para documentos de garantia."
+    serie_id, serie, corr = row
+    numero = f"{serie}-{str(corr).zfill(6)}"
+    return serie_id, numero, None
+
+
+def _crear_documento_cambio_garantia(cur, garantia_id, data: Garantia, producto, sucursal):
+    serie_id, numero, error = _siguiente_numero_garantia(cur, sucursal)
+    if error:
+        return None, error
+    sucursal = norm_sucursal(sucursal)
+    cliente = (data.cliente or "").strip() or "CLIENTE GARANTIA"
+    documento_ref = (data.documento or "").strip()
+    observacion = (
+        f"CAMBIO GARANTIA #{garantia_id} | Boleta origen: {documento_ref or 'SIN DOC'} | "
+        f"INGRESO: {data.serie or ''} | CAMBIO: {data.serie_cambio or ''} | "
+        f"Sin cobro ni descuento de precio."
+    )
+    fecha_emision = lima_now()
+    cur.execute("""
+    INSERT INTO ventas (
+        fecha, tipo, es_pase, numero, cliente, documento_cliente, direccion_cliente,
+        subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor, estado,
+        estado_pago, metodo_pago, sucursal
+    )
+    VALUES (%s,'GARANTIA',FALSE,%s,%s,'','',0,0,0,%s,NULL,%s,'EMITIDO','N/A','',%s)
+    RETURNING id
+    """, (fecha_emision, numero, cliente, observacion, data.usuario or "", sucursal))
+    venta_id = cur.fetchone()[0]
+    nombre = producto.get("nombre") or data.producto or ""
+    marca = producto.get("marca") or ""
+    modelo = producto.get("modelo") or ""
+    prod_id = int(producto.get("id") or data.producto_cambio_id or 0)
+    lineas = [
+        ("INGRESO GARANTIA", data.serie or "", "Serie danada recibida en taller/garantia."),
+        ("CAMBIO GARANTIA", data.serie_cambio or "", "Serie entregada al cliente en reemplazo."),
+    ]
+    for desc_pref, serie_linea, nota in lineas:
+        if not str(serie_linea or "").strip():
+            continue
+        cur.execute("""
+        INSERT INTO ventas_detalle (
+            venta_id, producto_id, descripcion, marca, modelo,
+            series_texto, cantidad, precio, total, sucursal
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,1,0,0,%s)
+        """, (
+            venta_id, prod_id, f"{desc_pref} - {nombre} ({nota})",
+            marca, modelo, str(serie_linea).strip().upper(), sucursal,
+        ))
+    cur.execute("UPDATE series SET correlativo = correlativo + 1 WHERE id=%s", (serie_id,))
+    try:
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,%s,%s,%s,%s)
+        """, (
+            data.usuario or "", "", sucursal, "DOCUMENTO GARANTIA CAMBIO",
+            f"{numero} | Ingreso {data.serie or ''} | Cambio {data.serie_cambio or ''} | Garantia #{garantia_id}",
+        ))
+    except Exception:
+        pass
+    return {"id": venta_id, "numero": numero, "tipo": "GARANTIA"}, None
+
+
 def _aplicar_cambio_garantia(cur, garantia_id, data: Garantia, sucursal):
     if not data.aplicar_cambio:
-        return None
+        return None, None
     sucursal = norm_sucursal(sucursal)
     cur.execute("""
     SELECT COALESCE(cambio_aplicado,FALSE)
@@ -7564,34 +7707,41 @@ def _aplicar_cambio_garantia(cur, garantia_id, data: Garantia, sucursal):
     """, (garantia_id, DEFAULT_SUCURSAL, sucursal))
     row = cur.fetchone()
     if row and bool(row[0]):
-        return "Esta garantia ya tiene cambio aplicado. No se descuenta stock dos veces."
+        return "Esta garantia ya tiene cambio aplicado.", None
 
     cantidad = max(1, int(data.cantidad_cambio or 1))
+    if cantidad != 1:
+        return "El cambio de garantia solo admite 1 serie de reemplazo por operacion.", None
     producto, error = _resolver_producto_cambio_garantia(cur, data, sucursal)
     if error:
-        return error
-    error_stock = validar_y_marcar_series_venta(
-        cur,
-        producto["id"],
-        producto["nombre"],
-        producto["marca"],
-        producto["modelo"],
-        cantidad,
-        data.serie_cambio,
-        sucursal,
+        return error, None
+    if not str(data.serie_cambio or "").strip():
+        return "Selecciona la serie de reemplazo.", None
+
+    if data.serie:
+        _marcar_serie_garantia_ingreso(cur, data.serie, sucursal, data.usuario or "")
+    error_salida = _marcar_serie_garantia_cambio(
+        cur, data.serie_cambio, producto["id"], sucursal, data.usuario or ""
     )
-    if error_stock:
-        return error_stock
+    if error_salida:
+        return error_salida, None
+
+    documento, error_doc = _crear_documento_cambio_garantia(cur, garantia_id, data, producto, sucursal)
+    if error_doc:
+        return error_doc, None
+
     cur.execute("""
     UPDATE garantias
     SET producto_cambio_id=%s,
         producto_cambio=%s,
         serie_cambio=%s,
         cantidad_cambio=%s,
-        diferencia_precio=%s,
+        diferencia_precio=0,
         cambio_aplicado=TRUE,
         cambio_fecha=CURRENT_TIMESTAMP,
         estado='ENTREGADO',
+        documento_cambio_id=%s,
+        documento_cambio_numero=%s,
         solucion=CASE
             WHEN COALESCE(solucion,'')='' THEN %s
             ELSE solucion
@@ -7599,25 +7749,15 @@ def _aplicar_cambio_garantia(cur, garantia_id, data: Garantia, sucursal):
     WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (
         producto["id"], producto["nombre"], data.serie_cambio, cantidad,
-        float(data.diferencia_precio or 0),
-        f"CAMBIO ENTREGADO: {producto['nombre']}",
+        documento.get("id"), documento.get("numero"),
+        f"CAMBIO GARANTIA {documento.get('numero')}: ingreso {data.serie or ''} / entrega {data.serie_cambio or ''}",
         garantia_id, DEFAULT_SUCURSAL, sucursal,
     ))
-    return None
+    return None, documento
 
 
 def _marcar_serie_garantia(cur, serie_texto, sucursal):
-    serie_norm = normalize_serie_key(serie_texto)
-    if not serie_norm:
-        return
-    sucursal_inv = inventario_sucursal(sucursal)
-    cur.execute(f"""
-    UPDATE producto_series
-    SET estado='GARANTIA',
-        almacen='GARANTIA'
-    WHERE COALESCE(sucursal,%s)=%s
-      AND {SERIE_SQL_KEY}=%s
-    """, (DEFAULT_SUCURSAL, sucursal_inv, serie_norm))
+    _marcar_serie_garantia_ingreso(cur, serie_texto, sucursal)
 
 
 @app.get("/garantias/buscar-serie")
@@ -7771,7 +7911,9 @@ def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
                COALESCE(cantidad_cambio,0) AS cantidad_cambio,
                COALESCE(diferencia_precio,0) AS diferencia_precio,
                COALESCE(cambio_aplicado,FALSE) AS cambio_aplicado,
-               COALESCE(to_char(cambio_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS cambio_fecha
+               COALESCE(to_char(cambio_fecha, 'YYYY-MM-DD HH24:MI:SS'),'') AS cambio_fecha,
+               COALESCE(documento_cambio_id,0) AS documento_cambio_id,
+               COALESCE(documento_cambio_numero,'') AS documento_cambio_numero
         FROM garantias
         WHERE COALESCE(sucursal,%s)=%s
           AND (%s = '%%'
@@ -7779,10 +7921,12 @@ def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
            OR documento ILIKE %s
            OR producto ILIKE %s
            OR serie ILIKE %s
-           OR falla ILIKE %s)
+           OR falla ILIKE %s
+           OR serie_cambio ILIKE %s
+           OR documento_cambio_numero ILIKE %s)
         ORDER BY fecha DESC, id DESC
         LIMIT 300
-    """, (DEFAULT_SUCURSAL, sucursal, filtro, filtro, filtro, filtro, filtro, filtro))
+    """, (DEFAULT_SUCURSAL, sucursal, filtro, filtro, filtro, filtro, filtro, filtro, filtro, filtro))
     data = dict_fetchall(cur)
     conn.close()
     return data
@@ -7810,16 +7954,21 @@ def guardar_garantia(data: Garantia):
         max(0, int(data.cantidad_cambio or 0)), float(data.diferencia_precio or 0)
     ))
     garantia_id = cur.fetchone()[0]
-    if data.serie:
+    if data.serie and not data.aplicar_cambio:
         _marcar_serie_garantia(cur, data.serie, sucursal)
-    error_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
+    error_cambio, documento_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
     if error_cambio:
         conn.rollback()
         conn.close()
         return {"ok": False, "success": False, "msg": error_cambio}
     conn.commit()
     conn.close()
-    return {"ok": True, "success": True, "id": garantia_id}
+    return {
+        "ok": True,
+        "success": True,
+        "id": garantia_id,
+        "documento_cambio": documento_cambio,
+    }
 
 
 @app.put("/garantias/{garantia_id}")
@@ -7847,8 +7996,9 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
         garantia_id, DEFAULT_SUCURSAL, sucursal
     ))
     row = cur.fetchone()
+    documento_cambio = None
     if row:
-        error_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
+        error_cambio, documento_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
         if error_cambio:
             conn.rollback()
             conn.close()
@@ -7857,7 +8007,7 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
     conn.close()
     if not row:
         return {"ok": False, "msg": "Garantia no encontrada"}
-    return {"ok": True, "success": True}
+    return {"ok": True, "success": True, "documento_cambio": documento_cambio}
 
 
 @app.get("/dashboard")
