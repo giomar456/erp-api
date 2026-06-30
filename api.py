@@ -60,6 +60,10 @@ if os.path.isdir(WEBAPP_DIR):
     if os.path.isdir(sounds_dir):
         app.mount("/erp/sounds", StaticFiles(directory=sounds_dir), name="erp_sounds")
         app.mount("/sounds", StaticFiles(directory=sounds_dir), name="root_sounds")
+    videos_dir = os.path.join(WEBAPP_DIR, "videos")
+    if os.path.isdir(videos_dir):
+        app.mount("/erp/videos", StaticFiles(directory=videos_dir), name="erp_videos")
+        app.mount("/videos", StaticFiles(directory=videos_dir), name="root_videos")
 
 
 @app.get("/")
