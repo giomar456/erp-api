@@ -902,17 +902,32 @@ def http_get_json(url, headers=None, timeout=5):
     safe_headers = {"User-Agent": "G&G-ERP/1.0", "Accept": "application/json"}
     safe_headers.update(headers or {})
     req = urllib.request.Request(url, headers=safe_headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", "ignore")
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore")[:240]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code}: {body or e.reason}") from e
 
 
 def normalizar_dni(data, numero, source):
-    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
-    nombres = first_value(payload, "nombres", "nombre", "first_name")
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(payload, dict):
+        return None
+    nombres = first_value(payload, "nombres", "first_name")
     paterno = first_value(payload, "apellidoPaterno", "apellido_paterno", "paterno", "ape_paterno", "first_last_name")
     materno = first_value(payload, "apellidoMaterno", "apellido_materno", "materno", "ape_materno", "second_last_name")
-    nombre = first_value(payload, "nombreCompleto", "nombre_completo", "full_name", "razonSocial", "razon_social")
+    nombre = first_value(
+        payload,
+        "nombreCompleto", "nombre_completo", "full_name", "razonSocial", "razon_social", "nombre",
+    )
     if not nombre:
         nombre = " ".join(x for x in [paterno, materno, nombres] if x).strip()
     if not nombre:
@@ -1008,8 +1023,54 @@ def consulta_documento_apis_net_pe_v1(tipo, numero):
     base = os.getenv("APIS_NET_PE_V1_BASE", "https://api.apis.net.pe/v1").strip().rstrip("/")
     endpoint = "dni" if tipo == "DNI" else "ruc"
     url = f"{base}/{endpoint}?numero={urllib.parse.quote(numero)}"
-    data = http_get_json(url, timeout=4)
-    return normalizar_dni(data, numero, "apis_net_pe_v1") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe_v1")
+    token = os.getenv("APIS_NET_PE_TOKEN", "").strip() or os.getenv("APIS_NET_PE_V1_TOKEN", "").strip()
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    last_error = ""
+    for attempt in range(2):
+        try:
+            data = http_get_json(url, headers=headers, timeout=6)
+            result = normalizar_dni(data, numero, "apis_net_pe_v1") if tipo == "DNI" else normalizar_ruc(data, numero, "apis_net_pe_v1")
+            if result:
+                return result
+            last_error = "Respuesta sin nombre para este documento."
+            break
+        except Exception as e:
+            last_error = str(e)
+            if "429" in last_error and attempt == 0:
+                time.sleep(1.5)
+                continue
+            break
+    if last_error:
+        raise RuntimeError(last_error)
+    return None
+
+
+def consulta_documento_decolecta(tipo, numero):
+    token = os.getenv("DECOLECTA_TOKEN", "").strip()
+    if not token:
+        return None
+    base = os.getenv("DECOLECTA_BASE", "https://api.decolecta.com/v1").strip().rstrip("/")
+    endpoint = "reniec/dni" if tipo == "DNI" else "sunat/ruc"
+    url = f"{base}/{endpoint}?numero={urllib.parse.quote(numero)}"
+    data = http_get_json(url, headers={"Authorization": f"Bearer {token}"}, timeout=6)
+    return normalizar_dni(data, numero, "decolecta") if tipo == "DNI" else normalizar_ruc(data, numero, "decolecta")
+
+
+def _mensaje_error_consulta_documento(last_error, provider_configured, tipo):
+    err = str(last_error or "").lower()
+    if "429" in err or "too many requests" in err:
+        return "Consulta DNI/RUC saturada temporalmente. Espera 5 segundos e intenta de nuevo."
+    if "401" in err or "403" in err or "unauthorized" in err:
+        return "Token de consulta DNI/RUC invalido o vencido en el servidor (APIS_NET_PE_TOKEN)."
+    if "timeout" in err or "timed out" in err:
+        return "El servicio de consulta DNI/RUC no respondio a tiempo. Intenta nuevamente."
+    if last_error:
+        return str(last_error)
+    if provider_configured:
+        return f"No se encontraron datos de {tipo} para ese numero."
+    return "No se encontraron datos. Configura APIS_NET_PE_TOKEN en Render para consultas DNI/RUC."
 
 
 def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
@@ -1020,29 +1081,31 @@ def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
 
     local = buscar_cliente_db(numero, sucursal)
     if local:
-        local["tipo_documento"] = tipo
+        local["tipo_documento"] = local.get("tipo_documento") or tipo
+        local["numero_documento"] = local.get("numero_documento") or numero
         return local
 
     last_error = ""
-    provider_configured = False
-    for provider in (consulta_documento_custom, consulta_documento_apis_net_pe, consulta_documento_apis_net_pe_v1):
+    provider_configured = bool(
+        os.getenv(f"DOC_LOOKUP_{tipo}_URL", "").strip()
+        or os.getenv("APIS_NET_PE_TOKEN", "").strip()
+        or os.getenv("APIS_NET_PE_V1_TOKEN", "").strip()
+        or os.getenv("DECOLECTA_TOKEN", "").strip()
+    )
+    for provider in (
+        consulta_documento_custom,
+        consulta_documento_apis_net_pe_v1,
+        consulta_documento_apis_net_pe,
+        consulta_documento_decolecta,
+    ):
         try:
-            if provider == consulta_documento_custom:
-                provider_configured = provider_configured or bool(os.getenv(f"DOC_LOOKUP_{tipo}_URL", "").strip())
-            if provider == consulta_documento_apis_net_pe:
-                provider_configured = provider_configured or bool(os.getenv("APIS_NET_PE_TOKEN", "").strip())
             result = provider(tipo, numero)
             if result and result.get("found"):
                 return result
         except Exception as e:
             last_error = str(e)
 
-    if last_error:
-        msg = last_error
-    elif provider_configured:
-        msg = "El proveedor respondio, pero no devolvio datos legibles para este documento."
-    else:
-        msg = "No se encontraron datos. Configura APIS_NET_PE_TOKEN o DOC_LOOKUP_DNI_URL/DOC_LOOKUP_RUC_URL en Render."
+    msg = _mensaje_error_consulta_documento(last_error, provider_configured, tipo)
     return {"ok": False, "success": False, "found": False, "tipo_documento": tipo, "numero_documento": numero, "msg": msg}
 
 
@@ -3087,6 +3150,12 @@ def consulta_documento(numero: str, sucursal: str = DEFAULT_SUCURSAL):
     return consulta_documento_impl(numero, sucursal)
 
 
+@app.get("/consulta/documento")
+def consulta_documento_query(numero: str = "", documento: str = "", dni: str = "", ruc: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    value = numero or documento or dni or ruc
+    return consulta_documento_impl(value, sucursal)
+
+
 @app.get("/consulta/dni/{dni}")
 def consulta_dni(dni: str, sucursal: str = DEFAULT_SUCURSAL):
     return consulta_documento_impl(dni, sucursal)
@@ -3099,12 +3168,7 @@ def consulta_ruc(ruc: str, sucursal: str = DEFAULT_SUCURSAL):
 
 @app.get("/clientes/{documento}")
 def buscar_cliente(documento: str, sucursal: str = DEFAULT_SUCURSAL):
-    row = buscar_cliente_db(documento, sucursal)
-    if row:
-        return row
-    documento = only_digits(documento)
-    tipo = "DNI" if len(documento) == 8 else "RUC" if len(documento) == 11 else ""
-    return {"ok": False, "success": False, "found": False, "tipo_documento": tipo, "numero_documento": documento}
+    return consulta_documento_impl(documento, sucursal)
 
 
 @app.post("/clientes")
