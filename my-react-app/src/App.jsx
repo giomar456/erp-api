@@ -4,7 +4,7 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 const TEST_API_URL = new URLSearchParams(window.location.search).get('api');
 const BASE_URL = TEST_API_URL || 'https://erp-api-7x3d.onrender.com';
 const EMPRESA = 'computer_army';
-const APP_VERSION = '1.78';
+const APP_VERSION = '1.79';
 const IS_NATIVE_APP = !!(Capacitor?.isNativePlatform && Capacitor.isNativePlatform());
 const IS_PC_TESTER = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('tester') === 'pc';
 const IS_PC_DESKTOP = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('desktop') === 'pc';
@@ -1735,25 +1735,44 @@ function Card({ title, actions, children, className = '' }) {
   );
 }
 
-function SeriesErrorVideoAlert({ alert, onClose }) {
+function SeriesErrorVideoAlert({ alert, onClose, sound }) {
   const videoRef = useRef(null);
+  const [playError, setPlayError] = useState('');
+  const [needsTap, setNeedsTap] = useState(false);
+
+  const startPlayback = async () => {
+    const el = videoRef.current;
+    if (!el) return;
+    setPlayError('');
+    setNeedsTap(false);
+    try {
+      if (sound?.unlock) await sound.unlock();
+    } catch {
+      // Best effort for autoplay policies.
+    }
+    el.currentTime = 0;
+    el.volume = 1;
+    el.muted = false;
+    try {
+      await el.play();
+      return;
+    } catch {
+      // Browsers often block autoplay with sound; fall back to muted playback.
+    }
+    try {
+      el.muted = true;
+      await el.play();
+      setNeedsTap(true);
+    } catch {
+      setPlayError('No se pudo reproducir el video. Toca Reproducir.');
+      setNeedsTap(true);
+    }
+  };
 
   useEffect(() => {
     if (!alert?.visible) return undefined;
-    const el = videoRef.current;
-    if (!el) return undefined;
-    el.currentTime = 0;
-    el.muted = false;
-    el.volume = 1;
-    const playWithSound = () => el.play().catch(() => {
-      el.muted = true;
-      return el.play().then(() => {
-        el.muted = false;
-        return el.play().catch(() => {});
-      }).catch(() => {});
-    });
-    playWithSound();
-    return undefined;
+    const timer = window.setTimeout(() => { startPlayback(); }, 60);
+    return () => window.clearTimeout(timer);
   }, [alert?.visible, alert?.serie, alert?.reason]);
 
   if (!alert?.visible) return null;
@@ -1764,10 +1783,32 @@ function SeriesErrorVideoAlert({ alert, onClose }) {
         <span>Serie incorrecta</span>
         <button type="button" onClick={onClose} className="rounded bg-white/20 px-2 py-1 text-[11px]">Cerrar</button>
       </div>
-      <video ref={videoRef} src={SERIES_ERROR_VIDEO_URL} playsInline autoPlay loop className="block h-auto w-full bg-black" />
+      <div className="relative bg-black">
+        <video
+          ref={videoRef}
+          src={SERIES_ERROR_VIDEO_URL}
+          playsInline
+          autoPlay
+          loop
+          preload="auto"
+          onCanPlay={() => { if (videoRef.current?.paused) startPlayback(); }}
+          onError={() => setPlayError('Video no encontrado en el servidor.')}
+          className="block min-h-[140px] h-auto w-full bg-black"
+        />
+        {(needsTap || playError) && (
+          <button
+            type="button"
+            onClick={startPlayback}
+            className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-black uppercase text-white"
+          >
+            {playError || 'Reproducir con sonido'}
+          </button>
+        )}
+      </div>
       <div className="bg-red-950 px-3 py-2 text-[11px] font-bold leading-snug text-red-100">
         <div className="font-black uppercase text-white">{alert.serie}</div>
         <div>{alert.reason}</div>
+        {playError && <div className="mt-1 text-amber-200">{playError}</div>}
       </div>
     </div>
   );
@@ -3211,7 +3252,7 @@ function VentasView({ user, sound, soundEnabled, setView }) {
         </Modal>
       )}
       <DocumentViewerModal viewer={viewer} onClose={() => setViewer(null)} />
-      <SeriesErrorVideoAlert alert={seriesErrorAlert} onClose={() => setSeriesErrorAlert({ visible: false, serie: '', reason: '' })} />
+      <SeriesErrorVideoAlert sound={sound} alert={seriesErrorAlert} onClose={() => setSeriesErrorAlert({ visible: false, serie: '', reason: '' })} />
     </div>
   );
 }
