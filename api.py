@@ -1253,6 +1253,13 @@ class DocumentoManualSeries(BaseModel):
     sucursal: str = DEFAULT_SUCURSAL
 
 
+class SeriesDocumentoReset(BaseModel):
+    sucursal: str = DEFAULT_SUCURSAL
+    correlativo: int = 1
+    tipos: Optional[List[str]] = None
+    usuario: str = ""
+
+
 class ServicioTecnico(BaseModel):
     tipo_documento: str = "DNI"
     numero_documento: str = ""
@@ -4688,6 +4695,43 @@ def get_serie(tipo: str, sucursal: str = DEFAULT_SUCURSAL):
     return {"numero": f"{serie}-{str(corr).zfill(6)}"}
 
 
+@app.post("/series/documentos/reset")
+def reset_series_documentos(data: SeriesDocumentoReset = None, sucursal: str = DEFAULT_SUCURSAL):
+    data = data or SeriesDocumentoReset()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(data.sucursal or sucursal)
+        seed_branch_series(cur, sucursal)
+        tipos = data.tipos or ["BOLETA", "FACTURA", "PROFORMA", "NOTA DE VENTA", "PASE", "GARANTIA", "NOTA DE CREDITO"]
+        correlativo = max(1, int(data.correlativo or 1))
+        updated = []
+        for tipo in tipos:
+            tipo_clean = str(tipo or "").strip().upper()
+            if not tipo_clean:
+                continue
+            cur.execute("""
+            UPDATE series
+            SET correlativo=%s
+            WHERE UPPER(tipo)=%s AND COALESCE(sucursal,%s)=%s
+            RETURNING id, tipo, serie, correlativo
+            """, (correlativo, tipo_clean, DEFAULT_SUCURSAL, sucursal))
+            row = cur.fetchone()
+            if row:
+                updated.append({"id": row[0], "tipo": row[1], "serie": row[2], "correlativo": row[3]})
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,'',%s,'SERIES RESET',%s)
+        """, (str(data.usuario or "SISTEMA").strip() or "SISTEMA", sucursal, json.dumps(updated, ensure_ascii=False)))
+        conn.commit()
+        return {"ok": True, "success": True, "sucursal": sucursal, "correlativo": correlativo, "series": updated}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
 # ================= VENTAS / DOCUMENTOS =================
 @app.post("/ventas")
 def crear_venta(data: Venta):
@@ -6273,7 +6317,7 @@ def _sunat_get_config(cur, sucursal):
         "departamento": _sunat_env(sucursal, "DEPARTAMENTO", "LIMA").strip() or "LIMA",
         "provincia": _sunat_env(sucursal, "PROVINCIA", "LIMA").strip() or "LIMA",
         "distrito": _sunat_env(sucursal, "DISTRITO", "LIMA").strip() or "LIMA",
-        "usuario_sol": _sunat_env(sucursal, "USUARIO_SOL", "").strip(),
+        "usuario_sol": _sunat_env(sucursal, "USUARIO_SOL", "").strip().upper(),
         "clave_sol": _sunat_env(sucursal, "CLAVE_SOL", "").strip(),
         "endpoint_url": _sunat_env(sucursal, "ENDPOINT_URL", "").strip(),
         "certificado_pfx_base64": _sunat_env_cert_pfx_base64(sucursal),
@@ -6562,16 +6606,18 @@ def _sunat_generate_for_document(cur, documento_id, sucursal):
 
 
 def _sunat_soap_send_bill(cfg, zip_name, zip_base64):
-    username = f"{_sunat_clean_ruc(cfg.get('ruc'))}{cfg.get('usuario_sol') or ''}"
+    usuario_sol = str(cfg.get("usuario_sol") or "").strip().upper()
+    username = f"{_sunat_clean_ruc(cfg.get('ruc'))}{usuario_sol}"
     password = cfg.get("clave_sol") or ""
     endpoint = cfg.get("endpoint_url") or SUNAT_DEFAULT_ENDPOINTS["BETA"]
+    password_type = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
     soap = f"""<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ser="http://service.sunat.gob.pe" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
   <soapenv:Header>
     <wsse:Security>
       <wsse:UsernameToken>
         <wsse:Username>{html.escape(username)}</wsse:Username>
-        <wsse:Password>{html.escape(password)}</wsse:Password>
+        <wsse:Password Type="{password_type}">{html.escape(password)}</wsse:Password>
       </wsse:UsernameToken>
     </wsse:Security>
   </soapenv:Header>
@@ -6620,6 +6666,7 @@ def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURS
         clean = data.dict()
         clean["ambiente"] = str(clean.get("ambiente") or "BETA").upper()
         clean["ruc"] = _sunat_clean_ruc(clean.get("ruc"))
+        clean["usuario_sol"] = str(clean.get("usuario_sol") or "").strip().upper()
         if clean["ambiente"] not in ("BETA", "PRODUCCION"):
             clean["ambiente"] = "BETA"
         for secret_key in ("clave_sol", "certificado_pfx_base64", "certificado_password"):
