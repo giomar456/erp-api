@@ -1020,6 +1020,7 @@ class ItemVenta(BaseModel):
 
 class Venta(BaseModel):
     tipo: str
+    es_pase: bool = False
     cliente_nombre: str
     items: List[ItemVenta]
     fecha_emision: str = ""
@@ -1208,6 +1209,7 @@ class Compra(BaseModel):
     usuario: str = ""
     detalle: str = ""
     sucursal: str = DEFAULT_SUCURSAL
+    items: List[dict] = []  # [{producto_id, nombre, cantidad, precio, series_texto}]
 
 
 class EstadoPagoUpdate(BaseModel):
@@ -1601,6 +1603,7 @@ def migrate_schema():
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_ticket TEXT DEFAULT ''",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_cdr_base64 TEXT DEFAULT ''",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sunat_respuesta_json TEXT DEFAULT ''",
+            "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS es_pase BOOLEAN DEFAULT FALSE",
             "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
         ]:
             cur.execute(column_sql)
@@ -2696,6 +2699,17 @@ def _pdf_series_items(value):
     return out
 
 
+def _pdf_item_row_height(desc_lines_count, series_count, desc_gap, serie_gap, extra_lines=0):
+    base = 4.2
+    height = base + max(1, desc_lines_count) * desc_gap
+    if series_count:
+        height += 2.0
+        height += series_count * serie_gap
+    if extra_lines:
+        height += extra_lines * serie_gap
+    return max(6.5, height)
+
+
 def _pdf_money(value):
     try:
         return f"{float(value or 0):.2f}"
@@ -2898,33 +2912,45 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         total = float(item.get("total") or qty * price)
         desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
         series = str(item.get("series_texto") or item.get("serie") or "").strip()
+        series_items = _pdf_series_items(series)
+        desc_max = 2 if series_items else 3
+        desc_font = 6.8 if series_items else (6.25 if len(desc) > 82 else 7.35)
+        desc_gap = 2.35 if series_items else (2.05 if len(desc) > 82 else 2.25)
+        serie_font = 6.4 if len(series_items) >= 4 else 6.6
+        serie_gap = 3.1 if len(series_items) >= 3 else 3.4
+        desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
+        shown = list(series_items)
+        overflow = 0
+        item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, overflow)
+        remaining_h = (ty + th) - (ty + header_h + 4.5) - (row_y - (ty + header_h + 4.5))
+        if item_h > remaining_h and remaining_h > 0:
+            compact_gap = max(2.6, serie_gap - 0.5)
+            compact_font = max(6.0, serie_font - 0.3)
+            while shown and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, overflow) > remaining_h:
+                shown = shown[:-1]
+                overflow = len(series_items) - len(shown)
+            serie_gap = compact_gap
+            serie_font = compact_font
+            item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, overflow)
         txt_c(centers[0], row_y, idx, 8.0)
         txt_c(centers[1], row_y, "UNIDADES", 7.8)
-        series_items = _pdf_series_items(series)
-        desc_max = 3
-        desc_font = 6.25 if (series_items or len(desc) > 82) else 7.35
-        desc_gap = 2.05 if (series_items or len(desc) > 82) else 2.25
-        serie_font = 5.65 if len(series_items) >= 3 else 6.2
-        serie_gap = 1.75 if len(series_items) >= 3 else 2.05
-        desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
         cursor_y = row_y
-        for j, ln in enumerate(desc_lines):
+        for ln in desc_lines:
             txt(cols[2] + 1.6, cursor_y, ln, desc_font, True)
             cursor_y += desc_gap
-        if series_items:
-            remaining_slots = max(1, 5 - len(desc_lines))
-            shown = series_items[:remaining_slots]
+        if shown:
+            cursor_y += 1.6
             for sidx, serie_line in enumerate(shown):
-                prefix = "SN: " if sidx == 0 else "SN: "
-                for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 1):
+                prefix = "S/N: " if sidx == 0 else "     "
+                for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 2):
                     txt(cols[2] + 1.6, cursor_y, ln, serie_font)
                     cursor_y += serie_gap
-            if len(series_items) > len(shown):
-                txt(cols[2] + 1.6, cursor_y, f"    +{len(series_items) - len(shown)} series", 5.2)
+            if overflow:
+                txt(cols[2] + 1.6, cursor_y, f"     +{overflow} serie(s) mas", 5.8)
         txt_r(cols[4] - 1.2, row_y, f"{qty:.2f}", 8.0)
         txt_r(cols[5] - 1.2, row_y, _pdf_money(total), 8.0)
         txt_r(cols[6] - 1.2, row_y, _pdf_money(price), 8.0)
-        row_y += row_h
+        row_y += max(item_h, row_h)
 
     total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle or []))
     igv_doc = float(documento.get("igv") or 0)
@@ -3622,11 +3648,12 @@ def guardar_serie_producto(data: SerieProducto):
             conn.close()
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
-        cur.execute("SELECT stock FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
+        cur.execute("SELECT stock, nombre FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
         producto = cur.fetchone()
         if not producto:
             conn.close()
             return {"ok": False, "msg": "Producto no encontrado"}
+        prod_nombre = producto[1] or f"ID {data.producto_id}"
 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
@@ -3689,6 +3716,20 @@ def guardar_serie_producto(data: SerieProducto):
             """, (data.producto_id, DEFAULT_SUCURSAL, sucursal, data.producto_id, DEFAULT_SUCURSAL, sucursal))
 
         conn.commit()
+
+        # Log detallado de ingreso/actualizacion de series con mercaderia
+        try:
+            cur.execute("""
+            INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+            VALUES (%s,%s,%s,%s,%s)
+            """, (
+                data.usuario_ingreso or "SISTEMA", "", sucursal, "INGRESO MERCADERIA / SERIES",
+                f"Usuario '{data.usuario_ingreso or 'SISTEMA'}' añadió las series [{', '.join(series)}] al producto '{prod_nombre}' (ID {data.producto_id}) | Estado: {data.estado} | Almacén: {almacen} | Fecha: {data.fecha_ingreso or 'hoy'}"
+            ))
+            conn.commit()
+        except:
+            pass
+
         conn.close()
         return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
     except Exception as e:
@@ -3793,6 +3834,20 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
                 """, (producto_id, DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
 
         conn.commit()
+
+        # Log detallado también en actualización
+        try:
+            cur.execute("""
+            INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+            VALUES (%s,%s,%s,%s,%s)
+            """, (
+                data.usuario_ingreso or "SISTEMA", "", sucursal, "INGRESO MERCADERIA / SERIES (UPDATE)",
+                f"Usuario '{data.usuario_ingreso or 'SISTEMA'}' actualizó serie '{serie}' del producto ID {data.producto_id} | Estado: {data.estado} | Almacén: {almacen}"
+            ))
+            conn.commit()
+        except:
+            pass
+
         conn.close()
         return {"ok": True, "success": True, "id": serie_id, "series_guardadas": [serie]}
     except Exception as e:
@@ -4472,13 +4527,13 @@ def crear_venta(data: Venta):
 
         cur.execute("""
         INSERT INTO ventas (
-            fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
+            fecha, tipo, es_pase, numero, cliente, documento_cliente, direccion_cliente,
             subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor, estado, estado_pago, metodo_pago, sucursal
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s)
         RETURNING id
         """, (
-            fecha_emision, data.tipo, numero, data.cliente_nombre, documento_cliente,
+            fecha_emision, data.tipo, bool(getattr(data, 'es_pase', False)), numero, data.cliente_nombre, documento_cliente,
             data.direccion_cliente, subtotal, igv, total,
             data.observacion, fecha_vencimiento, data.usuario_emisor, estado_pago, metodo_pago, sucursal
         ))
@@ -6645,6 +6700,13 @@ def guardar_compra(data: Compra):
     cur = conn.cursor()
     sucursal = norm_sucursal(data.sucursal)
     proveedor = (data.proveedor_nombre or data.proveedor or "").strip()
+    # Guardar proveedor si no existe
+    if proveedor:
+        cur.execute("""
+            INSERT INTO proveedores (nombre, sucursal)
+            VALUES (%s, %s)
+            ON CONFLICT (nombre, sucursal) DO NOTHING
+        """, (proveedor, sucursal))
     cur.execute("""
     INSERT INTO compras (proveedor_nombre, comprobante, total, usuario_registro, detalle, sucursal)
     VALUES (%s,%s,%s,%s,%s,%s)
@@ -6654,6 +6716,39 @@ def guardar_compra(data: Compra):
         data.usuario_registro or data.usuario or "", data.detalle or "", sucursal
     ))
     compra_id = cur.fetchone()[0]
+
+    # Procesar items: agregar al inventario y series
+    for item in (data.items or []):
+        prod_id = item.get("producto_id") or 0
+        nombre = item.get("nombre", "")
+        cantidad = int(item.get("cantidad") or 1)
+        precio = float(item.get("precio") or 0)
+        series_texto = item.get("series_texto", "")
+        if prod_id:
+            # Actualizar stock
+            cur.execute("""
+                UPDATE productos SET stock = COALESCE(stock,0) + %s
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (cantidad, prod_id, DEFAULT_SUCURSAL, sucursal))
+            # Agregar series si hay
+            if series_texto:
+                series_list = [s.strip() for s in series_texto.replace("\n", ",").split(",") if s.strip()]
+                for serie in series_list:
+                    cur.execute("""
+                        INSERT INTO producto_series (producto_id, serie, proveedor, estado, almacen, fecha_ingreso, sucursal, usuario_ingreso)
+                        VALUES (%s, %s, %s, 'DISPONIBLE', 'TIENDA', CURRENT_DATE, %s, %s)
+                        ON CONFLICT DO NOTHING
+                    """, (prod_id, serie, proveedor, sucursal, data.usuario or ""))
+                    # Log detailed
+                    try:
+                        cur.execute("""
+                            INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+                            VALUES (%s,%s,%s,%s,%s)
+                        """, (data.usuario or "", "", sucursal, "INGRESO MERCADERIA COMPRA",
+                              f"Compra {compra_id} - Producto ID {prod_id} Serie {serie} - Proveedor {proveedor}"))
+                    except:
+                        pass
+
     conn.commit()
     conn.close()
     return {"ok": True, "success": True, "id": compra_id}
@@ -7532,11 +7627,12 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
 
 
 @app.get("/dashboard")
-def dashboard(sucursal: str = DEFAULT_SUCURSAL):
+def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     tipos_venta_sql = "('BOLETA','FACTURA','NOTA DE VENTA')"
+    target_date = f"'{fecha}'::date" if fecha else "(timezone('America/Lima', now()))::date"
 
     cur.execute("SELECT COUNT(*) FROM clientes WHERE COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, sucursal))
     clientes = cur.fetchone()[0]
@@ -7560,7 +7656,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         SELECT COALESCE(SUM(total),0)
         FROM ventas
         WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
-          AND fecha::date = (timezone('America/Lima', now()))::date
+          AND fecha::date = {target_date}
           AND COALESCE(sucursal,%s)=%s
     """, (DEFAULT_SUCURSAL, sucursal))
     total_ventas_hoy = float(cur.fetchone()[0] or 0)
@@ -7596,7 +7692,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         ),0)
         FROM ventas
         WHERE UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
-          AND fecha::date = (timezone('America/Lima', now()))::date
+          AND fecha::date = {target_date}
           AND COALESCE(sucursal,%s)=%s
         """, (DEFAULT_SUCURSAL, sucursal))
         saldo_caja_hoy = float(cur.fetchone()[0] or 0)
@@ -7641,7 +7737,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL):
         FROM ventas
         WHERE COALESCE(estado_pago,'PAGADO')='PAGADO'
           AND UPPER(COALESCE(tipo,'')) IN {tipos_venta_sql}
-          AND fecha::date = (timezone('America/Lima', now()))::date
+          AND fecha::date = {target_date}
           AND COALESCE(sucursal,%s)=%s
         GROUP BY COALESCE(NULLIF(metodo_pago,''),'SIN METODO')
         ORDER BY total DESC
