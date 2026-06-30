@@ -207,6 +207,348 @@ function asArray(value) {
   return [];
 }
 
+const PRODUCT_SEARCH_MIN_TOKEN = 0.8;
+const PRODUCT_SEARCH_MIN_SCORE = 0.68;
+const PRODUCT_BRAND_TOKENS = new Set([
+  'msi', 'asus', 'gigabyte', 'asrock', 'biostar', 'evga', 'zotac', 'sapphire', 'xfx', 'powercolor',
+  'intel', 'amd', 'nvidia', 'kingston', 'corsair', 'thermaltake', 'coolermaster', 'cougar', 'redragon',
+  'lenovo', 'hp', 'dell', 'acer', 'samsung', 'lg', 'logitech', 'razer', 'hyperx', 'crucial', 'seagate',
+  'western', 'digital', 'wd', 'adata', 'teamgroup', 'hikvision', 'tplink', 'dlink', 'genius', 'trust',
+]);
+
+function normalizeProductSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function tokenizeProductSearch(value) {
+  return normalizeProductSearchText(value).split(/\s+/).filter(Boolean);
+}
+
+function levenshteinDistance(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const dist = Array.from({ length: rows }, () => Array(cols).fill(0));
+  for (let i = 0; i < rows; i += 1) dist[i][0] = i;
+  for (let j = 0; j < cols; j += 1) dist[0][j] = j;
+  for (let i = 1; i < rows; i += 1) {
+    for (let j = 1; j < cols; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dist[i][j] = Math.min(dist[i - 1][j] + 1, dist[i][j - 1] + 1, dist[i - 1][j - 1] + cost);
+    }
+  }
+  return dist[rows - 1][cols - 1];
+}
+
+function geometricMean(values) {
+  if (!values.length) return 0;
+  if (values.some((value) => value <= 0)) return 0;
+  return values.reduce((acc, value) => acc * value, 1) ** (1 / values.length);
+}
+
+function productTokenSimilarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const short = a.length <= b.length ? a : b;
+  const long = a.length <= b.length ? b : a;
+  if (short.length <= 2) {
+    if (short === long) return 1;
+    if (long.startsWith(short)) return 0.9;
+    return 0;
+  }
+  if (long.includes(short)) {
+    const ratio = short.length / long.length;
+    if (ratio < 0.55) return 0;
+    return 0.84 + ratio * 0.14;
+  }
+  const dist = levenshteinDistance(short, long);
+  const maxAllowed = Math.max(1, Math.floor(long.length * 0.22));
+  if (dist > maxAllowed) return 0;
+  return 1 - dist / long.length;
+}
+
+function isModelLikeToken(token) {
+  return /\d/.test(token) && token.length >= 3;
+}
+
+function extractModelCore(token) {
+  const match = String(token || '').toLowerCase().match(/^([a-z]{1,5})(\d{2,5})([a-z]*)$/);
+  if (!match) return null;
+  return { prefix: match[1], digits: match[2], suffix: match[3] || '' };
+}
+
+function isChipsetModelToken(token) {
+  return extractModelCore(token) !== null;
+}
+
+function modelSuffixCompatible(querySuffix, candidateSuffix) {
+  if (!querySuffix || !candidateSuffix) return true;
+  if (querySuffix === candidateSuffix) return true;
+  if (candidateSuffix.startsWith(querySuffix) || querySuffix.startsWith(candidateSuffix)) return true;
+  // Variantes pegadas al chipset: b550m-a -> b550ma, b550m-vc -> b550mvc, b550mpro -> b550mpro.
+  if (querySuffix.length === 1 && candidateSuffix.startsWith(querySuffix)) return true;
+  return false;
+}
+
+function modelDigitsEquivalent(queryDigits, candidateDigits) {
+  if (queryDigits === candidateDigits) return 1;
+  if (queryDigits.length !== candidateDigits.length) return 0;
+  if (queryDigits[0] !== candidateDigits[0]) return 0;
+  let diffs = 0;
+  for (let i = 0; i < queryDigits.length; i += 1) {
+    if (queryDigits[i] !== candidateDigits[i]) diffs += 1;
+  }
+  if (diffs > 1) return 0;
+  return diffs === 0 ? 1 : 0.92;
+}
+
+function modelTokensEquivalent(queryToken, candidateToken) {
+  const q = extractModelCore(queryToken);
+  const c = extractModelCore(candidateToken);
+  if (!q || !c) return false;
+  if (q.prefix !== c.prefix) return false;
+  const digitScore = modelDigitsEquivalent(q.digits, c.digits);
+  if (!digitScore) return false;
+  if (q.suffix && !c.suffix) return false;
+  if (!modelSuffixCompatible(q.suffix, c.suffix)) return false;
+  return digitScore;
+}
+
+const CHIPSET_MODEL_PATTERN = /[a-z]{1,5}\d{2,5}[a-z]*/g;
+
+function collectChipsetModelCandidates(...texts) {
+  const candidates = new Set();
+  const parts = texts.map((text) => normalizeProductSearchText(text)).filter(Boolean);
+  const combined = parts.join(' ');
+  for (const norm of (combined ? [...parts, combined] : parts)) {
+    for (const token of norm.split(/\s+/).filter(Boolean)) {
+      candidates.add(token);
+      for (let i = 0; i < token.length; i += 1) {
+        if (!/[a-z]/.test(token[i])) continue;
+        const embedded = token.slice(i).match(/^([a-z]{1,5}\d{2,5}[a-z]*)/);
+        if (embedded?.[1] && embedded[1].length >= 4) candidates.add(embedded[1]);
+      }
+    }
+    const pattern = new RegExp(CHIPSET_MODEL_PATTERN.source, 'g');
+    let match;
+    while ((match = pattern.exec(norm)) !== null) {
+      if (match[0].length >= 4) candidates.add(match[0]);
+    }
+  }
+  return [...candidates];
+}
+
+function bestChipsetModelTokenMatch(queryToken, productTokens) {
+  let best = 0;
+  for (const token of productTokens) {
+    const score = modelTokensEquivalent(queryToken, token);
+    if (score > best) best = score;
+  }
+  return best;
+}
+
+function chipsetModelMatchInProduct(queryToken, product) {
+  const candidates = collectChipsetModelCandidates(
+    product?.nombre,
+    product?.marca,
+    product?.modelo,
+    product?.sku_woo,
+    product?.categoria,
+  );
+  return bestChipsetModelTokenMatch(queryToken, candidates);
+}
+
+function productBrandTokens(product) {
+  const found = new Set();
+  const marca = normalizeProductSearchText(product?.marca || '');
+  if (marca && PRODUCT_BRAND_TOKENS.has(marca)) found.add(marca);
+  for (const token of tokenizeProductSearch(product?.nombre || '')) {
+    if (PRODUCT_BRAND_TOKENS.has(token)) found.add(token);
+  }
+  return found;
+}
+
+function productHasBrand(product, brandToken) {
+  const brands = productBrandTokens(product);
+  if (brands.has(brandToken)) return true;
+  const marca = normalizeProductSearchText(product?.marca || '');
+  if (marca && productTokenSimilarity(brandToken, marca) >= 0.94) return true;
+  return tokenizeProductSearch(product?.nombre || '').some((token) => token === brandToken);
+}
+
+function productConflictsRequiredBrands(product, requiredBrands) {
+  if (!requiredBrands.length) return false;
+  const productBrands = productBrandTokens(product);
+  if (!productBrands.size) return false;
+  return Array.from(productBrands).some((brand) => !requiredBrands.includes(brand));
+}
+
+function bestProductTokenMatch(queryToken, productTokens, fieldText = '', product = null) {
+  if (PRODUCT_BRAND_TOKENS.has(queryToken)) {
+    if (product && productHasBrand(product, queryToken)) return 1;
+    let brandBest = 0;
+    for (const token of productTokens) {
+      if (token === queryToken) brandBest = 1;
+      else brandBest = Math.max(brandBest, productTokenSimilarity(queryToken, token));
+    }
+    return brandBest;
+  }
+  if (isChipsetModelToken(queryToken)) {
+    const candidates = fieldText
+      ? collectChipsetModelCandidates(fieldText)
+      : productTokens;
+    return bestChipsetModelTokenMatch(queryToken, candidates.length ? candidates : productTokens);
+  }
+  let best = 0;
+  for (const token of productTokens) {
+    best = Math.max(best, productTokenSimilarity(queryToken, token));
+  }
+  return best;
+}
+
+function strictQueryTokenMatch(queryToken, product) {
+  const nombre = String(product?.nombre || '');
+  const marca = String(product?.marca || '');
+  const modelo = String(product?.modelo || '');
+  const nombreTokens = tokenizeProductSearch(nombre);
+  const modeloTokens = tokenizeProductSearch(modelo);
+
+  if (PRODUCT_BRAND_TOKENS.has(queryToken)) {
+    return productHasBrand(product, queryToken) ? 1 : 0;
+  }
+
+  if (isModelLikeToken(queryToken)) {
+    const modelTokens = [...nombreTokens, ...modeloTokens];
+    if (isChipsetModelToken(queryToken)) {
+      const chipsetScore = chipsetModelMatchInProduct(queryToken, product);
+      if (chipsetScore > 0) return chipsetScore;
+      return bestChipsetModelTokenMatch(queryToken, modelTokens);
+    }
+    let best = 0;
+    for (const token of modelTokens) {
+      best = Math.max(best, productTokenSimilarity(queryToken, token));
+    }
+    return best >= 0.86 ? best : 0;
+  }
+
+  const nombreBest = bestProductTokenMatch(queryToken, nombreTokens);
+  if (nombreBest >= PRODUCT_SEARCH_MIN_TOKEN) return nombreBest;
+  const modeloBest = bestProductTokenMatch(queryToken, modeloTokens);
+  if (modeloBest >= PRODUCT_SEARCH_MIN_TOKEN) return modeloBest;
+  const marcaBest = productTokenSimilarity(queryToken, normalizeProductSearchText(marca));
+  if (marcaBest >= 0.94) return marcaBest;
+  return 0;
+}
+
+function productSearchText(product) {
+  return [product?.nombre, product?.marca, product?.modelo, product?.categoria, product?.sku_woo]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
+function fieldSearchSimilarity(queryTokens, fieldText, product = null) {
+  const fieldTokens = tokenizeProductSearch(fieldText);
+  if (!queryTokens.length || !fieldTokens.length) return 0;
+  const matches = queryTokens.map((token) => bestProductTokenMatch(token, fieldTokens, fieldText, product));
+  if (matches.some((score) => score < PRODUCT_SEARCH_MIN_TOKEN)) return 0;
+  return geometricMean(matches);
+}
+
+function orderedTokenPhraseScore(queryTokens, fieldText) {
+  const fieldTokens = tokenizeProductSearch(fieldText);
+  if (!queryTokens.length || !fieldTokens.length) return 0;
+  let cursor = 0;
+  let used = 0;
+  for (const qToken of queryTokens) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    for (let idx = cursor; idx < fieldTokens.length; idx += 1) {
+      const score = productTokenSimilarity(qToken, fieldTokens[idx]);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = idx;
+      }
+    }
+    if (bestScore < PRODUCT_SEARCH_MIN_TOKEN) return 0;
+    used += bestScore;
+    cursor = bestIndex + 1;
+  }
+  return used / queryTokens.length;
+}
+
+function productSearchScore(query, product) {
+  const q = String(query || '').trim();
+  if (!q) return 1;
+  const qTokens = tokenizeProductSearch(q);
+  if (!qTokens.length) return 0;
+
+  const nombre = String(product?.nombre || '');
+  const marca = String(product?.marca || '');
+  const modelo = String(product?.modelo || '');
+  const requiredBrands = qTokens.filter((token) => PRODUCT_BRAND_TOKENS.has(token));
+
+  if (productConflictsRequiredBrands(product, requiredBrands)) return 0;
+  for (const brandToken of requiredBrands) {
+    if (!productHasBrand(product, brandToken)) return 0;
+  }
+
+  const tokenMatches = qTokens.map((token) => strictQueryTokenMatch(token, product));
+  if (tokenMatches.some((score) => score < PRODUCT_SEARCH_MIN_TOKEN)) return 0;
+
+  const fullGeo = geometricMean(tokenMatches);
+  const nombreField = fieldSearchSimilarity(qTokens, nombre, product);
+  const modeloField = fieldSearchSimilarity(qTokens, modelo, product);
+  const orderedNombre = orderedTokenPhraseScore(qTokens, nombre);
+
+  const nombreNorm = normalizeProductSearchText(nombre);
+  const queryNorm = normalizeProductSearchText(q);
+  let exactBonus = 0;
+  if (nombreNorm === queryNorm) exactBonus = 0.35;
+  else if (nombreNorm.includes(queryNorm)) exactBonus = 0.24;
+  else if (qTokens.every((token) => nombreNorm.includes(token))) exactBonus = 0.14;
+
+  const score = (
+    0.5 * fullGeo
+    + 0.28 * (nombreField || orderedNombre || 0)
+    + 0.12 * (modeloField || 0)
+    + 0.1 * orderedNombre
+    + exactBonus
+  );
+
+  if (requiredBrands.length && qTokens.some((token) => isModelLikeToken(token))) {
+    const brandOk = requiredBrands.every((brand) => productHasBrand(product, brand));
+    const modelOk = qTokens.filter((token) => isModelLikeToken(token))
+      .every((token) => strictQueryTokenMatch(token, product) >= PRODUCT_SEARCH_MIN_TOKEN);
+    if (!brandOk || !modelOk) return 0;
+    return Math.min(1, Math.max(score + 0.08, fullGeo * 0.92));
+  }
+
+  let finalScore = Math.min(1, score);
+  if (tokenMatches.every((matchScore) => matchScore >= PRODUCT_SEARCH_MIN_TOKEN)) {
+    finalScore = Math.max(finalScore, fullGeo * 0.92);
+  }
+  return finalScore;
+}
+
+function filterProductsBySearch(products, query, { limit, minScore = PRODUCT_SEARCH_MIN_SCORE } = {}) {
+  const q = String(query || '').trim();
+  if (!q) return products;
+  const ranked = products
+    .map((product) => ({ product, score: productSearchScore(q, product) }))
+    .filter((row) => row.score >= minScore)
+    .sort((a, b) => b.score - a.score || String(a.product?.nombre || '').localeCompare(String(b.product?.nombre || '')));
+  const max = Number.isFinite(limit) ? limit : ranked.length;
+  return ranked.slice(0, max).map((row) => row.product);
+}
+
 function okResponse(value) {
   if (!value || typeof value !== 'object') return false;
   return value.ok === true || value.success === true || value.data !== undefined || value.id !== undefined;
@@ -237,6 +579,7 @@ function docNumber(doc) {
 
 const DOCUMENT_EDIT_USERS = new Set(['giomar']);
 const SERIES_EDIT_USERS = new Set(['giomar', 'mily']);
+const SUNAT_EMIT_USERS = new Set(['giomar', 'jean', 'mily']);
 
 function normalizeUserForPermission(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -244,6 +587,10 @@ function normalizeUserForPermission(value) {
 
 function canEditProcessedDocuments(user) {
   return DOCUMENT_EDIT_USERS.has(normalizeUserForPermission(user));
+}
+
+function canEmitLegalSunat(user) {
+  return SUNAT_EMIT_USERS.has(normalizeUserForPermission(user));
 }
 
 function canEditSeries(user) {
@@ -2050,7 +2397,6 @@ function DashboardView({ setView }) {
 
 function VentasView({ user, sound, soundEnabled, setView }) {
   const saleUserName = user && typeof user === 'object' ? (user.usuario || '') : String(user || '');
-  const canEditLineNames = !['giomar', 'mily'].includes(saleUserName.trim().toLowerCase());
   const saleTabsStorageKey = `gg_erp_sale_tabs_${EMPRESA}_${saleUserName || 'usuario'}`;
   const loadStoredSaleState = () => {
     try {
@@ -2090,9 +2436,7 @@ function VentasView({ user, sound, soundEnabled, setView }) {
 
   const isProforma = docType === 'PROFORMA';
   const isTestProduct = (item) => /(^|\s)(producto\s*)?prueba($|\s)|random|varios/i.test(String(item?.nombre || item?.descripcion || ''));
-  const filtered = products
-    .filter((p) => `${p.nombre || ''} ${p.categoria || ''} ${p.marca || ''} ${p.modelo || ''}`.toLowerCase().includes(query.toLowerCase()))
-    .slice(0, 120);
+  const filtered = filterProductsBySearch(products, query, { limit: 120 });
   const total = cart.reduce((sum, item) => sum + Number(item.total || 0), 0);
   const selectedLine = selectedLineIndex === null ? null : cart[selectedLineIndex] || null;
   const selectedLineSeries = selectedLine ? splitSeriesInput(selectedLine.series_texto) : [];
@@ -2356,7 +2700,7 @@ function VentasView({ user, sound, soundEnabled, setView }) {
     setCart((current) => current.map((item, i) => {
       if (i !== idx) return item;
       const cleanPatch = { ...patch };
-      if (cleanPatch.nombre !== undefined && !item.is_test_product && !canEditLineNames) delete cleanPatch.nombre;
+      if (cleanPatch.nombre !== undefined && !item.is_test_product) delete cleanPatch.nombre;
       if (cleanPatch.precio !== undefined) cleanPatch.precio = cleanPriceInput(cleanPatch.precio);
       const next = { ...item, ...cleanPatch };
       if (cleanPatch.nombre !== undefined) next.descripcion = cleanPatch.nombre;
@@ -2384,10 +2728,18 @@ function VentasView({ user, sound, soundEnabled, setView }) {
     }
   };
 
-  const issue = async () => {
+  const issue = async (legalSunat = false) => {
     if (!cart.length || (!isProforma && !client.cliente_nombre)) {
       alert(isProforma ? 'Agrega productos para procesar la proforma.' : 'Completa cliente y productos.');
       return;
+    }
+    if (legalSunat) {
+      if (!['BOLETA', 'FACTURA'].includes(docType)) {
+        alert('EMITIR solo aplica a boleta o factura legal.');
+        return;
+      }
+      const serieLegal = docType === 'BOLETA' ? 'B002' : 'F002';
+      if (!window.confirm(`Emitir ${docType} LEGAL (${serieLegal}) y enviar a SUNAT?`)) return;
     }
     setSaving(true);
     try {
@@ -2402,6 +2754,7 @@ function VentasView({ user, sound, soundEnabled, setView }) {
         json: {
           tipo: isProforma ? 'PROFORMA' : docType,
           es_pase: docType === 'PASE' && esPase,
+          emitir_legal_sunat: !!legalSunat,
           ...clientPayload,
           usuario_emisor: user,
           fecha_emision: localTimestampForApi(),
@@ -2415,6 +2768,13 @@ function VentasView({ user, sound, soundEnabled, setView }) {
       if (!okResponse(res)) {
         alert(res.msg || 'No se pudo emitir.');
         return;
+      }
+      if (legalSunat && res.sunat_auto) {
+        const sa = res.sunat_auto;
+        const err = sunatErrorSnippet(sa.respuesta);
+        if (!okResponse(sa) && !sa.success) {
+          alert(err ? `${res.numero || 'Documento'} creado. SUNAT: ${err}` : `${res.numero || 'Documento'} creado. ${sa.msg || 'Revisa configuracion SUNAT.'}`);
+        }
       }
       if (soundEnabled) await sound.play();
       const issuedDoc = {
@@ -2574,13 +2934,18 @@ function VentasView({ user, sound, soundEnabled, setView }) {
           </div>
         )}
         <TextInput placeholder="Buscar producto..." value={query} onChange={(e) => setQuery(e.target.value)} className="h-12 text-lg" />
-        <div className="mt-3 grid gap-3 md:grid-cols-[minmax(220px,1fr)_220px_220px]">
+        <div className="mt-3 grid gap-3 md:grid-cols-[minmax(220px,1fr)_220px_minmax(220px,1fr)]">
           <div className="flex items-center justify-between rounded-md bg-slate-100 px-6 py-4">
             <span className="text-2xl font-black uppercase text-slate-700">Total</span>
             <span className="text-3xl font-black text-slate-950">{money(total)}</span>
           </div>
           <ActionButton tone="blue" onClick={previewDocument}>Vista previa</ActionButton>
-          <ActionButton disabled={saving} onClick={issue}>{isProforma ? 'Procesar' : 'Enviar a caja'}</ActionButton>
+          <div className="flex gap-2">
+            <ActionButton className="flex-1" disabled={saving} onClick={() => issue(false)}>{isProforma ? 'Procesar' : 'Procesar'}</ActionButton>
+            {canEmitLegalSunat(saleUserName) && !isProforma && ['BOLETA', 'FACTURA'].includes(docType) && (
+              <ActionButton tone="amber" className="min-w-[84px] px-2 text-xs font-black" disabled={saving} onClick={() => issue(true)}>EMITIR</ActionButton>
+            )}
+          </div>
         </div>
       </footer>
 
@@ -2590,12 +2955,11 @@ function VentasView({ user, sound, soundEnabled, setView }) {
             <Field label="Nombre">
               <TextInput
                 value={selectedLine.nombre}
-                readOnly={!selectedLine.is_test_product && !canEditLineNames}
+                readOnly={!selectedLine.is_test_product}
                 onChange={(e) => updateCart(selectedLineIndex, { nombre: e.target.value })}
-                className={!selectedLine.is_test_product && !canEditLineNames ? 'bg-slate-100 font-black uppercase' : 'font-black uppercase'}
+                className={!selectedLine.is_test_product ? 'bg-slate-100 font-black uppercase' : 'font-black uppercase'}
               />
-              {!selectedLine.is_test_product && !canEditLineNames && <div className="mt-1 text-xs font-semibold text-slate-500">Nombre bloqueado para mantener el nombre real interno.</div>}
-              {!selectedLine.is_test_product && canEditLineNames && <div className="mt-1 text-xs font-semibold text-slate-500">Puedes cambiar el nombre visible; stock y series usan el producto interno real.</div>}
+              {!selectedLine.is_test_product && <div className="mt-1 text-xs font-semibold text-slate-500">Nombre bloqueado para mantener el nombre real interno.</div>}
             </Field>
             <Field label="Almacen salida">
               <SelectInput value={selectedLine.almacen || 'TIENDA'} onChange={(e) => updateCart(selectedLineIndex, { almacen: e.target.value })}>
@@ -2707,7 +3071,7 @@ function LegacyVentasView({ user, sound, soundEnabled }) {
   const load = async () => setProducts(asArray(await apiFetch('/productos')));
   useEffect(() => { load(); }, []);
 
-  const filtered = products.filter((p) => `${p.nombre || ''} ${p.marca || ''} ${p.modelo || ''}`.toLowerCase().includes(query.toLowerCase())).slice(0, 80);
+  const filtered = filterProductsBySearch(products, query, { limit: 80 });
   const total = cart.reduce((sum, item) => sum + Number(item.total || 0), 0);
   const isProforma = docType === 'PROFORMA';
   const draftDoc = () => ({
@@ -3536,9 +3900,7 @@ function ReservasView({ user, setView }) {
     });
   };
 
-  const filteredProducts = products
-    .filter((p) => `${p.nombre || ''} ${p.categoria || ''} ${p.marca || ''}`.toLowerCase().includes(productQuery.toLowerCase()))
-    .slice(0, 40);
+  const filteredProducts = filterProductsBySearch(products, productQuery, { limit: 40 });
   const totalReservado = reservas
     .filter((r) => !['ANULADO', 'ENTREGADO'].includes(String(r.estado || '').toUpperCase()))
     .reduce((sum, r) => sum + Number(r.monto_reserva || 0), 0);
@@ -3851,11 +4213,10 @@ function ProductosView({ user }) {
     return (rank[ea] ?? 9) - (rank[eb] ?? 9) || String(a.serie || '').localeCompare(String(b.serie || ''));
   });
   const pendingSeriesCount = splitSeriesInput(serieForm.serie).length;
-  const filtered = products.filter((p) => {
-    const matchesCategory = category === 'TODAS' || String(p.categoria || '').toLowerCase() === category.toLowerCase();
-    const matchesSearch = `${p.nombre || ''} ${p.categoria || ''} ${p.marca || ''} ${p.modelo || ''}`.toLowerCase().includes(search.toLowerCase());
-    return matchesCategory && matchesSearch;
-  });
+  const filtered = filterProductsBySearch(
+    products.filter((p) => category === 'TODAS' || String(p.categoria || '').toLowerCase() === category.toLowerCase()),
+    search,
+  );
   const edit = (p) => {
     if (!p) {
       alert('Selecciona un producto para editar.');
@@ -4280,11 +4641,10 @@ function InventarioView({ user }) {
   const categories = useMemo(() => ['TODAS', ...Array.from(new Set(products.map((p) => String(p.categoria || '').trim()).filter(Boolean))).sort()], [products]);
   const selectedSeries = series.filter((s) => String(s.producto_id) === String(selected?.id));
   const pendingSeriesCount = splitSeriesInput(serieForm.serie).length;
-  const filtered = products.filter((p) => {
-    const matchesCategory = category === 'TODAS' || String(p.categoria || '').toLowerCase() === category.toLowerCase();
-    const matchesQuery = `${p.nombre || ''} ${p.categoria || ''} ${p.marca || ''} ${p.modelo || ''}`.toLowerCase().includes(query.toLowerCase());
-    return matchesCategory && matchesQuery;
-  });
+  const filtered = filterProductsBySearch(
+    products.filter((p) => category === 'TODAS' || String(p.categoria || '').toLowerCase() === category.toLowerCase()),
+    query,
+  );
   const adjust = async () => { if (!selected) return; const res = await apiFetch(`/productos/${selected.id}/ajustar-stock`, { method: 'POST', json: { stock: Number(stockReal || 0) } }); if (okResponse(res)) { await load(); await loadMovements(selected.id); alert('Stock actualizado.'); } else alert(res.msg || 'Error.'); };
   const editSerie = (serie) => setSerieForm({ id: serie.id || '', serie: serie.serie || '', proveedor: serie.proveedor || localStorage.getItem('gg_erp_last_provider') || '', estado: serie.estado || 'DISPONIBLE', almacen: serie.almacen || localStorage.getItem('gg_erp_last_warehouse') || 'TIENDA', fecha_ingreso: String(serie.fecha_ingreso || localDateForApi()).slice(0, 10), usuario_ingreso: serie.usuario_ingreso || user || '' });
   const resetSerie = () => setSerieForm((current) => ({ id: '', serie: '', proveedor: current.proveedor || localStorage.getItem('gg_erp_last_provider') || '', estado: current.estado || localStorage.getItem('gg_erp_last_series_state') || 'DISPONIBLE', almacen: current.almacen || localStorage.getItem('gg_erp_last_warehouse') || 'TIENDA', fecha_ingreso: current.fecha_ingreso || localDateForApi(), usuario_ingreso: user || '' }));
@@ -4449,9 +4809,7 @@ function ComprasView({ user }) {
   );
   const showCreateProveedor = proveedorNombre && !proveedor.id && !proveedorExiste;
 
-  const filteredProducts = products.filter((p) =>
-    `${p.nombre} ${p.marca} ${p.modelo} ${p.categoria || ''}`.toLowerCase().includes(productQuery.toLowerCase())
-  ).slice(0, 12);
+  const filteredProducts = filterProductsBySearch(products, productQuery, { limit: 12 });
   const showProductSuggestions = productQuery.trim().length > 0;
 
   const addProduct = (p) => {
@@ -4837,6 +5195,8 @@ function DocumentosView({ sound, soundEnabled, user }) {
   const [editorTargetLine, setEditorTargetLine] = useState(0);
   const [convertOpen, setConvertOpen] = useState(false);
   const [convertForm, setConvertForm] = useState({ tipo: 'BOLETA', estado_pago: 'PAGADO', metodo_pago: 'EFECTIVO', observacion: '' });
+  const [sunatInfo, setSunatInfo] = useState(null);
+  const [sunatPolling, setSunatPolling] = useState(false);
   const load = async (date = docDate, query = docSearch) => {
     const cleanQuery = String(query || '').trim();
     const params = {};
@@ -4855,22 +5215,86 @@ function DocumentosView({ sound, soundEnabled, user }) {
   const selected = docs.find((d) => String(d.id) === String(selectedId));
   const canEditDocuments = canEditProcessedDocuments(user);
   const filtered = docs.filter((d) => filter === 'TODOS' || String(d.tipo || '').toUpperCase() === filter);
-  const loadDetail = async (id) => { setSelectedId(String(id)); setDetail(await apiFetch(`/documentos/${id}`)); };
-  const setSunat = async (state) => { if (!selected) return; const res = await apiFetch(`/documentos/${selected.id}/sunat`, { method: 'PUT', json: { sunat_estado: state, sunat_modo: state === 'PENDIENTE' ? 'NO_ENVIAR' : 'MANUAL' } }); if (okResponse(res)) { if (soundEnabled) await sound.play(); await load(); } else alert(res.msg || 'No se pudo actualizar SUNAT.'); };
+  const applySunatEstado = (id, estadoRow) => {
+    if (!id || !estadoRow) return;
+    setDocs((current) => current.map((row) => (
+      String(row.id) === String(id)
+        ? { ...row, sunat_estado: estadoRow.sunat_estado, sunat_modo: estadoRow.sunat_modo, sunat_fecha: estadoRow.sunat_fecha }
+        : row
+    )));
+    setDetail((current) => {
+      if (!current?.documento || String(current.documento.id) !== String(id)) return current;
+      return {
+        ...current,
+        documento: {
+          ...current.documento,
+          sunat_estado: estadoRow.sunat_estado,
+          sunat_modo: estadoRow.sunat_modo,
+          sunat_fecha: estadoRow.sunat_fecha,
+        },
+      };
+    });
+  };
+  const refreshSunatEstado = async (id = selectedId) => {
+    if (!id) return null;
+    const res = await apiFetch(`/sunat/documentos/${id}/estado`);
+    if (okResponse(res)) {
+      applySunatEstado(id, res);
+      setSunatInfo(res);
+      return res;
+    }
+    return null;
+  };
+  const loadDetail = async (id) => {
+    setSelectedId(String(id));
+    setDetail(await apiFetch(`/documentos/${id}`));
+    await refreshSunatEstado(id);
+  };
+  useEffect(() => {
+    const watchDocs = selected ? [selected, ...docs] : docs;
+    const shouldPoll = watchDocs.some((row) => docNeedsSunatPolling(row));
+    if (!shouldPoll) {
+      setSunatPolling(false);
+      return undefined;
+    }
+    setSunatPolling(true);
+    const timer = window.setInterval(async () => {
+      const targets = [...new Set(watchDocs.filter((row) => docNeedsSunatPolling(row)).map((row) => row.id))];
+      await Promise.all(targets.map((id) => refreshSunatEstado(id)));
+      await load(docDate, docSearch);
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [docs, selectedId, selected?.sunat_estado, docDate, docSearch]);
+  const setSunat = async (state) => { if (!selected) return; const res = await apiFetch(`/documentos/${selected.id}/sunat`, { method: 'PUT', json: { sunat_estado: state, sunat_modo: state === 'PENDIENTE' ? 'NO_ENVIAR' : 'MANUAL' } }); if (okResponse(res)) { if (soundEnabled) await sound.play(); await load(); await refreshSunatEstado(selected.id); } else alert(res.msg || 'No se pudo actualizar SUNAT.'); };
   const remove = async () => { if (!selected || !confirm(`Eliminar ${selected.tipo} ${docNumber(selected)}?`)) return; const res = await apiFetch(`/documentos/${selected.id}`, { method: 'DELETE' }); if (okResponse(res)) { setSelectedId(''); setDetail(null); await load(); } else alert(res.msg || 'No se pudo eliminar.'); };
   const annulDoc = async () => { if (!selected || !confirm(`Anular ${selected.tipo} ${docNumber(selected)} y restaurar stock?`)) return; const motivo = prompt('Motivo de anulacion', 'Anulado desde documentos') || 'Anulado desde documentos'; const res = await apiFetch(`/documentos/${selected.id}/anular`, { method: 'POST', json: { usuario: user || '', motivo } }); if (okResponse(res)) { if (soundEnabled) await sound.play(); await load(docDate, docSearch); await loadDetail(selected.id); alert(res.msg || 'Documento anulado.'); } else alert(res.msg || 'No se pudo anular.'); };
   const sendSunat = async () => {
     if (!selected) return;
+    if (sunatDocEsInterno(selected)) {
+      alert('Documento interno de caja. No se envia a SUNAT.');
+      return;
+    }
     const res = await apiFetch(`/sunat/documentos/${selected.id}/enviar`, { method: 'POST', json: { regenerar: true } });
+    if (res.sunat_estado) {
+      applySunatEstado(selected.id, {
+        sunat_estado: res.sunat_estado,
+        sunat_modo: 'API',
+        sunat_fecha: new Date().toISOString(),
+        respuesta: { http_status: res.http_status, response: res.respuesta },
+      });
+    }
+    await refreshSunatEstado(selected.id);
     await load(docDate, docSearch);
-    await loadDetail(selected.id);
-    alert(res.msg || res.sunat_estado || (okResponse(res) ? 'Enviado a SUNAT.' : 'No se pudo enviar a SUNAT.'));
+    const err = sunatErrorSnippet(res.respuesta || sunatInfo?.respuesta);
+    const estado = res.sunat_estado || sunatInfo?.sunat_estado || 'PENDIENTE';
+    alert(err ? `SUNAT ${estado}: ${err}` : (res.msg || `SUNAT: ${estado}`));
   };
   const checkSunat = async () => {
     if (!selected) return;
-    const res = await apiFetch(`/sunat/documentos/${selected.id}/estado`);
-    await loadDetail(selected.id);
-    alert(okResponse(res) ? `SUNAT: ${res.sunat_estado || 'PENDIENTE'}` : (res.msg || 'No se pudo consultar SUNAT.'));
+    const res = await refreshSunatEstado(selected.id);
+    await load(docDate, docSearch);
+    const err = sunatErrorSnippet(res?.respuesta);
+    alert(okResponse(res) ? (err ? `SUNAT ${res.sunat_estado}: ${err}` : `SUNAT: ${res.sunat_estado || 'PENDIENTE'}`) : (res?.msg || 'No se pudo consultar SUNAT.'));
   };
   const openInternalDoc = async () => {
     if (!selected) return;
@@ -5064,7 +5488,7 @@ function DocumentosView({ sound, soundEnabled, user }) {
     } else alert(res.msg || 'No se pudo convertir la proforma.');
   };
   const lines = detailLinesFromPayload(detail);
-  return <div className="grid gap-4 xl:grid-cols-[1fr_430px]"><Card title="Documentos" actions={<><TextInput placeholder="Buscar producto en todas las fechas..." value={docSearch} onChange={(e) => setDocSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load(docDate, e.currentTarget.value)} className="w-72" /><ActionButton tone="blue" onClick={() => load(docDate, docSearch)}>Buscar</ActionButton><ActionButton tone="neutral" onClick={() => shiftDocDate(-1)}>‹</ActionButton><TextInput type="date" value={docDate} onChange={(e) => { setDocDate(e.target.value); load(e.target.value, ''); }} className="w-36" /><ActionButton tone="neutral" onClick={() => shiftDocDate(1)}>›</ActionButton><SelectInput value={filter} onChange={(e) => setFilter(e.target.value)} className="w-40"><option>TODOS</option>{DOC_TYPES.map((t) => <option key={t}>{t}</option>)}</SelectInput><ActionButton tone="blue" onClick={() => setManualOpen(true)}>Boleta manual</ActionButton><ActionButton tone="neutral" onClick={() => { setDocSearch(''); load(docDate, ''); }}>Limpiar</ActionButton><ActionButton tone="neutral" onClick={() => load(docDate, docSearch)}>Actualizar</ActionButton></>}><div className="max-h-[680px] overflow-auto">{filtered.map((d) => <button key={d.id} onClick={() => loadDetail(d.id)} className={`grid w-full gap-2 border-b border-slate-100 p-3 text-left md:grid-cols-[110px_1fr_100px_110px] ${String(selectedId) === String(d.id) ? 'bg-teal-50' : ''}`}><b>{d.tipo}</b><span><b className="text-slate-700">Fecha: {String(d.fecha_emision || d.fecha || '').slice(0, 10)}</b><br />{docNumber(d)} / {d.cliente_nombre}</span><b>{money(d.total)}</b><span className={`rounded-md px-2 py-1 text-center text-xs font-black ${String(d.estado || '').toUpperCase() === 'ANULADO' ? 'bg-red-100 text-red-700' : String(d.sunat_estado || '').toUpperCase() === 'ACEPTADO' ? 'bg-emerald-100 text-emerald-700' : String(d.sunat_estado || '').toUpperCase() === 'RECHAZADO' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>{String(d.estado || '').toUpperCase() === 'ANULADO' ? 'ANULADO' : `SUNAT ${d.sunat_estado || 'PENDIENTE'}`}</span></button>)}</div></Card><aside className="grid gap-4"><Card title="Detalle / SUNAT">{selected ? <div className="grid gap-3"><div className="rounded-md bg-slate-50 p-3 text-sm"><b>{selected.tipo} {docNumber(selected)}</b><div>{selected.cliente_nombre}</div><div>{money(selected.total)}</div><div className={`mt-2 rounded-md p-2 text-xs font-black ${String(selected.sunat_estado || '').toUpperCase() === 'ACEPTADO' ? 'bg-emerald-100 text-emerald-700' : String(selected.sunat_estado || '').toUpperCase() === 'RECHAZADO' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>SUNAT: {selected.sunat_estado || 'PENDIENTE'}</div>{String(selected.estado || '').toUpperCase() === 'ANULADO' && <div className="mt-2 rounded-md bg-red-100 p-2 text-xs font-black text-red-700">DOCUMENTO ANULADO</div>}</div><div className="grid grid-cols-2 gap-2">{SUNAT_STATES.map((s) => <ActionButton key={s} tone={s === 'RECHAZADO' ? 'danger' : 'neutral'} onClick={() => setSunat(s)}>{s}</ActionButton>)}</div><div className="grid grid-cols-2 gap-2"><ActionButton tone="blue" onClick={openInternalDoc}>Ver PDF</ActionButton>{String(selected.estado || '').toUpperCase() !== 'ANULADO' && <ActionButton tone="violet" onClick={openDocumentEditor}>Cambiar boleta / productos / series</ActionButton>}{['BOLETA', 'FACTURA'].includes(String(selected.tipo || '').toUpperCase()) && <ActionButton tone="blue" onClick={sendSunat}>Enviar SUNAT</ActionButton>}{['BOLETA', 'FACTURA'].includes(String(selected.tipo || '').toUpperCase()) && <ActionButton tone="neutral" onClick={checkSunat}>Estado SUNAT</ActionButton>}{String(selected.tipo || '').toUpperCase() === 'PROFORMA' && <ActionButton onClick={() => setConvertOpen(true)}>Crear boleta/factura</ActionButton>}<ActionButton tone="danger" onClick={annulDoc}>Anular</ActionButton><ActionButton tone="danger" onClick={remove}>Eliminar</ActionButton></div><div className="max-h-72 overflow-auto">{lines.map((l) => <div key={l.id} className="border-b border-slate-100 py-2 text-xs"><b>{l.descripcion || l.nombre}</b><div>{l.cantidad} x {money(l.precio_unitario || l.precio)} = {money(l.total)}</div>{(l.series_texto || l.serie) && <div className="font-bold text-blue-700">S/N: {l.series_texto || l.serie}</div>}</div>)}</div></div> : <Empty text="Selecciona un documento." />}</Card></aside>{manualOpen && <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-3"><section className="w-full max-w-xl rounded-lg bg-white shadow-2xl"><header className="flex items-center justify-between border-b border-slate-200 p-3"><h2 className="text-lg font-black">Boleta manual por series</h2><button className="rounded-md bg-slate-100 px-3 py-2 text-xs font-black" onClick={() => setManualOpen(false)}>Cerrar</button></header><div className="grid gap-3 p-3"><div className="grid grid-cols-2 gap-2"><Field label="Tipo"><SelectInput value={manualForm.tipo} onChange={(e) => setManualForm({ ...manualForm, tipo: e.target.value })}><option>BOLETA</option><option>FACTURA</option><option>PASE</option></SelectInput></Field><Field label="Numero"><TextInput value={manualForm.numero} onChange={(e) => setManualForm({ ...manualForm, numero: e.target.value })} /></Field></div><Field label="Cliente / pase"><TextInput value={manualForm.cliente_nombre} onChange={(e) => setManualForm({ ...manualForm, cliente_nombre: e.target.value })} /></Field><Field label="Fecha"><TextInput type="date" value={manualForm.fecha_emision} onChange={(e) => setManualForm({ ...manualForm, fecha_emision: e.target.value })} /></Field><Field label="Series"><TextArea value={manualForm.series_texto} onChange={(e) => setManualForm({ ...manualForm, series_texto: e.target.value })} /></Field><Field label="Observacion"><TextInput value={manualForm.observacion} onChange={(e) => setManualForm({ ...manualForm, observacion: e.target.value })} /></Field></div><footer className="grid grid-cols-2 gap-2 border-t border-slate-200 p-3"><ActionButton tone="neutral" onClick={() => setManualOpen(false)}>Cancelar</ActionButton><ActionButton onClick={saveManualSeries}>Registrar</ActionButton></footer></section></div>}{convertOpen && <Modal title="Crear boleta/factura desde proforma" onClose={() => setConvertOpen(false)}><div className="grid gap-3"><Field label="Tipo"><SelectInput value={convertForm.tipo} onChange={(e) => setConvertForm({ ...convertForm, tipo: e.target.value })}><option>BOLETA</option><option>FACTURA</option></SelectInput></Field><Field label="Estado pago"><SelectInput value={convertForm.estado_pago} onChange={(e) => setConvertForm({ ...convertForm, estado_pago: e.target.value })}>{PAY_STATES.map((s) => <option key={s}>{s}</option>)}</SelectInput></Field><Field label="Metodo"><SelectInput value={convertForm.metodo_pago} onChange={(e) => setConvertForm({ ...convertForm, metodo_pago: e.target.value })}>{PAY_METHODS.map((m) => <option key={m}>{m}</option>)}</SelectInput></Field><Field label="Observacion"><TextInput value={convertForm.observacion} onChange={(e) => setConvertForm({ ...convertForm, observacion: e.target.value })} placeholder="Convertido desde proforma" /></Field><div className="grid grid-cols-2 gap-2"><ActionButton tone="neutral" onClick={() => setConvertOpen(false)}>Cancelar</ActionButton><ActionButton onClick={convertProforma}>Crear documento</ActionButton></div></div></Modal>}{proformaEditor && <Modal title={`Cambiar ${proformaEditor.tipo || 'documento'} ${proformaEditor.numero || `#${proformaEditor.id}`}`} onClose={() => setProformaEditor(null)}><div className="grid gap-3"><Field label="Cliente"><TextInput value={proformaEditor.cliente_nombre} onChange={(e) => setProformaEditor({ ...proformaEditor, cliente_nombre: e.target.value })} /></Field><Field label="Documento cliente"><TextInput value={proformaEditor.documento_cliente} onChange={(e) => setProformaEditor({ ...proformaEditor, documento_cliente: e.target.value })} /></Field><Field label="Direccion"><TextInput value={proformaEditor.direccion_cliente} onChange={(e) => setProformaEditor({ ...proformaEditor, direccion_cliente: e.target.value })} /></Field><Field label="Vencimiento"><TextInput type="date" value={proformaEditor.fecha_vencimiento} onChange={(e) => setProformaEditor({ ...proformaEditor, fecha_vencimiento: e.target.value })} /></Field><div className="rounded-md border border-orange-200 bg-orange-50 p-3"><div className="grid gap-2 md:grid-cols-[160px_1fr_auto]"><Field label="Linea a cambiar"><SelectInput value={editorTargetLine} onChange={(e) => setEditorTargetLine(Number(e.target.value || 0))}>{proformaEditor.lines.map((line, idx) => <option key={idx} value={idx}>Linea {idx + 1}</option>)}</SelectInput></Field><Field label="Buscar producto interno"><TextInput value={editorProductQuery} onChange={(e) => setEditorProductQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadEditorProducts(e.currentTarget.value)} placeholder="Escribe nombre, marca o modelo" /></Field><div className="flex items-end gap-2"><ActionButton tone="blue" onClick={() => loadEditorProducts(editorProductQuery)}>Buscar</ActionButton><ActionButton tone="neutral" onClick={addEditorLine}>Agregar linea</ActionButton></div></div>{editorProducts.length > 0 && <div className="mt-2 max-h-44 overflow-auto rounded-md bg-white">{editorProducts.map((p) => <button type="button" key={p.id} onClick={() => selectEditorProduct(p)} className="grid w-full grid-cols-[1fr_auto] gap-2 border-b border-slate-100 p-2 text-left text-xs hover:bg-orange-50"><span><b>{p.nombre}</b><div className="text-slate-500">{p.categoria || 'Sin categoria'} / {p.marca || ''} / Stock {p.stock ?? 0}</div></span><b>{money(p.precio_venta || p.precio || 0)}</b></button>)}</div>}<p className="mt-2 text-xs font-bold text-orange-900">Usa esto cuando el cliente cambia producto o cuando quieres vincular la linea con el producto real interno para stock y series.</p></div><div className="max-h-80 overflow-auto rounded-md border border-slate-100">{proformaEditor.lines.map((line, idx) => <div key={`${line.id || idx}`} className="grid gap-2 border-b border-slate-100 p-2 md:grid-cols-[1fr_80px_110px_105px_auto]"><div><TextInput value={line.descripcion} onChange={(e) => updateProformaLine(idx, { descripcion: e.target.value })} placeholder="Producto / descripcion" /><div className="mt-1 text-[11px] font-black text-slate-500">Interno: {line.producto_id ? `#${line.producto_id}` : 'sin producto vinculado'}</div></div><TextInput inputMode="numeric" value={line.cantidad} onChange={(e) => updateProformaLine(idx, { cantidad: e.target.value })} /><div className="grid grid-cols-[1fr_auto_auto] gap-1"><TextInput inputMode="decimal" value={line.precio} onFocus={(e) => e.target.select()} onChange={(e) => updateProformaLine(idx, { precio: e.target.value })} /><button type="button" className="rounded-md bg-emerald-100 px-2 text-xs font-black text-emerald-800" onClick={() => updateProformaLine(idx, { precio: price99(line.precio) })}>.99</button><button type="button" className="rounded-md bg-slate-100 px-2 text-xs font-black text-slate-700" onClick={() => copyText(parsePrice(line.precio).toFixed(2))}>Copiar</button></div><b className="grid place-items-center rounded-md bg-slate-50 text-sm">{money(line.total)}</b><button type="button" className="rounded-md bg-red-100 px-2 text-xs font-black text-red-700" onClick={() => removeEditorLine(idx)}>Quitar</button><TextArea className="md:col-span-5 min-h-[86px]" placeholder="Series, una por linea. Puedes agregar las series que faltaron." value={line.series_texto} onChange={(e) => updateProformaLine(idx, { series_texto: e.target.value })} /></div>)}</div><Field label="Observacion del documento"><TextArea value={proformaEditor.observacion} onChange={(e) => setProformaEditor({ ...proformaEditor, observacion: e.target.value })} placeholder="Observacion visible del documento (opcional)" /></Field><Field label="Observacion del cambio (obligatorio)"><TextArea className="min-h-24" value={proformaEditor.observacion_cambio || ''} onChange={(e) => setProformaEditor({ ...proformaEditor, observacion_cambio: e.target.value })} placeholder="Ej: Cliente pidio cambiar producto / corregir precio / agregar series faltantes" /></Field><div className="rounded-md border border-violet-200 bg-violet-50 p-2 text-xs font-semibold text-violet-800">Solo Giomar puede editar. Este motivo queda guardado en la nota interna y en Registro.</div><div className="grid grid-cols-2 gap-2"><ActionButton tone="neutral" onClick={() => setProformaEditor(null)}>Cancelar</ActionButton><ActionButton onClick={saveProformaEditor}>Guardar cambios y recalcular stock</ActionButton></div></div></Modal>}<DocumentViewerModal viewer={viewer} onClose={() => setViewer(null)} /></div>;
+  return <div className="grid gap-4 xl:grid-cols-[1fr_430px]"><Card title="Documentos" actions={<><TextInput placeholder="Buscar producto en todas las fechas..." value={docSearch} onChange={(e) => setDocSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load(docDate, e.currentTarget.value)} className="w-72" /><ActionButton tone="blue" onClick={() => load(docDate, docSearch)}>Buscar</ActionButton><ActionButton tone="neutral" onClick={() => shiftDocDate(-1)}>‹</ActionButton><TextInput type="date" value={docDate} onChange={(e) => { setDocDate(e.target.value); load(e.target.value, ''); }} className="w-36" /><ActionButton tone="neutral" onClick={() => shiftDocDate(1)}>›</ActionButton><SelectInput value={filter} onChange={(e) => setFilter(e.target.value)} className="w-40"><option>TODOS</option>{DOC_TYPES.map((t) => <option key={t}>{t}</option>)}</SelectInput><ActionButton tone="blue" onClick={() => setManualOpen(true)}>Boleta manual</ActionButton><ActionButton tone="neutral" onClick={() => { setDocSearch(''); load(docDate, ''); }}>Limpiar</ActionButton><ActionButton tone="neutral" onClick={() => load(docDate, docSearch)}>Actualizar</ActionButton></>}><div className="max-h-[680px] overflow-auto">{filtered.map((d) => <button key={d.id} onClick={() => loadDetail(d.id)} className={`grid w-full gap-2 border-b border-slate-100 p-3 text-left md:grid-cols-[110px_1fr_100px_110px] ${String(selectedId) === String(d.id) ? 'bg-teal-50' : ''}`}><b>{d.tipo}</b><span><b className="text-slate-700">Fecha: {String(d.fecha_emision || d.fecha || '').slice(0, 10)}</b><br />{docNumber(d)} / {d.cliente_nombre}</span><b>{money(d.total)}</b><span className={`rounded-md px-2 py-1 text-center text-xs font-black ${String(d.estado || '').toUpperCase() === 'ANULADO' ? 'bg-red-100 text-red-700' : String(d.sunat_estado || '').toUpperCase() === 'ACEPTADO' ? 'bg-emerald-100 text-emerald-700' : String(d.sunat_estado || '').toUpperCase() === 'RECHAZADO' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>{String(d.estado || '').toUpperCase() === 'ANULADO' ? 'ANULADO' : `SUNAT ${d.sunat_estado || 'PENDIENTE'}`}</span></button>)}</div></Card><aside className="grid gap-4"><Card title="Detalle / SUNAT">{selected ? <div className="grid gap-3"><div className="rounded-md bg-slate-50 p-3 text-sm"><b>{selected.tipo} {docNumber(selected)}</b><div>{selected.cliente_nombre}</div><div>{money(selected.total)}</div><div className={`mt-2 rounded-md p-2 text-xs font-black ${sunatStatusTone(selected.sunat_estado)}`}>SUNAT: {selected.sunat_estado || 'PENDIENTE'}{sunatPolling && docNeedsSunatPolling(selected) ? ' (actualizando...)' : ''}</div>{sunatErrorSnippet(sunatInfo?.respuesta) && <div className="mt-2 rounded-md bg-red-50 p-2 text-xs font-bold text-red-700">{sunatErrorSnippet(sunatInfo?.respuesta)}</div>}{String(selected.estado || '').toUpperCase() === 'ANULADO' && <div className="mt-2 rounded-md bg-red-100 p-2 text-xs font-black text-red-700">DOCUMENTO ANULADO</div>}</div><div className="grid grid-cols-2 gap-2">{SUNAT_STATES.map((s) => <ActionButton key={s} tone={s === 'RECHAZADO' ? 'danger' : 'neutral'} onClick={() => setSunat(s)}>{s}</ActionButton>)}</div><div className="grid grid-cols-2 gap-2"><ActionButton tone="blue" onClick={openInternalDoc}>Ver PDF</ActionButton>{String(selected.estado || '').toUpperCase() !== 'ANULADO' && <ActionButton tone="violet" onClick={openDocumentEditor}>Cambiar boleta / productos / series</ActionButton>}{['BOLETA', 'FACTURA'].includes(String(selected.tipo || '').toUpperCase()) && <ActionButton tone="blue" onClick={sendSunat}>Enviar SUNAT</ActionButton>}{['BOLETA', 'FACTURA'].includes(String(selected.tipo || '').toUpperCase()) && <ActionButton tone="neutral" onClick={checkSunat}>Estado SUNAT</ActionButton>}{String(selected.tipo || '').toUpperCase() === 'PROFORMA' && <ActionButton onClick={() => setConvertOpen(true)}>Crear boleta/factura</ActionButton>}<ActionButton tone="danger" onClick={annulDoc}>Anular</ActionButton><ActionButton tone="danger" onClick={remove}>Eliminar</ActionButton></div><div className="max-h-72 overflow-auto">{lines.map((l) => <div key={l.id} className="border-b border-slate-100 py-2 text-xs"><b>{l.descripcion || l.nombre}</b><div>{l.cantidad} x {money(l.precio_unitario || l.precio)} = {money(l.total)}</div>{(l.series_texto || l.serie) && <div className="font-bold text-blue-700">S/N: {l.series_texto || l.serie}</div>}</div>)}</div></div> : <Empty text="Selecciona un documento." />}</Card></aside>{manualOpen && <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-3"><section className="w-full max-w-xl rounded-lg bg-white shadow-2xl"><header className="flex items-center justify-between border-b border-slate-200 p-3"><h2 className="text-lg font-black">Boleta manual por series</h2><button className="rounded-md bg-slate-100 px-3 py-2 text-xs font-black" onClick={() => setManualOpen(false)}>Cerrar</button></header><div className="grid gap-3 p-3"><div className="grid grid-cols-2 gap-2"><Field label="Tipo"><SelectInput value={manualForm.tipo} onChange={(e) => setManualForm({ ...manualForm, tipo: e.target.value })}><option>BOLETA</option><option>FACTURA</option><option>PASE</option></SelectInput></Field><Field label="Numero"><TextInput value={manualForm.numero} onChange={(e) => setManualForm({ ...manualForm, numero: e.target.value })} /></Field></div><Field label="Cliente / pase"><TextInput value={manualForm.cliente_nombre} onChange={(e) => setManualForm({ ...manualForm, cliente_nombre: e.target.value })} /></Field><Field label="Fecha"><TextInput type="date" value={manualForm.fecha_emision} onChange={(e) => setManualForm({ ...manualForm, fecha_emision: e.target.value })} /></Field><Field label="Series"><TextArea value={manualForm.series_texto} onChange={(e) => setManualForm({ ...manualForm, series_texto: e.target.value })} /></Field><Field label="Observacion"><TextInput value={manualForm.observacion} onChange={(e) => setManualForm({ ...manualForm, observacion: e.target.value })} /></Field></div><footer className="grid grid-cols-2 gap-2 border-t border-slate-200 p-3"><ActionButton tone="neutral" onClick={() => setManualOpen(false)}>Cancelar</ActionButton><ActionButton onClick={saveManualSeries}>Registrar</ActionButton></footer></section></div>}{convertOpen && <Modal title="Crear boleta/factura desde proforma" onClose={() => setConvertOpen(false)}><div className="grid gap-3"><Field label="Tipo"><SelectInput value={convertForm.tipo} onChange={(e) => setConvertForm({ ...convertForm, tipo: e.target.value })}><option>BOLETA</option><option>FACTURA</option></SelectInput></Field><Field label="Estado pago"><SelectInput value={convertForm.estado_pago} onChange={(e) => setConvertForm({ ...convertForm, estado_pago: e.target.value })}>{PAY_STATES.map((s) => <option key={s}>{s}</option>)}</SelectInput></Field><Field label="Metodo"><SelectInput value={convertForm.metodo_pago} onChange={(e) => setConvertForm({ ...convertForm, metodo_pago: e.target.value })}>{PAY_METHODS.map((m) => <option key={m}>{m}</option>)}</SelectInput></Field><Field label="Observacion"><TextInput value={convertForm.observacion} onChange={(e) => setConvertForm({ ...convertForm, observacion: e.target.value })} placeholder="Convertido desde proforma" /></Field><div className="grid grid-cols-2 gap-2"><ActionButton tone="neutral" onClick={() => setConvertOpen(false)}>Cancelar</ActionButton><ActionButton onClick={convertProforma}>Crear documento</ActionButton></div></div></Modal>}{proformaEditor && <Modal title={`Cambiar ${proformaEditor.tipo || 'documento'} ${proformaEditor.numero || `#${proformaEditor.id}`}`} onClose={() => setProformaEditor(null)}><div className="grid gap-3"><Field label="Cliente"><TextInput value={proformaEditor.cliente_nombre} onChange={(e) => setProformaEditor({ ...proformaEditor, cliente_nombre: e.target.value })} /></Field><Field label="Documento cliente"><TextInput value={proformaEditor.documento_cliente} onChange={(e) => setProformaEditor({ ...proformaEditor, documento_cliente: e.target.value })} /></Field><Field label="Direccion"><TextInput value={proformaEditor.direccion_cliente} onChange={(e) => setProformaEditor({ ...proformaEditor, direccion_cliente: e.target.value })} /></Field><Field label="Vencimiento"><TextInput type="date" value={proformaEditor.fecha_vencimiento} onChange={(e) => setProformaEditor({ ...proformaEditor, fecha_vencimiento: e.target.value })} /></Field><div className="rounded-md border border-orange-200 bg-orange-50 p-3"><div className="grid gap-2 md:grid-cols-[160px_1fr_auto]"><Field label="Linea a cambiar"><SelectInput value={editorTargetLine} onChange={(e) => setEditorTargetLine(Number(e.target.value || 0))}>{proformaEditor.lines.map((line, idx) => <option key={idx} value={idx}>Linea {idx + 1}</option>)}</SelectInput></Field><Field label="Buscar producto interno"><TextInput value={editorProductQuery} onChange={(e) => setEditorProductQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadEditorProducts(e.currentTarget.value)} placeholder="Escribe nombre, marca o modelo" /></Field><div className="flex items-end gap-2"><ActionButton tone="blue" onClick={() => loadEditorProducts(editorProductQuery)}>Buscar</ActionButton><ActionButton tone="neutral" onClick={addEditorLine}>Agregar linea</ActionButton></div></div>{editorProducts.length > 0 && <div className="mt-2 max-h-44 overflow-auto rounded-md bg-white">{editorProducts.map((p) => <button type="button" key={p.id} onClick={() => selectEditorProduct(p)} className="grid w-full grid-cols-[1fr_auto] gap-2 border-b border-slate-100 p-2 text-left text-xs hover:bg-orange-50"><span><b>{p.nombre}</b><div className="text-slate-500">{p.categoria || 'Sin categoria'} / {p.marca || ''} / Stock {p.stock ?? 0}</div></span><b>{money(p.precio_venta || p.precio || 0)}</b></button>)}</div>}<p className="mt-2 text-xs font-bold text-orange-900">Usa esto cuando el cliente cambia producto o cuando quieres vincular la linea con el producto real interno para stock y series.</p></div><div className="max-h-80 overflow-auto rounded-md border border-slate-100">{proformaEditor.lines.map((line, idx) => <div key={`${line.id || idx}`} className="grid gap-2 border-b border-slate-100 p-2 md:grid-cols-[1fr_80px_110px_105px_auto]"><div><TextInput value={line.descripcion} onChange={(e) => updateProformaLine(idx, { descripcion: e.target.value })} placeholder="Producto / descripcion" /><div className="mt-1 text-[11px] font-black text-slate-500">Interno: {line.producto_id ? `#${line.producto_id}` : 'sin producto vinculado'}</div></div><TextInput inputMode="numeric" value={line.cantidad} onChange={(e) => updateProformaLine(idx, { cantidad: e.target.value })} /><div className="grid grid-cols-[1fr_auto_auto] gap-1"><TextInput inputMode="decimal" value={line.precio} onFocus={(e) => e.target.select()} onChange={(e) => updateProformaLine(idx, { precio: e.target.value })} /><button type="button" className="rounded-md bg-emerald-100 px-2 text-xs font-black text-emerald-800" onClick={() => updateProformaLine(idx, { precio: price99(line.precio) })}>.99</button><button type="button" className="rounded-md bg-slate-100 px-2 text-xs font-black text-slate-700" onClick={() => copyText(parsePrice(line.precio).toFixed(2))}>Copiar</button></div><b className="grid place-items-center rounded-md bg-slate-50 text-sm">{money(line.total)}</b><button type="button" className="rounded-md bg-red-100 px-2 text-xs font-black text-red-700" onClick={() => removeEditorLine(idx)}>Quitar</button><TextArea className="md:col-span-5 min-h-[86px]" placeholder="Series, una por linea. Puedes agregar las series que faltaron." value={line.series_texto} onChange={(e) => updateProformaLine(idx, { series_texto: e.target.value })} /></div>)}</div><Field label="Observacion del documento"><TextArea value={proformaEditor.observacion} onChange={(e) => setProformaEditor({ ...proformaEditor, observacion: e.target.value })} placeholder="Observacion visible del documento (opcional)" /></Field><Field label="Observacion del cambio (obligatorio)"><TextArea className="min-h-24" value={proformaEditor.observacion_cambio || ''} onChange={(e) => setProformaEditor({ ...proformaEditor, observacion_cambio: e.target.value })} placeholder="Ej: Cliente pidio cambiar producto / corregir precio / agregar series faltantes" /></Field><div className="rounded-md border border-violet-200 bg-violet-50 p-2 text-xs font-semibold text-violet-800">Solo Giomar puede editar. Este motivo queda guardado en la nota interna y en Registro.</div><div className="grid grid-cols-2 gap-2"><ActionButton tone="neutral" onClick={() => setProformaEditor(null)}>Cancelar</ActionButton><ActionButton onClick={saveProformaEditor}>Guardar cambios y recalcular stock</ActionButton></div></div></Modal>}<DocumentViewerModal viewer={viewer} onClose={() => setViewer(null)} /></div>;
 }
 
 function RadioView({ user, sound, soundEnabled }) {
@@ -6181,22 +6605,88 @@ function WebView() {
   );
 }
 
+function sunatStatusTone(estado) {
+  const value = String(estado || 'PENDIENTE').toUpperCase();
+  if (value === 'ACEPTADO') return 'bg-emerald-100 text-emerald-800';
+  if (value === 'RECHAZADO') return 'bg-red-100 text-red-800';
+  if (value === 'PROCESO') return 'bg-blue-100 text-blue-800';
+  if (value === 'INTERNO') return 'bg-slate-200 text-slate-700';
+  return 'bg-amber-100 text-amber-800';
+}
+
+function sunatDocEsInterno(doc) {
+  const estado = String(doc?.sunat_estado || '').toUpperCase();
+  const modo = String(doc?.sunat_modo || '').toUpperCase();
+  return estado === 'INTERNO' || modo === 'NO_ENVIAR' || modo === 'INTERNO';
+}
+
+function sunatErrorSnippet(payload) {
+  if (!payload) return '';
+  if (typeof payload === 'string') {
+    const match = payload.match(/<faultstring>([^<]+)<\/faultstring>/i);
+    return match?.[1]?.trim() || payload.slice(0, 180);
+  }
+  if (typeof payload !== 'object') return '';
+  if (payload.msg) return String(payload.msg);
+  const raw = String(payload.response || payload.raw || '');
+  const match = raw.match(/<faultstring>([^<]+)<\/faultstring>/i);
+  if (match?.[1]) return match[1].trim();
+  return raw ? raw.slice(0, 180) : '';
+}
+
+const SUNAT_FINAL_STATES = new Set(['ACEPTADO', 'RECHAZADO']);
+
+function docNeedsSunatPolling(doc) {
+  const tipo = String(doc?.tipo || '').toUpperCase();
+  const estado = String(doc?.sunat_estado || 'PENDIENTE').toUpperCase();
+  return ['BOLETA', 'FACTURA'].includes(tipo) && estado === 'PROCESO' && !sunatDocEsInterno(doc);
+}
+
 function SunatView() {
+  const empresa = currentEmpresa();
   const [cfg, setCfg] = useState({});
+  const [docs, setDocs] = useState([]);
+  const [docDetails, setDocDetails] = useState({});
   const [msg, setMsg] = useState('');
   const [loading, setLoading] = useState(false);
+  const [docsLoading, setDocsLoading] = useState(false);
   const update = (key, value) => setCfg((current) => ({ ...current, [key]: value }));
+  const loadDocs = async () => {
+    setDocsLoading(true);
+    try {
+      const rows = asArray(await apiFetch('/documentos')).filter((doc) => ['BOLETA', 'FACTURA'].includes(String(doc.tipo || '').toUpperCase()));
+      setDocs(rows.slice(0, 30));
+      const details = {};
+      await Promise.all(rows.slice(0, 12).map(async (doc) => {
+        try {
+          const res = await apiFetch(`/sunat/documentos/${doc.id}/estado`);
+          if (okResponse(res)) details[String(doc.id)] = res;
+        } catch {
+          // ignore per-document errors
+        }
+      }));
+      setDocDetails(details);
+    } finally {
+      setDocsLoading(false);
+    }
+  };
   const load = async () => {
     setLoading(true);
     try {
       const res = await apiFetch('/sunat/config');
       setCfg(res.data || {});
       setMsg('');
+      await loadDocs();
     } finally {
       setLoading(false);
     }
   };
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [empresa]);
+  useEffect(() => {
+    if (!docs.some((row) => docNeedsSunatPolling(row))) return undefined;
+    const timer = window.setInterval(() => loadDocs(), 4000);
+    return () => window.clearInterval(timer);
+  }, [docs.map((row) => `${row.id}:${row.sunat_estado}`).join('|')]);
   const save = async () => {
     setMsg('Guardando configuracion SUNAT...');
     const res = await apiFetch('/sunat/config', { method: 'POST', json: cfg });
@@ -6206,6 +6696,25 @@ function SunatView() {
     } else {
       setMsg(res.msg || 'No se pudo guardar SUNAT.');
     }
+  };
+  const markHistoricosInternos = async () => {
+    if (!window.confirm('Marcar TODAS las boletas/facturas ya registradas como INTERNAS? Ninguna se enviara a SUNAT.')) return;
+    setMsg('Marcando documentos historicos como internos...');
+    const res = await apiFetch('/sunat/marcar-historicos-internos', { method: 'POST' });
+    setMsg(res.msg || (okResponse(res) ? 'Historicos marcados.' : 'No se pudo marcar.'));
+    await loadDocs();
+  };
+  const sendDoc = async (doc) => {
+    if (!doc?.id) return;
+    if (sunatDocEsInterno(doc)) {
+      alert('Documento interno de caja. No se envia a SUNAT.');
+      return;
+    }
+    const res = await apiFetch(`/sunat/documentos/${doc.id}/enviar`, { method: 'POST', json: { regenerar: true } });
+    await loadDocs();
+    const err = sunatErrorSnippet(res.respuesta || res);
+    const estado = res.sunat_estado || 'PENDIENTE';
+    alert(err ? `SUNAT ${estado}: ${err}` : (res.msg || `SUNAT: ${estado}`));
   };
   const pickPfx = async (file) => {
     if (!file) return;
@@ -6217,14 +6726,28 @@ function SunatView() {
       setMsg(error.message || 'No se pudo cargar el certificado.');
     }
   };
+  const branchLabel = empresa === 'pc_fast_store' ? 'PC FAST STORE' : empresa.replace(/_/g, ' ').toUpperCase();
   return (
-    <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
+    <div className="grid gap-4">
+      <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-950">
+        Sucursal activa: <span className="font-black">{branchLabel}</span> ({empresa}). La configuracion y los envios SUNAT son independientes por sucursal.
+      </div>
+      <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
       <Card title="Estado SUNAT" actions={<><ActionButton tone="neutral" onClick={load}>Recargar</ActionButton><ActionButton onClick={save}>Guardar SUNAT</ActionButton></>}>
         <div className="grid gap-3">
           <div className={`rounded-md p-3 text-sm font-black ${cfg.listo_envio ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>ENVIO: {cfg.listo_envio ? 'LISTO' : 'FALTA CONFIG'}</div>
           <div className={`rounded-md p-3 text-sm font-black ${cfg.firma_configurada ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>FIRMA: {cfg.firma_configurada ? 'CERTIFICADO OK' : 'SIN CERTIFICADO PFX'}</div>
           <div className={`rounded-md p-3 text-sm font-black ${cfg.envio_automatico ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-700'}`}>ENVIO AUTOMATICO: {cfg.envio_automatico ? 'ACTIVO' : 'APAGADO'}</div>
-          <div className="rounded-md bg-blue-50 p-3 text-xs font-bold text-blue-800">Completa esta pantalla, guarda y luego prueba desde Documentos con el boton Enviar SUNAT.</div>
+          <div className="rounded-md bg-white p-3 text-xs font-bold text-slate-700">
+            <div>RUC: {cfg.ruc || '—'}</div>
+            <div>Razon social: {cfg.razon_social || '—'}</div>
+            <div>Ambiente: {cfg.ambiente || 'BETA'}</div>
+            <div>Usuario SOL: {cfg.usuario_sol || '—'}</div>
+          </div>
+          <div className="rounded-md bg-blue-50 p-3 text-xs font-bold text-blue-800">Solo boletas/facturas ELECTRONICAS (desde fecha de activacion) se envian a SUNAT. Las internas historicas quedan bloqueadas.</div>
+          <div className="flex flex-wrap gap-2">
+            <ActionButton tone="neutral" onClick={markHistoricosInternos}>Marcar historicos internos</ActionButton>
+          </div>
           {loading && <div className="rounded-md bg-slate-50 p-3 text-sm font-bold">Cargando...</div>}
           {msg && <div className="rounded-md bg-slate-50 p-3 text-sm font-bold">{msg}</div>}
         </div>
@@ -6234,6 +6757,7 @@ function SunatView() {
           <div className="grid gap-3 md:grid-cols-2">
             <Field label="Ambiente"><SelectInput value={cfg.ambiente || 'BETA'} onChange={(e) => update('ambiente', e.target.value)}><option>BETA</option><option>PRODUCCION</option></SelectInput></Field>
             <Field label="Envio automatico"><SelectInput value={cfg.envio_automatico ? 'SI' : 'NO'} onChange={(e) => update('envio_automatico', e.target.value === 'SI')}><option value="NO">NO</option><option value="SI">SI</option></SelectInput></Field>
+            <Field label="Fecha activacion SUNAT (solo desde aqui son legales)"><TextInput type="datetime-local" value={String(cfg.fecha_activacion_sunat || '').replace(' ', 'T').slice(0, 16)} onChange={(e) => update('fecha_activacion_sunat', e.target.value ? `${e.target.value.replace('T', ' ')}:00` : '')} /></Field>
             <Field label="RUC emisor"><TextInput value={cfg.ruc || ''} onChange={(e) => update('ruc', e.target.value)} inputMode="numeric" /></Field>
             <Field label="Razon social"><TextInput value={cfg.razon_social || ''} onChange={(e) => update('razon_social', e.target.value)} /></Field>
             <Field label="Nombre comercial"><TextInput value={cfg.nombre_comercial || ''} onChange={(e) => update('nombre_comercial', e.target.value)} /></Field>
@@ -6252,6 +6776,31 @@ function SunatView() {
             <div className="mt-1 text-xs font-bold text-slate-500">{cfg.certificado_pfx_base64 === 'CONFIGURADO' ? 'Certificado ya guardado. Si cargas otro se reemplaza al guardar.' : 'Carga aqui el certificado que te entregue SUNAT.'}</div>
           </Field>
           <div className="flex justify-end"><ActionButton onClick={save}>Guardar SUNAT</ActionButton></div>
+        </div>
+      </Card>
+      </div>
+      <Card title="Boletas y facturas SUNAT" actions={<ActionButton tone="neutral" onClick={loadDocs}>Actualizar lista</ActionButton>}>
+        {docsLoading && <div className="rounded-md bg-slate-50 p-3 text-sm font-bold">Cargando documentos...</div>}
+        {!docsLoading && !docs.length && <Empty text="No hay boletas ni facturas en esta sucursal." />}
+        <div className="max-h-[520px] overflow-auto">
+          {docs.map((doc) => {
+            const detail = docDetails[String(doc.id)];
+            const err = sunatErrorSnippet(detail?.respuesta);
+            return (
+              <div key={doc.id} className="grid gap-2 border-b border-slate-100 p-3 md:grid-cols-[1fr_140px_120px_auto] md:items-center">
+                <div>
+                  <div className="text-sm font-black">{doc.tipo} {docNumber(doc)}</div>
+                  <div className="text-xs text-slate-500">{String(doc.fecha_emision || doc.fecha || '').slice(0, 10)} / {doc.cliente_nombre || 'Cliente'} / {money(doc.total)}</div>
+                  {err && <div className="mt-1 text-xs font-bold text-red-700">{err}</div>}
+                </div>
+                <span className={`rounded-md px-2 py-1 text-center text-xs font-black ${sunatStatusTone(doc.sunat_estado)}`}>{doc.sunat_estado || 'PENDIENTE'}</span>
+                <span className="text-xs font-bold text-slate-500">{doc.sunat_modo || 'MANUAL'}</span>
+                {sunatDocEsInterno(doc)
+                  ? <span className="rounded-md bg-slate-100 px-2 py-1 text-xs font-black text-slate-600">Interno</span>
+                  : <ActionButton tone="blue" onClick={() => sendDoc(doc)}>Reenviar</ActionButton>}
+              </div>
+            );
+          })}
         </div>
       </Card>
     </div>
