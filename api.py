@@ -304,6 +304,16 @@ def inventario_sucursal(value: str = ""):
     return SHARED_STOCK_SUCURSALES.get(sucursal, sucursal)
 
 
+SERIES_DOCUMENTO_INTERNO = {
+    "BOLETA": "B001",
+    "FACTURA": "F001",
+}
+SERIES_DOCUMENTO_LEGAL_SUNAT = {
+    "BOLETA": "B002",
+    "FACTURA": "F002",
+}
+
+
 def seed_branch_series(cur, sucursal):
     sucursal = norm_sucursal(sucursal)
     cur.execute("""
@@ -318,6 +328,44 @@ def seed_branch_series(cur, sucursal):
         ('NOTA DE CREDITO','NC001',1,%s)
     ON CONFLICT (tipo, sucursal) DO NOTHING;
     """, (sucursal, sucursal, sucursal, sucursal, sucursal, sucursal, sucursal))
+    seed_legal_sunat_series(cur, sucursal)
+
+
+def seed_legal_sunat_series(cur, sucursal):
+    sucursal = norm_sucursal(sucursal)
+    cur.execute("""
+    INSERT INTO series (tipo, serie, correlativo, sucursal)
+    VALUES
+        ('BOLETA_ELECTRONICA','B002',1,%s),
+        ('FACTURA_ELECTRONICA','F002',1,%s)
+    ON CONFLICT (tipo, sucursal) DO NOTHING;
+    """, (sucursal, sucursal))
+
+
+def _resolver_fila_serie_documento(cur, doc_tipo_upper, sucursal, legal_sunat=False):
+    sucursal = norm_sucursal(sucursal)
+    doc_tipo_upper = str(doc_tipo_upper or "").strip().upper()
+    if legal_sunat and doc_tipo_upper in SERIES_DOCUMENTO_LEGAL_SUNAT:
+        seed_legal_sunat_series(cur, sucursal)
+        serie_codigo = SERIES_DOCUMENTO_LEGAL_SUNAT[doc_tipo_upper]
+        cur.execute("""
+        SELECT id, serie, correlativo
+        FROM series
+        WHERE UPPER(serie)=%s AND COALESCE(sucursal,%s)=%s
+        """, (serie_codigo, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if row:
+            return row, ""
+        return None, f"No existe serie legal {serie_codigo} para {doc_tipo_upper}."
+    cur.execute("""
+    SELECT id, serie, correlativo
+    FROM series
+    WHERE UPPER(tipo)=%s AND COALESCE(sucursal,%s)=%s
+    """, (doc_tipo_upper, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if row:
+        return row, ""
+    return None, f"No existe serie para {doc_tipo_upper}"
 
 
 def ensure_usuario_permisos_table(cur):
@@ -611,11 +659,29 @@ def normalize_match_text(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
+def series_texto_a_set(series_texto):
+    return set(split_series_text(series_texto))
+
+
+def series_desde_detalle_rows(rows):
+    out = set()
+    for row in rows or []:
+        if isinstance(row, dict):
+            out.update(series_texto_a_set(row.get("series_texto") or row.get("serie") or ""))
+        else:
+            try:
+                out.update(series_texto_a_set(row[3] if len(row) > 3 else ""))
+            except Exception:
+                pass
+    return out
+
+
+def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal, permitir_series=None):
     sucursal = inventario_sucursal(sucursal)
     texto_doc = normalize_match_text(descripcion_doc)
     selected = split_series_text(series_texto)
     touched_products = set()
+    permitir_series = set(permitir_series or [])
 
     if selected:
         if len(set(selected)) != len(selected):
@@ -640,6 +706,8 @@ def procesar_combo_generico_venta(cur, descripcion_doc, series_texto, sucursal):
             if not matches:
                 continue
             disponibles = [r for r in matches if str(r.get("estado") or "").upper() in ("DISPONIBLE", "RESERVADO")]
+            if not disponibles and serie in permitir_series:
+                disponibles = [r for r in matches if str(r.get("estado") or "").upper() == "VENDIDO"]
             if not disponibles:
                 estados = ", ".join(sorted({str(r.get("estado") or "") for r in matches}))
                 return f"Combo/PRUEBA: la serie {serie} no esta disponible ({estados})."
@@ -777,7 +845,7 @@ def resolver_producto_por_series_venta(cur, producto_id, nombre_doc, cantidad, s
     return producto_id, None
 
 
-def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal):
+def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal, permitir_series=None):
     sucursal = inventario_sucursal(sucursal)
     cantidad = max(0, int(float(cantidad or 0)))
     if cantidad <= 0 or not producto_id:
@@ -802,6 +870,7 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
     FROM producto_series
     WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    permitir_series = set(permitir_series or [])
     registered = {str(r.get("serie") or "").strip().upper(): r for r in dict_fetchall(cur) if str(r.get("serie") or "").strip()}
     registered_count = len(registered)
     active_count = sum(1 for r in registered.values() if r.get("estado") in ("DISPONIBLE", "RESERVADO"))
@@ -845,7 +914,10 @@ def validar_y_marcar_series_venta(cur, producto_id, nombre_doc, marca_doc, model
             """, (producto_id, serie, sucursal))
             continue
         if row and row.get("estado") not in ("DISPONIBLE", "RESERVADO"):
-            return f"{prod_nombre}: la serie {serie} esta en estado {row.get('estado')}."
+            if serie in permitir_series and str(row.get("estado") or "").upper() == "VENDIDO":
+                pass
+            else:
+                return f"{prod_nombre}: la serie {serie} esta en estado {row.get('estado')}."
         cur.execute("""
         UPDATE producto_series
         SET estado='VENDIDO',
@@ -1190,6 +1262,7 @@ class Venta(BaseModel):
     estado_pago: str = "PAGADO"
     metodo_pago: str = ""
     sucursal: str = DEFAULT_SUCURSAL
+    emitir_legal_sunat: bool = False
 
 
 class Cliente(BaseModel):
@@ -1400,6 +1473,7 @@ class EstadoSunatUpdate(BaseModel):
 class SunatConfigUpdate(BaseModel):
     ambiente: str = "BETA"
     envio_automatico: bool = False
+    fecha_activacion_sunat: str = ""
     ruc: str = ""
     razon_social: str = ""
     nombre_comercial: str = ""
@@ -4744,16 +4818,11 @@ def crear_venta(data: Venta):
         doc_tipo_upper = (data.tipo or "").strip().upper()
         if doc_tipo_upper:
             data.tipo = doc_tipo_upper
-        cur.execute("""
-        SELECT id, serie, correlativo
-        FROM series
-        WHERE UPPER(tipo)=%s AND COALESCE(sucursal,%s)=%s
-        """, (doc_tipo_upper, DEFAULT_SUCURSAL, sucursal))
-        row = cur.fetchone()
-
-        if not row:
+        legal_sunat = bool(getattr(data, "emitir_legal_sunat", False))
+        row, serie_error = _resolver_fila_serie_documento(cur, doc_tipo_upper, sucursal, legal_sunat)
+        if serie_error or not row:
             conn.close()
-            return {"ok": False, "msg": f"No existe serie para {data.tipo}"}
+            return {"ok": False, "msg": serie_error or f"No existe serie para {data.tipo}"}
 
         serie_id, serie, corr = row
         numero = f"{serie}-{str(corr).zfill(6)}"
@@ -4828,17 +4897,26 @@ def crear_venta(data: Venta):
                     conn.close()
                     return {"ok": False, "success": False, "msg": error_series}
 
+        sunat_estado_doc, sunat_modo_doc = ("INTERNO", "NO_ENVIAR")
+        if doc_tipo_upper in ("BOLETA", "FACTURA"):
+            if legal_sunat:
+                sunat_estado_doc, sunat_modo_doc = "PENDIENTE", "ELECTRONICO"
+            else:
+                sunat_estado_doc, sunat_modo_doc = "INTERNO", "NO_ENVIAR"
+
         cur.execute("""
         INSERT INTO ventas (
             fecha, tipo, es_pase, numero, cliente, documento_cliente, direccion_cliente,
-            subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor, estado, estado_pago, metodo_pago, sucursal
+            subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor, estado, estado_pago, metodo_pago, sucursal,
+            sunat_estado, sunat_modo
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'EMITIDO',%s,%s,%s,%s,%s)
         RETURNING id
         """, (
             fecha_emision, data.tipo, bool(getattr(data, 'es_pase', False)), numero, data.cliente_nombre, documento_cliente,
             data.direccion_cliente, subtotal, igv, total,
-            data.observacion, fecha_vencimiento, data.usuario_emisor, estado_pago, metodo_pago, sucursal
+            data.observacion, fecha_vencimiento, data.usuario_emisor, estado_pago, metodo_pago, sucursal,
+            sunat_estado_doc, sunat_modo_doc,
         ))
 
         venta_id = cur.fetchone()[0]
@@ -4889,9 +4967,13 @@ def crear_venta(data: Venta):
         conn.close()
 
         sunat_auto = None
-        if doc_tipo_upper in ("BOLETA", "FACTURA"):
+        if doc_tipo_upper in ("BOLETA", "FACTURA") and legal_sunat:
             try:
-                sunat_auto = _sunat_auto_send_document(venta_id, sucursal)
+                sunat_auto = enviar_documento_sunat(
+                    venta_id,
+                    SunatEnviarRequest(regenerar=True, permitir_sin_firma=False),
+                    sucursal,
+                )
             except Exception as sunat_error:
                 sunat_auto = {"ok": False, "auto": True, "msg": str(sunat_error)}
 
@@ -4982,18 +5064,20 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         if existing_doc:
             venta_id = existing_doc[0]
         else:
+            sunat_estado_doc, sunat_modo_doc = _sunat_defaults_nuevo_documento(cur, sucursal, fecha_emision)
             cur.execute("""
             INSERT INTO ventas (
                 fecha, tipo, numero, cliente, documento_cliente, direccion_cliente,
                 subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor,
-                estado, estado_pago, metodo_pago, sucursal
+                estado, estado_pago, metodo_pago, sucursal, sunat_estado, sunat_modo
             )
-            VALUES (%s,%s,%s,%s,'','',%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s)
+            VALUES (%s,%s,%s,%s,'','',%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s,%s,%s)
             RETURNING id
             """, (
                 fecha_emision, doc_tipo, numero, cliente, total, total,
                 data.observacion or f"{doc_tipo} manual ingresado por series",
-                fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal
+                fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal,
+                sunat_estado_doc, sunat_modo_doc,
             ))
             venta_id = cur.fetchone()[0]
 
@@ -5618,6 +5702,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         ORDER BY id
         """, (documento_id,))
         detalle_previo = dict_fetchall(cur)
+        series_previas_doc = series_desde_detalle_rows(detalle_previo)
 
         items = data.get("items") or data.get("detalle") or []
         if not isinstance(items, list) or not items:
@@ -5663,9 +5748,12 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                     marca = marca or (prod[1] or "")
                     modelo = modelo or (prod[2] or "")
             combo_procesado = False
+            line_series_previas = series_texto_a_set(series_texto) & series_previas_doc
             if tipo_doc_upper in STOCK_DOC_TYPES:
                 if is_test_product_name(descripcion, marca, modelo) or ((not producto_id) and series_texto):
-                    error_combo = procesar_combo_generico_venta(cur, descripcion, series_texto, sucursal_doc)
+                    error_combo = procesar_combo_generico_venta(
+                        cur, descripcion, series_texto, sucursal_doc, permitir_series=line_series_previas or series_previas_doc
+                    )
                     if error_combo:
                         conn.rollback()
                         conn.close()
@@ -5680,7 +5768,8 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                         conn.close()
                         return {"ok": False, "success": False, "msg": error_resolver}
                     error_series = validar_y_marcar_series_venta(
-                        cur, producto_id, descripcion, marca, modelo, cantidad, series_texto, sucursal_doc
+                        cur, producto_id, descripcion, marca, modelo, cantidad, series_texto, sucursal_doc,
+                        permitir_series=line_series_previas or series_previas_doc,
                     )
                     if error_series:
                         conn.rollback()
@@ -5779,7 +5868,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
     except Exception as e:
         conn.rollback()
         conn.close()
-        return {"ok": False, "success": False, "msg": str(e)}
+        return {"ok": False, "success": False, "msg": f"Error interno al editar documento: {e}"}
 
 
 @app.patch("/documentos/{documento_id}")
@@ -5843,7 +5932,7 @@ def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
     cur.execute("""
     SELECT producto_id, COALESCE(cantidad, 0), COALESCE(series_texto, '')
     FROM ventas_detalle
-    WHERE venta_id=%s AND producto_id IS NOT NULL
+    WHERE venta_id=%s
     """, (documento_id,))
     detalles = cur.fetchall()
     touched = set()
@@ -5854,12 +5943,22 @@ def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
                 cur.execute("""
                 UPDATE producto_series
                 SET estado='DISPONIBLE', fecha_salida=NULL
-                WHERE producto_id=%s
-                  AND COALESCE(sucursal,%s)=%s
+                WHERE COALESCE(sucursal,%s)=%s
                   AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
-                """, (producto_id, DEFAULT_SUCURSAL, sucursal_stock, series))
-                touched.add(producto_id)
-            else:
+                """, (DEFAULT_SUCURSAL, sucursal_stock, series))
+                cur.execute("""
+                SELECT DISTINCT producto_id
+                FROM producto_series
+                WHERE COALESCE(sucursal,%s)=%s
+                  AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
+                  AND producto_id IS NOT NULL
+                """, (DEFAULT_SUCURSAL, sucursal_stock, series))
+                for prow in cur.fetchall():
+                    if prow and prow[0]:
+                        touched.add(prow[0])
+                if producto_id:
+                    touched.add(producto_id)
+            elif producto_id:
                 cur.execute("""
                 UPDATE productos
                 SET stock = COALESCE(stock, 0) + %s
@@ -6204,10 +6303,10 @@ def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal
     try:
         sucursal = norm_sucursal(sucursal)
         estado = (data.sunat_estado or "PROCESO").upper()
-        if estado not in ("PENDIENTE", "PROCESO", "ACEPTADO", "RECHAZADO"):
+        if estado not in ("PENDIENTE", "PROCESO", "ACEPTADO", "RECHAZADO", "INTERNO"):
             estado = "PROCESO"
         modo = (data.sunat_modo or "MANUAL").upper()
-        if modo not in ("MANUAL", "NO_ENVIAR"):
+        if modo not in ("MANUAL", "NO_ENVIAR", "ELECTRONICO", "API"):
             modo = "MANUAL"
 
         cur.execute("""
@@ -6240,6 +6339,44 @@ def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal
         conn.rollback()
         conn.close()
         return {"ok": False, "msg": str(e)}
+
+
+def _sunat_parse_activation_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text[:19] if "T" not in fmt else text.replace("Z", "")[:19], fmt)
+            if fmt == "%Y-%m-%d":
+                return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+            return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _sunat_defaults_nuevo_documento(cur, sucursal, fecha_emision):
+    cfg = _sunat_get_config(cur, sucursal)
+    activation = _sunat_parse_activation_datetime(cfg.get("fecha_activacion_sunat"))
+    if not activation:
+        return "INTERNO", "NO_ENVIAR"
+    doc_fecha = fecha_emision
+    if isinstance(doc_fecha, datetime):
+        doc_fecha_cmp = doc_fecha
+    else:
+        doc_fecha_cmp = parse_fecha_emision(doc_fecha)
+    if doc_fecha_cmp >= activation:
+        return "PENDIENTE", "ELECTRONICO"
+    return "INTERNO", "NO_ENVIAR"
+
+
+def _sunat_envio_bloqueado(doc):
+    modo = str(doc.get("sunat_modo") or "").strip().upper()
+    estado = str(doc.get("sunat_estado") or "").strip().upper()
+    if modo in ("NO_ENVIAR", "INTERNO") or estado == "INTERNO":
+        return True, "Documento interno de caja. No se envia a SUNAT."
+    return False, ""
 
 
 SUNAT_DEFAULT_ENDPOINTS = {
@@ -6325,6 +6462,7 @@ def _sunat_get_config(cur, sucursal):
         "endpoint_url": _sunat_env(sucursal, "ENDPOINT_URL", "").strip(),
         "certificado_pfx_base64": _sunat_env_cert_pfx_base64(sucursal),
         "certificado_password": _sunat_env(sucursal, "CERT_PASSWORD", "").strip(),
+        "fecha_activacion_sunat": _sunat_env(sucursal, "FECHA_ACTIVACION", "").strip(),
     }
     try:
         cur.execute("SELECT valor FROM app_config WHERE clave=%s", (f"sunat:{sucursal}",))
@@ -6362,7 +6500,8 @@ def _sunat_documento_payload(cur, documento_id, sucursal):
            COALESCE(subtotal,0), COALESCE(igv,0), COALESCE(total,0), fecha,
            COALESCE(sucursal,%s), COALESCE(sunat_xml_nombre,''), COALESCE(sunat_xml_base64,''),
            COALESCE(sunat_zip_nombre,''), COALESCE(sunat_zip_base64,''), COALESCE(sunat_hash,''),
-           COALESCE(sunat_estado,'PENDIENTE'), COALESCE(sunat_respuesta_json,'')
+           COALESCE(sunat_estado,'PENDIENTE'), COALESCE(sunat_respuesta_json,''),
+           COALESCE(sunat_modo,'MANUAL')
     FROM ventas
     WHERE id=%s AND COALESCE(sucursal,%s)=%s
       AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA')
@@ -6377,6 +6516,7 @@ def _sunat_documento_payload(cur, documento_id, sucursal):
         "fecha": row[9], "sucursal": row[10], "sunat_xml_nombre": row[11],
         "sunat_xml_base64": row[12], "sunat_zip_nombre": row[13], "sunat_zip_base64": row[14],
         "sunat_hash": row[15], "sunat_estado": row[16], "sunat_respuesta_json": row[17],
+        "sunat_modo": row[18],
     }
     cur.execute("""
     SELECT COALESCE(descripcion,''), COALESCE(cantidad,0), COALESCE(precio,0), COALESCE(total,0),
@@ -6801,6 +6941,42 @@ def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURS
         conn.close()
 
 
+@app.post("/sunat/marcar-historicos-internos")
+def marcar_historicos_internos_sunat(sucursal: str = DEFAULT_SUCURSAL):
+    """Marca todas las boletas/facturas ya emitidas como internas (nunca se envian a SUNAT)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("""
+        UPDATE ventas
+        SET sunat_estado='INTERNO',
+            sunat_modo='NO_ENVIAR',
+            sunat_respuesta_json=%s
+        WHERE UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA')
+          AND COALESCE(sucursal,%s)=%s
+          AND COALESCE(sunat_estado,'PENDIENTE') NOT IN ('ACEPTADO','PROCESO')
+        """, (
+            json.dumps({"msg": "Documento interno historico de caja. Excluido de envio SUNAT."}, ensure_ascii=False),
+            DEFAULT_SUCURSAL,
+            sucursal,
+        ))
+        actualizados = int(cur.rowcount or 0)
+        conn.commit()
+        return {
+            "ok": True,
+            "success": True,
+            "sucursal": sucursal,
+            "actualizados": actualizados,
+            "msg": f"{actualizados} documento(s) marcados como internos. No se enviaran a SUNAT.",
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
 @app.post("/sunat/documentos/{documento_id}/xml")
 def generar_sunat_xml(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -6890,6 +7066,15 @@ def enviar_documento_sunat(documento_id: int, data: SunatEnviarRequest = None, s
         doc, detalle = _sunat_documento_payload(cur, documento_id, sucursal)
         if not doc:
             return {"ok": False, "success": False, "msg": "Documento no encontrado o no es BOLETA/FACTURA."}
+        bloqueado, bloqueo_msg = _sunat_envio_bloqueado(doc)
+        if bloqueado:
+            return {
+                "ok": False,
+                "success": False,
+                "msg": bloqueo_msg,
+                "sunat_estado": doc.get("sunat_estado"),
+                "sunat_modo": doc.get("sunat_modo"),
+            }
         cfg = _sunat_get_config(cur, doc.get("sucursal") or sucursal)
         if data.regenerar or not doc.get("sunat_zip_base64"):
             doc, cfg, artifacts, xml_bytes, zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
@@ -6952,6 +7137,10 @@ def _sunat_auto_send_document(documento_id, sucursal):
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(sucursal)
+        doc, _detalle = _sunat_documento_payload(cur, documento_id, sucursal)
+        bloqueado, bloqueo_msg = _sunat_envio_bloqueado(doc or {})
+        if bloqueado:
+            return {"ok": True, "auto": False, "msg": bloqueo_msg, "sunat_estado": (doc or {}).get("sunat_estado"), "sunat_modo": (doc or {}).get("sunat_modo")}
         cfg = _sunat_get_config(cur, sucursal)
         auto = str(cfg.get("envio_automatico")).lower() in ("1", "true", "si", "yes", "on")
         if not auto:
@@ -8901,6 +9090,8 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
     cur.execute("""
         SELECT COUNT(*) FROM ventas
         WHERE COALESCE(sunat_estado,'PENDIENTE') IN ('PENDIENTE','PROCESO')
+          AND COALESCE(sunat_estado,'') <> 'INTERNO'
+          AND UPPER(COALESCE(sunat_modo,'')) NOT IN ('NO_ENVIAR','INTERNO')
           AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA')
           AND COALESCE(sucursal,%s)=%s
     """, (DEFAULT_SUCURSAL, sucursal))
