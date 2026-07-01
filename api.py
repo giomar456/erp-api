@@ -41,6 +41,11 @@ except Exception:
     load_key_and_certificates = None
     serialization = None
 
+try:
+    import plataform_sunat_client as plataform_sunat
+except Exception:
+    plataform_sunat = None
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -1509,6 +1514,11 @@ class SunatConfigUpdate(BaseModel):
     ambiente: str = "BETA"
     envio_automatico: bool = False
     fecha_activacion_sunat: str = ""
+    proveedor_sunat: str = "directo"
+    api_base_url: str = ""
+    api_key: str = ""
+    api_secret: str = ""
+    api_sucursal_id: int = 1
     ruc: str = ""
     razon_social: str = ""
     nombre_comercial: str = ""
@@ -1522,6 +1532,25 @@ class SunatConfigUpdate(BaseModel):
     endpoint_url: str = ""
     certificado_pfx_base64: str = ""
     certificado_password: str = ""
+
+
+PLATAFORM_API_SECRET_AVISO = (
+    "El api_secret se guarda como hash SHA256 en la plataforma. "
+    "No existe forma de recuperar el valor original; solo se puede generar uno nuevo. "
+    "Este diseño es intencional: ni el equipo tecnico puede ver el secret de un cliente."
+)
+PLATAFORM_API_SECRET_AVISO_REGISTRO = (
+    f"{PLATAFORM_API_SECRET_AVISO} "
+    "Al registrar un cliente nuevo, el sistema devuelve el api_secret en texto plano UNA UNICA VEZ. "
+    "Copialo y guardalo en un lugar seguro antes de cerrar esta ventana."
+)
+
+
+class SunatPlataformRegistro(BaseModel):
+    cert_path: str = ""
+    certificado_pfx_base64: str = ""
+    cert_password: str = ""
+    entorno: str = "beta"
 
 
 class SunatEnviarRequest(BaseModel):
@@ -4821,7 +4850,10 @@ def reset_series_documentos(data: SeriesDocumentoReset = None, sucursal: str = D
     try:
         sucursal = norm_sucursal(data.sucursal or sucursal)
         seed_branch_series(cur, sucursal)
-        tipos = data.tipos or ["BOLETA", "FACTURA", "PROFORMA", "NOTA DE VENTA", "PASE", "GARANTIA", "NOTA DE CREDITO"]
+        tipos = data.tipos or [
+            "BOLETA", "FACTURA", "BOLETA_ELECTRONICA", "FACTURA_ELECTRONICA",
+            "PROFORMA", "NOTA DE VENTA", "PASE", "GARANTIA", "NOTA DE CREDITO",
+        ]
         correlativo = max(1, int(data.correlativo or 1))
         updated = []
         for tipo in tipos:
@@ -6366,7 +6398,7 @@ def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal
         if estado not in ("PENDIENTE", "PROCESO", "ACEPTADO", "RECHAZADO", "INTERNO"):
             estado = "PROCESO"
         modo = (data.sunat_modo or "MANUAL").upper()
-        if modo not in ("MANUAL", "NO_ENVIAR", "ELECTRONICO", "API"):
+        if modo not in ("MANUAL", "NO_ENVIAR", "ELECTRONICO", "API", "PLATAFORM"):
             modo = "MANUAL"
 
         cur.execute("""
@@ -6509,6 +6541,11 @@ def _sunat_get_config(cur, sucursal):
     cfg = {
         "ambiente": _sunat_env(sucursal, "AMBIENTE", "BETA").strip().upper() or "BETA",
         "envio_automatico": str(_sunat_env(sucursal, "ENVIO_AUTOMATICO", "")).strip().lower() in ("1", "true", "si", "yes", "on"),
+        "proveedor_sunat": str(_sunat_env(sucursal, "PROVEEDOR", "directo")).strip().lower() or "directo",
+        "api_base_url": str(_sunat_env(sucursal, "API_BASE_URL", os.getenv("PLATAFORM_SUNAT_BASE_URL", "https://apigo.apuuraydev.com/api/v1"))).strip(),
+        "api_key": str(_sunat_env(sucursal, "API_KEY", "")).strip(),
+        "api_secret": str(_sunat_env(sucursal, "API_SECRET", "")).strip(),
+        "api_sucursal_id": int(_sunat_env(sucursal, "API_SUCURSAL_ID", "1") or "1"),
         "ruc": _sunat_env(sucursal, "RUC", "").strip(),
         "razon_social": _sunat_env(sucursal, "RAZON_SOCIAL", "").strip(),
         "nombre_comercial": _sunat_env(sucursal, "NOMBRE_COMERCIAL", "").strip(),
@@ -6531,6 +6568,9 @@ def _sunat_get_config(cur, sucursal):
             saved = json.loads(row[0])
             if isinstance(saved, dict):
                 for key, value in saved.items():
+                    if key == "usuario_sol":
+                        cfg[key] = str(value or "").strip().upper()
+                        continue
                     if value not in (None, ""):
                         cfg[key] = str(value).strip()
     except Exception:
@@ -6540,7 +6580,21 @@ def _sunat_get_config(cur, sucursal):
         cfg["ambiente"] = "BETA"
     if not cfg.get("endpoint_url"):
         cfg["endpoint_url"] = SUNAT_DEFAULT_ENDPOINTS[cfg["ambiente"]]
+    proveedor = str(cfg.get("proveedor_sunat") or "directo").strip().lower()
+    if proveedor not in ("directo", "plataform", "plataforma", "api", "kodevo", "apigo"):
+        proveedor = "directo"
+    cfg["proveedor_sunat"] = "plataform" if proveedor in ("plataform", "plataforma", "api", "kodevo", "apigo") else "directo"
+    if not str(cfg.get("api_base_url") or "").strip():
+        cfg["api_base_url"] = "https://apigo.apuuraydev.com/api/v1"
+    try:
+        cfg["api_sucursal_id"] = max(1, int(cfg.get("api_sucursal_id") or 1))
+    except Exception:
+        cfg["api_sucursal_id"] = 1
     return cfg
+
+
+def _sunat_usa_plataform(cfg):
+    return str((cfg or {}).get("proveedor_sunat") or "").strip().lower() == "plataform"
 
 
 def _sunat_emision_habilitada():
@@ -6549,13 +6603,22 @@ def _sunat_emision_habilitada():
 
 def _sunat_public_config(cfg):
     public = dict(cfg)
-    for key in ("clave_sol", "certificado_pfx_base64", "certificado_password"):
+    for key in ("clave_sol", "certificado_pfx_base64", "certificado_password", "api_secret"):
         public[key] = "CONFIGURADO" if cfg.get(key) else ""
     public["ruc"] = _sunat_clean_ruc(public.get("ruc"))
-    public["listo_envio"] = bool(public.get("ruc") and public.get("usuario_sol") and cfg.get("clave_sol") and public.get("endpoint_url"))
+    public["proveedor_sunat"] = str(cfg.get("proveedor_sunat") or "directo").strip().lower()
+    public["api_key"] = str(cfg.get("api_key") or "").strip()
+    public["api_base_url"] = str(cfg.get("api_base_url") or "").strip()
+    public["api_sucursal_id"] = int(cfg.get("api_sucursal_id") or 1)
+    public["listo_envio"] = bool(public.get("ruc") and cfg.get("clave_sol") and public.get("endpoint_url"))
     public["firma_configurada"] = bool(cfg.get("certificado_pfx_base64") and cfg.get("certificado_password"))
+    public["plataform_configurada"] = bool(cfg.get("api_key") and cfg.get("api_secret") and public.get("api_base_url"))
     public["envio_automatico"] = bool(str(cfg.get("envio_automatico")).lower() in ("1", "true", "si", "yes", "on"))
-    public["listo_emitir"] = bool(public["listo_envio"] and public["firma_configurada"])
+    if _sunat_usa_plataform(cfg):
+        public["listo_emitir"] = bool(public["plataform_configurada"])
+        public["listo_envio"] = bool(public["plataform_configurada"])
+    else:
+        public["listo_emitir"] = bool(public["listo_envio"] and public["firma_configurada"])
     public["emision_habilitada"] = _sunat_emision_habilitada()
     public["puede_enviar_sunat"] = bool(public["listo_emitir"] and public["emision_habilitada"])
     return public
@@ -6853,8 +6916,11 @@ def _sunat_generate_for_document(cur, documento_id, sucursal):
 
 
 def _sunat_soap_username(cfg):
+    ruc = _sunat_clean_ruc(cfg.get("ruc"))
     usuario_sol = str(cfg.get("usuario_sol") or "").strip().upper()
-    return f"{_sunat_clean_ruc(cfg.get('ruc'))}{usuario_sol}"
+    if not usuario_sol:
+        return ruc
+    return f"{ruc}{usuario_sol}"
 
 
 def _sunat_parse_soap_fault(response_text):
@@ -6916,27 +6982,27 @@ def diagnostico_sunat(sucursal: str = DEFAULT_SUCURSAL):
             "sucursal": sucursal,
             "portal_login": {
                 "ruc": public.get("ruc"),
-                "usuario_sol": public.get("usuario_sol"),
-                "nota": "En el portal SUNAT ingresas RUC y usuario por separado.",
+                "usuario_sol": public.get("usuario_sol") or "(principal — solo RUC)",
+                "nota": "Portal SUNAT: RUC + clave SOL principal. Usuario secundario solo si lo configuras en el ERP.",
             },
             "soap_login": {
                 "username": _sunat_soap_username(cfg),
                 "clave_configurada": bool(clave),
                 "clave_longitud": len(clave),
-                "nota": "El servicio web concatena RUC + usuario, por ejemplo 20613247603LOOKBAIL.",
+                "nota": "Usuario principal: solo RUC. Usuario secundario: RUC + codigo (ej. 20611068701ERPFACTU).",
             },
             "config": public,
             "error_0110": {
                 "significado": "SUNAT no reconoce el tipo de usuario para facturacion electronica.",
                 "causas_frecuentes": [
-                    "ARMY entra al portal web pero no tiene perfil de Comprobantes de Pago / Factura Electronica.",
-                    "El usuario secundario fue creado bajo otro RUC distinto al configurado en el ERP.",
-                    "La clave guardada en el ERP no coincide con la que pruebas manualmente en el portal.",
+                    "La clave SOL principal no coincide con la guardada en el ERP.",
+                    "El RUC configurado no tiene habilitada la facturacion electronica.",
+                    "Si usas usuario secundario, falta asignar programas de comprobantes electronicos.",
                 ],
                 "que_revisar_en_sunat": [
-                    "Mis tramites > Administracion de usuarios secundarios > ARMY > Asignar programas.",
+                    "Ingresar con RUC 20611068701 y clave SOL principal en el portal.",
                     "Tributarios > Comprobantes de pago: SEE-Contribuyente, Envio de documentos, Factura y Boleta electronica.",
-                    "Confirmar que el RUC del portal sea 20611068701 (COMPUTER ARMY).",
+                    "Certificado digital comunicado y vigente.",
                 ],
             },
             "emision_habilitada": _sunat_emision_habilitada(),
@@ -7028,7 +7094,9 @@ def obtener_sunat_config(sucursal: str = DEFAULT_SUCURSAL):
     try:
         sucursal = norm_sucursal(sucursal)
         cfg = _sunat_get_config(cur, sucursal)
-        return {"ok": True, "success": True, "sucursal": sucursal, "data": _sunat_public_config(cfg)}
+        public = _sunat_public_config(cfg)
+        public["aviso_api_secret"] = PLATAFORM_API_SECRET_AVISO
+        return {"ok": True, "success": True, "sucursal": sucursal, "data": public}
     finally:
         conn.close()
 
@@ -7053,7 +7121,18 @@ def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURS
         clean["usuario_sol"] = str(clean.get("usuario_sol") or "").strip().upper()
         if clean["ambiente"] not in ("BETA", "PRODUCCION"):
             clean["ambiente"] = "BETA"
-        for secret_key in ("clave_sol", "certificado_pfx_base64", "certificado_password"):
+        clean["proveedor_sunat"] = str(clean.get("proveedor_sunat") or current.get("proveedor_sunat") or "directo").strip().lower()
+        if clean["proveedor_sunat"] in ("plataforma", "api", "kodevo", "apigo"):
+            clean["proveedor_sunat"] = "plataform"
+        if clean["proveedor_sunat"] not in ("directo", "plataform"):
+            clean["proveedor_sunat"] = "directo"
+        if not str(clean.get("api_base_url") or "").strip():
+            clean["api_base_url"] = str(current.get("api_base_url") or "https://apigo.apuuraydev.com/api/v1").strip()
+        try:
+            clean["api_sucursal_id"] = max(1, int(clean.get("api_sucursal_id") or current.get("api_sucursal_id") or 1))
+        except Exception:
+            clean["api_sucursal_id"] = 1
+        for secret_key in ("clave_sol", "certificado_pfx_base64", "certificado_password", "api_secret"):
             value = str(clean.get(secret_key) or "").strip()
             if value in ("", "CONFIGURADO"):
                 clean[secret_key] = current.get(secret_key) or ""
@@ -7066,6 +7145,105 @@ def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURS
         """, (f"sunat:{sucursal}", json.dumps(clean, ensure_ascii=False)))
         conn.commit()
         return {"ok": True, "success": True, "sucursal": sucursal, "data": _sunat_public_config(clean)}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
+
+
+@app.post("/sunat/plataform/registrar")
+def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucursal: str = DEFAULT_SUCURSAL):
+    data = data or SunatPlataformRegistro()
+    if not plataform_sunat:
+        return {"ok": False, "success": False, "msg": "Modulo plataform_sunat_client no disponible en el servidor."}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cfg = _sunat_get_config(cur, sucursal)
+        cert_path = str(data.cert_path or "").strip()
+        if not cert_path:
+            cert_path = str(_sunat_env(sucursal, "CERT_PFX_PATH", "") or "").strip()
+        cert_password = str(data.cert_password or cfg.get("certificado_password") or "").strip()
+        cert_b64 = str(data.certificado_pfx_base64 or cfg.get("certificado_pfx_base64") or "").strip()
+        if cert_b64 in ("", "CONFIGURADO"):
+            cert_b64 = ""
+        temp_cert_path = ""
+        if not cert_path or not os.path.exists(cert_path):
+            if cert_b64:
+                try:
+                    cert_bytes = base64.b64decode(cert_b64)
+                    temp_fd, temp_cert_path = tempfile.mkstemp(suffix=".p12")
+                    os.write(temp_fd, cert_bytes)
+                    os.close(temp_fd)
+                    cert_path = temp_cert_path
+                except Exception as exc:
+                    return {"ok": False, "success": False, "msg": f"Certificado PFX invalido: {exc}"}
+            else:
+                return {"ok": False, "success": False, "msg": "Falta certificado .pfx/.p12. Subelo en la pantalla SUNAT o indica cert_path."}
+        if not cert_password:
+            return {"ok": False, "success": False, "msg": "Falta contrasena del certificado."}
+        entorno = "produccion" if str(cfg.get("ambiente") or "BETA").upper() == "PRODUCCION" else str(data.entorno or "beta").strip().lower()
+        try:
+            status, body, used_base = plataform_sunat.registrar_empresa(
+                ruc=_sunat_clean_ruc(cfg.get("ruc")),
+                razon_social=str(cfg.get("razon_social") or "").strip(),
+                direccion=str(cfg.get("direccion") or "").strip(),
+                ubigeo=str(cfg.get("ubigeo") or "150101").strip(),
+                sol_user=str(cfg.get("usuario_sol") or "").strip(),
+                sol_pass=str(cfg.get("clave_sol") or "").strip(),
+                cert_path=cert_path,
+                cert_password=cert_password,
+                entorno=entorno,
+                base_url=str(cfg.get("api_base_url") or "").strip(),
+            )
+        finally:
+            if temp_cert_path:
+                try:
+                    os.remove(temp_cert_path)
+                except Exception:
+                    pass
+        if status >= 400:
+            return {
+                "ok": False,
+                "success": False,
+                "http_status": status,
+                "base_url": used_base,
+                "respuesta": body,
+                "aviso_api_secret": PLATAFORM_API_SECRET_AVISO,
+            }
+        datos = body.get("datos") if isinstance(body, dict) else {}
+        api_key = ""
+        api_secret = ""
+        if isinstance(datos, dict):
+            api_key = str(datos.get("api_key") or "").strip()
+            api_secret = str(datos.get("api_secret") or "").strip()
+        credenciales_una_vez = None
+        if api_key and api_secret:
+            credenciales_una_vez = {"api_key": api_key, "api_secret": api_secret}
+            cfg["proveedor_sunat"] = "plataform"
+            cfg["api_key"] = api_key
+            cfg["api_secret"] = api_secret
+            cfg["api_base_url"] = used_base
+            cur.execute("""
+            INSERT INTO app_config (clave, valor, actualizado)
+            VALUES (%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT (clave) DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
+            """, (f"sunat:{sucursal}", json.dumps(cfg, ensure_ascii=False)))
+            conn.commit()
+        public = _sunat_public_config(cfg)
+        return {
+            "ok": True,
+            "success": True,
+            "http_status": status,
+            "base_url": used_base,
+            "data": public,
+            "respuesta": body,
+            "credenciales_una_vez": credenciales_una_vez,
+            "aviso_api_secret": PLATAFORM_API_SECRET_AVISO_REGISTRO,
+            "msg": "Empresa registrada. Copia el api_secret ahora: solo se muestra una vez.",
+        }
     except Exception as e:
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
@@ -7188,6 +7366,60 @@ def descargar_sunat_zip(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         conn.close()
 
 
+def _sunat_enviar_via_plataform(cur, documento_id, doc, detalle, cfg, sucursal):
+    if not plataform_sunat:
+        return {"ok": False, "success": False, "msg": "Modulo plataform_sunat_client no disponible en el servidor."}
+    public_cfg = _sunat_public_config(cfg)
+    if not public_cfg.get("plataform_configurada"):
+        cur.execute("""
+        UPDATE ventas
+        SET sunat_estado='PENDIENTE',
+            sunat_modo='PLATAFORM',
+            sunat_respuesta_json=%s,
+            sunat_fecha=CURRENT_TIMESTAMP
+        WHERE id=%s
+        """, (json.dumps({"msg": "Falta api_key, api_secret o api_base_url de plataform SUNAT."}, ensure_ascii=False), documento_id))
+        return {
+            "ok": False,
+            "success": False,
+            "msg": "Falta configurar api_key, api_secret y api_base_url en /sunat/config (proveedor_sunat=plataform).",
+            "config": public_cfg,
+        }
+    resultado = plataform_sunat.emitir_documento_erp(
+        api_key=str(cfg.get("api_key") or ""),
+        api_secret=str(cfg.get("api_secret") or ""),
+        doc=doc,
+        detalle=detalle,
+        base_url=str(cfg.get("api_base_url") or "").strip(),
+        sucursal_id=int(cfg.get("api_sucursal_id") or 1),
+        sincronizar_serie=True,
+    )
+    estado = str(resultado.get("sunat_estado") or "PROCESO").upper()
+    if estado not in ("ACEPTADO", "RECHAZADO", "PROCESO"):
+        estado = "PROCESO"
+    respuesta_json = json.dumps(resultado, ensure_ascii=False)
+    cur.execute("""
+    UPDATE ventas
+    SET sunat_estado=%s,
+        sunat_modo='PLATAFORM',
+        sunat_fecha=CURRENT_TIMESTAMP,
+        sunat_respuesta_json=%s
+    WHERE id=%s
+    """, (estado, respuesta_json, documento_id))
+    return {
+        "ok": estado != "RECHAZADO",
+        "success": estado != "RECHAZADO",
+        "id": documento_id,
+        "sunat_estado": estado,
+        "proveedor": "plataform",
+        "plataform_id": resultado.get("plataform_id"),
+        "numero_plataform": resultado.get("numero_plataform"),
+        "base_url": resultado.get("base_url"),
+        "respuesta": resultado,
+        "msg": resultado.get("msg"),
+    }
+
+
 @app.post("/sunat/documentos/{documento_id}/enviar")
 def enviar_documento_sunat(documento_id: int, data: SunatEnviarRequest = None, sucursal: str = DEFAULT_SUCURSAL):
     data = data or SunatEnviarRequest()
@@ -7216,6 +7448,10 @@ def enviar_documento_sunat(documento_id: int, data: SunatEnviarRequest = None, s
                 "sunat_modo": doc.get("sunat_modo"),
             }
         cfg = _sunat_get_config(cur, doc.get("sucursal") or sucursal)
+        if _sunat_usa_plataform(cfg):
+            out = _sunat_enviar_via_plataform(cur, documento_id, doc, detalle, cfg, sucursal)
+            conn.commit()
+            return out
         if data.regenerar or not doc.get("sunat_zip_base64"):
             doc, cfg, artifacts, xml_bytes, zip_bytes = _sunat_generate_for_document(cur, documento_id, sucursal)
             zip_name = artifacts["zip_nombre"]
