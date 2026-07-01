@@ -7359,8 +7359,8 @@ function SunatView() {
             <Field label="Distrito"><TextInput value={cfg.distrito || 'LIMA'} onChange={(e) => update('distrito', e.target.value)} /></Field>
             <Field label="Provincia"><TextInput value={cfg.provincia || 'LIMA'} onChange={(e) => update('provincia', e.target.value)} /></Field>
             <Field label="Departamento"><TextInput value={cfg.departamento || 'LIMA'} onChange={(e) => update('departamento', e.target.value)} /></Field>
-            <Field label="Usuario SOL"><TextInput value={cfg.usuario_sol || ''} onChange={(e) => update('usuario_sol', e.target.value)} placeholder="Usuario secundario SUNAT" /></Field>
-            <Field label="Clave SOL"><TextInput type="password" value={cfg.clave_sol === 'CONFIGURADO' ? '' : (cfg.clave_sol || '')} onChange={(e) => update('clave_sol', e.target.value)} placeholder={cfg.clave_sol === 'CONFIGURADO' ? 'Clave guardada' : 'Clave SOL'} /></Field>
+            <Field label="Usuario SOL (solo codigo secundario)"><TextInput value={cfg.usuario_sol || ''} onChange={(e) => update('usuario_sol', e.target.value)} placeholder="Ej: 77136020 (sin RUC delante)" /></Field>
+            <Field label="Clave SOL (contraseña Army SUNAT)"><TextInput type="password" value={cfg.clave_sol === 'CONFIGURADO' ? '' : (cfg.clave_sol || '')} onChange={(e) => update('clave_sol', e.target.value)} placeholder={cfg.clave_sol === 'CONFIGURADO' ? 'Clave guardada — escribe solo si quieres cambiarla' : 'Clave SOL de Computer Army'} /></Field>
             <Field label="Clave certificado PFX"><TextInput type="password" value={cfg.certificado_password === 'CONFIGURADO' ? '' : (cfg.certificado_password || '')} onChange={(e) => update('certificado_password', e.target.value)} placeholder={cfg.certificado_password === 'CONFIGURADO' ? 'Clave de certificado guardada' : 'Clave del PFX'} /></Field>
             <Field label="Endpoint SUNAT"><TextInput value={cfg.endpoint_url || ''} onChange={(e) => update('endpoint_url', e.target.value)} placeholder="Automatico por ambiente si queda vacio" /></Field>
           </div>
@@ -7508,8 +7508,8 @@ function AjustesView() {
               <Field label="Distrito"><TextInput value={sunatCfg.distrito || 'LIMA'} onChange={(e) => updateSunat('distrito', e.target.value)} /></Field>
               <Field label="Provincia"><TextInput value={sunatCfg.provincia || 'LIMA'} onChange={(e) => updateSunat('provincia', e.target.value)} /></Field>
               <Field label="Departamento"><TextInput value={sunatCfg.departamento || 'LIMA'} onChange={(e) => updateSunat('departamento', e.target.value)} /></Field>
-              <Field label="Usuario SOL"><TextInput value={sunatCfg.usuario_sol || ''} onChange={(e) => updateSunat('usuario_sol', e.target.value)} placeholder="RUC + usuario secundario" /></Field>
-              <Field label="Clave SOL"><TextInput type="password" value={sunatCfg.clave_sol === 'CONFIGURADO' ? '' : (sunatCfg.clave_sol || '')} onChange={(e) => updateSunat('clave_sol', e.target.value)} placeholder={sunatCfg.clave_sol === 'CONFIGURADO' ? 'Clave guardada' : 'Clave SOL'} /></Field>
+              <Field label="Usuario SOL (codigo secundario)"><TextInput value={sunatCfg.usuario_sol || ''} onChange={(e) => updateSunat('usuario_sol', e.target.value)} placeholder="Ej: 77136020 (sin RUC)" /></Field>
+              <Field label="Clave SOL (contraseña Army)"><TextInput type="password" value={sunatCfg.clave_sol === 'CONFIGURADO' ? '' : (sunatCfg.clave_sol || '')} onChange={(e) => updateSunat('clave_sol', e.target.value)} placeholder={sunatCfg.clave_sol === 'CONFIGURADO' ? 'Clave guardada' : 'Clave SOL Computer Army'} /></Field>
               <Field label="Endpoint SUNAT"><TextInput value={sunatCfg.endpoint_url || ''} onChange={(e) => updateSunat('endpoint_url', e.target.value)} placeholder="Se autocompleta por ambiente si lo dejas vacio" /></Field>
               <Field label="Clave certificado PFX"><TextInput type="password" value={sunatCfg.certificado_password === 'CONFIGURADO' ? '' : (sunatCfg.certificado_password || '')} onChange={(e) => updateSunat('certificado_password', e.target.value)} placeholder={sunatCfg.certificado_password === 'CONFIGURADO' ? 'Clave de certificado guardada' : 'Clave del PFX'} /></Field>
             </div>
