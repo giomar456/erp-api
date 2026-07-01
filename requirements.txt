@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+psycopg2-binary
+requests
+reportlab
+pillow
+lxml
+cryptography
+signxml
