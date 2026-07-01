@@ -1,11 +1,11 @@
 ﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
+from starlette.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 from decimal import Decimal
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from collections import defaultdict, deque
 import threading
 import time
@@ -50,20 +50,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class CachedStaticFiles(StaticFiles):
+    def __init__(self, *args, cache_seconds=86400, **kwargs):
+        self.cache_seconds = int(cache_seconds or 0)
+        super().__init__(*args, **kwargs)
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200 and self.cache_seconds > 0:
+            response.headers["Cache-Control"] = f"public, max-age={self.cache_seconds}"
+        return response
+
+
 WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
 if os.path.isdir(WEBAPP_DIR):
     assets_dir = os.path.join(WEBAPP_DIR, "assets")
     if os.path.isdir(assets_dir):
-        app.mount("/erp/assets", StaticFiles(directory=assets_dir), name="erp_assets")
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="root_assets")
+        app.mount("/erp/assets", CachedStaticFiles(directory=assets_dir, cache_seconds=31536000), name="erp_assets")
+        app.mount("/assets", CachedStaticFiles(directory=assets_dir, cache_seconds=31536000), name="root_assets")
     sounds_dir = os.path.join(WEBAPP_DIR, "sounds")
     if os.path.isdir(sounds_dir):
-        app.mount("/erp/sounds", StaticFiles(directory=sounds_dir), name="erp_sounds")
-        app.mount("/sounds", StaticFiles(directory=sounds_dir), name="root_sounds")
-    videos_dir = os.path.join(WEBAPP_DIR, "videos")
-    if os.path.isdir(videos_dir):
-        app.mount("/erp/videos", StaticFiles(directory=videos_dir), name="erp_videos")
-        app.mount("/videos", StaticFiles(directory=videos_dir), name="root_videos")
+        app.mount("/erp/sounds", CachedStaticFiles(directory=sounds_dir, cache_seconds=604800), name="erp_sounds")
+        app.mount("/sounds", CachedStaticFiles(directory=sounds_dir, cache_seconds=604800), name="root_sounds")
 
 
 @app.get("/")
@@ -133,6 +141,29 @@ def lima_now():
 
 def lima_today_iso():
     return lima_now().date().isoformat()
+
+
+PROFORMA_VALIDITY_HOURS = 48
+PROFORMA_VALIDITY_NOTE = "Cotizacion valida solo por 48 horas desde la fecha de emision."
+
+
+def proforma_fecha_vencimiento(fecha_emision=None):
+    base = parse_fecha_emision(fecha_emision) if fecha_emision else lima_now()
+    return (base + timedelta(hours=PROFORMA_VALIDITY_HOURS)).date().isoformat()
+
+
+def proforma_observacion_valida(observacion=""):
+    obs = str(observacion or "").strip()
+    marker = PROFORMA_VALIDITY_NOTE.lower()
+    if marker in obs.lower():
+        return obs
+    return f"{obs}\n{PROFORMA_VALIDITY_NOTE}".strip() if obs else PROFORMA_VALIDITY_NOTE
+
+
+def documento_pdf_label(tipo):
+    if str(tipo or "").upper() == "PROFORMA":
+        return "COTIZACION"
+    return str(tipo or "DOCUMENTO").upper()
 
 
 def parse_fecha_emision(value):
@@ -3119,10 +3150,11 @@ def generar_pdf_documento_original(documento, detalle, cfg):
 
     doc_type = str(documento.get("tipo") or "DOCUMENTO").upper()
     numero = str(documento.get("numero") or "")
+    is_proforma_doc = doc_type == "PROFORMA"
     title = {
         "BOLETA": "BOLETA DE VENTA\nELECTRONICA",
         "FACTURA": "FACTURA\nELECTRONICA",
-        "PROFORMA": "PROFORMA",
+        "PROFORMA": "COTIZACION",
         "PASE": "PASE",
         "NOTA DE VENTA": "NOTA DE VENTA",
     }.get(doc_type, doc_type)
@@ -3253,7 +3285,8 @@ def generar_pdf_documento_original(documento, detalle, cfg):
 
     info_y = 176
     txt(7.0, info_y, "USUARIO", 7.0, True); txt(65, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 6.6)
-    txt(7.0, info_y + 4.8, "CONDICION DE PAGO", 7.0, True); txt(65, info_y + 4.8, documento.get("estado_pago") or "CONTADO", 6.8)
+    condicion_pago = "COTIZACION" if is_proforma_doc else (documento.get("estado_pago") or "CONTADO")
+    txt(7.0, info_y + 4.8, "CONDICION DE PAGO", 7.0, True); txt(65, info_y + 4.8, condicion_pago, 6.8)
     txt(65, info_y + 12.0, "CUENTAS BANCARIAS", 6.8, True)
     txt(94, info_y + 12.0, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 6.5)
     txt(65, info_y + 16.0, "Titular:Computer Army Eirl", 6.5)
@@ -3264,10 +3297,16 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         rect(181, info_y + 27, 20, 20)
 
     legal_y = 216
-    txt(5.0, legal_y, "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT", 7.0)
-    txt(5.0, legal_y + 5, f"Representacion impresa de la {title.replace(chr(10), ' ')}", 7.0)
-    txt(5.0, legal_y + 10, "Para consultar el comprobante visita G&G ERP", 8.6)
-    txt(5.0, legal_y + 15, "Resumen", 8.6)
+    if is_proforma_doc:
+        txt(5.0, legal_y, "COTIZACION - NO TIENE VALIDEZ TRIBUTARIA", 7.0, True)
+        txt(5.0, legal_y + 5, f"VALIDA SOLO POR 48 HORAS HASTA {venc}", 7.0, True)
+        txt(5.0, legal_y + 10, "Precios y stock sujetos a confirmacion al emitir boleta/factura.", 6.5)
+        txt(5.0, legal_y + 15, PROFORMA_VALIDITY_NOTE, 6.3)
+    else:
+        txt(5.0, legal_y, "Autorizado mediante resolucion Nro 034-005-0010431/SUNAT", 7.0)
+        txt(5.0, legal_y + 5, f"Representacion impresa de la {title.replace(chr(10), ' ')}", 7.0)
+        txt(5.0, legal_y + 10, "Para consultar el comprobante visita G&G ERP", 8.6)
+        txt(5.0, legal_y + 15, "Resumen", 8.6)
     texts = editor.get("texts") if isinstance(editor.get("texts"), dict) else {}
     wy = 244
     for key in ("garantia_1", "garantia_2", "garantia_3", "garantia_4", "garantia_5", "garantia_6"):
@@ -4847,10 +4886,11 @@ def crear_venta(data: Venta):
         es_proforma = doc_tipo_upper == "PROFORMA"
         mueve_stock = doc_tipo_upper in STOCK_DOC_TYPES
         if es_proforma and not fecha_vencimiento:
-            fecha_vencimiento = fecha_emision.date().isoformat()
+            fecha_vencimiento = proforma_fecha_vencimiento(fecha_emision)
         if es_proforma:
             estado_pago = "DEUDA"
             metodo_pago = ""
+            data.observacion = proforma_observacion_valida(data.observacion)
 
         resolved_product_ids = {}
         if mueve_stock:
@@ -5157,6 +5197,9 @@ def crear_proforma(data: Venta):
     data.metodo_pago = ""
     if not data.cliente_nombre:
         data.cliente_nombre = "CLIENTE GENERAL"
+    if not data.fecha_vencimiento:
+        data.fecha_vencimiento = proforma_fecha_vencimiento(data.fecha_emision)
+    data.observacion = proforma_observacion_valida(data.observacion)
     return crear_venta(data)
 
 
@@ -5419,7 +5462,7 @@ def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL,
     try:
         cfg = cargar_config_documento_dict(sucursal or documento.get("sucursal") or DEFAULT_SUCURSAL)
         pdf = generar_pdf_documento_original(documento, detalle, cfg)
-        raw_name = f"{documento.get('tipo') or 'DOCUMENTO'}_{documento.get('numero') or documento_id}.pdf"
+        raw_name = f"{documento_pdf_label(documento.get('tipo'))}_{documento.get('numero') or documento_id}.pdf"
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name)
         return Response(
             content=pdf,
@@ -5683,14 +5726,18 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         if str(estado_actual or "").upper() == "ANULADO":
             conn.close()
             return {"ok": False, "success": False, "msg": "No se puede editar un documento anulado."}
-        if not usuario_puede_editar_documento(data):
+        es_proforma_doc = tipo_doc_upper == "PROFORMA"
+        if not es_proforma_doc and not usuario_puede_editar_documento(data):
             conn.close()
             return {"ok": False, "success": False, "msg": "Solo Giomar puede cambiar boletas/facturas ya procesadas."}
 
         motivo_cambio = str(data.get("observacion_cambio") or data.get("motivo_cambio") or "").strip()
         if not motivo_cambio:
-            conn.close()
-            return {"ok": False, "success": False, "msg": "Debes indicar la observacion del cambio antes de guardar."}
+            if es_proforma_doc:
+                motivo_cambio = "Actualizacion de cotizacion"
+            else:
+                conn.close()
+                return {"ok": False, "success": False, "msg": "Debes indicar la observacion del cambio antes de guardar."}
 
         cur.execute("""
         SELECT COALESCE(observacion_interna,'')
@@ -5719,7 +5766,11 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             total = round(sum(float((i or {}).get("cantidad") or 0) * float((i or {}).get("precio") or (i or {}).get("precio_unitario") or 0) for i in items), 2)
         subtotal = float(data.get("subtotal") or total)
         igv = float(data.get("igv") or 0)
-        fecha_vencimiento = data.get("fecha_vencimiento") or lima_today_iso()
+        if es_proforma_doc:
+            fecha_vencimiento = data.get("fecha_vencimiento") or proforma_fecha_vencimiento()
+            data["observacion"] = proforma_observacion_valida(data.get("observacion") or "")
+        else:
+            fecha_vencimiento = data.get("fecha_vencimiento") or lima_today_iso()
 
         documento_cliente = data.get("numero_documento_cliente") or ""
         tipo_cliente = data.get("tipo_documento_cliente") or ""
@@ -5868,7 +5919,11 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             "tipo": tipo_actual,
             "total": total,
             "fecha_vencimiento": fecha_vencimiento,
-            "msg": f"{tipo_actual} {numero_actual} actualizado. Stock y series recalculados.",
+            "msg": (
+                f"Cotizacion {numero_actual} actualizada. Valida hasta {fecha_vencimiento}."
+                if es_proforma_doc
+                else f"{tipo_actual} {numero_actual} actualizado. Stock y series recalculados."
+            ),
         }
     except Exception as e:
         conn.rollback()
