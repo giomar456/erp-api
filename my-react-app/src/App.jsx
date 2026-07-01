@@ -4,7 +4,7 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 const TEST_API_URL = new URLSearchParams(window.location.search).get('api');
 const BASE_URL = TEST_API_URL || 'https://erp-api-7x3d.onrender.com';
 const EMPRESA = 'computer_army';
-const APP_VERSION = '1.79';
+const APP_VERSION = '1.80';
 const IS_NATIVE_APP = !!(Capacitor?.isNativePlatform && Capacitor.isNativePlatform());
 const IS_PC_TESTER = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('tester') === 'pc';
 const IS_PC_DESKTOP = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('desktop') === 'pc';
@@ -7241,9 +7241,23 @@ function SunatView() {
   const [docs, setDocs] = useState([]);
   const [docDetails, setDocDetails] = useState({});
   const [msg, setMsg] = useState('');
+  const [verify, setVerify] = useState(null);
   const [loading, setLoading] = useState(false);
   const [docsLoading, setDocsLoading] = useState(false);
   const update = (key, value) => setCfg((current) => ({ ...current, [key]: value }));
+  const runVerify = async () => {
+    setMsg('Verificando instalacion SUNAT (sin enviar documentos)...');
+    setVerify(null);
+    try {
+      const res = await apiFetch('/sunat/verificar');
+      setVerify(res);
+      setMsg(res.puede_enviar_sunat
+        ? 'Instalacion lista. Ya se puede habilitar emision real.'
+        : (res.bloqueo_emision || res.certificado?.msg || res.nota || 'Verificacion completada.'));
+    } catch (error) {
+      setMsg(error?.message || 'No se pudo verificar SUNAT.');
+    }
+  };
   const loadDocs = async () => {
     setDocsLoading(true);
     try {
@@ -7326,17 +7340,27 @@ function SunatView() {
         Sucursal activa: <span className="font-black">{branchLabel}</span> ({empresa}). La configuracion y los envios SUNAT son independientes por sucursal.
       </div>
       <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
-      <Card title="Estado SUNAT" actions={<><ActionButton tone="neutral" onClick={load}>Recargar</ActionButton><ActionButton onClick={save}>Guardar SUNAT</ActionButton></>}>
+      <Card title="Estado SUNAT" actions={<><ActionButton tone="neutral" onClick={load}>Recargar</ActionButton><ActionButton tone="blue" onClick={runVerify}>Verificar instalacion</ActionButton><ActionButton onClick={save}>Guardar SUNAT</ActionButton></>}>
         <div className="grid gap-3">
-          <div className={`rounded-md p-3 text-sm font-black ${cfg.listo_envio ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>ENVIO: {cfg.listo_envio ? 'LISTO' : 'FALTA CONFIG'}</div>
+          <div className={`rounded-md p-3 text-sm font-black ${cfg.listo_envio ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>CREDENCIALES: {cfg.listo_envio ? 'LISTO' : 'FALTA CONFIG'}</div>
           <div className={`rounded-md p-3 text-sm font-black ${cfg.firma_configurada ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>FIRMA: {cfg.firma_configurada ? 'CERTIFICADO OK' : 'SIN CERTIFICADO PFX'}</div>
+          <div className={`rounded-md p-3 text-sm font-black ${cfg.listo_emitir ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>LISTO EMITIR: {cfg.listo_emitir ? 'SI' : 'NO'}</div>
+          <div className={`rounded-md p-3 text-sm font-black ${cfg.puede_enviar_sunat ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}`}>ENVIO REAL SUNAT: {cfg.puede_enviar_sunat ? 'HABILITADO' : 'BLOQUEADO (seguro)'}</div>
           <div className={`rounded-md p-3 text-sm font-black ${cfg.envio_automatico ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-700'}`}>ENVIO AUTOMATICO: {cfg.envio_automatico ? 'ACTIVO' : 'APAGADO'}</div>
           <div className="rounded-md bg-white p-3 text-xs font-bold text-slate-700">
             <div>RUC: {cfg.ruc || '—'}</div>
             <div>Razon social: {cfg.razon_social || '—'}</div>
             <div>Ambiente: {cfg.ambiente || 'BETA'}</div>
             <div>Usuario SOL: {cfg.usuario_sol || '—'}</div>
+            <div>Login SOAP: {cfg.ruc && cfg.usuario_sol ? `${cfg.ruc}${cfg.usuario_sol}` : '—'}</div>
           </div>
+          {verify && (
+            <div className="rounded-md bg-slate-50 p-3 text-xs font-bold text-slate-700">
+              <div>Certificado: {verify.certificado?.ok ? 'OK' : 'ERROR'} — {verify.certificado?.msg || '—'}</div>
+              {verify.certificado?.vence && <div>Vence: {String(verify.certificado.vence).slice(0, 10)}</div>}
+              {verify.bloqueo_emision && <div className="mt-1 text-rose-700">{verify.bloqueo_emision}</div>}
+            </div>
+          )}
           <div className="rounded-md bg-blue-50 p-3 text-xs font-bold text-blue-800">Solo boletas/facturas ELECTRONICAS (desde fecha de activacion) se envian a SUNAT. Las internas historicas quedan bloqueadas.</div>
           <div className="flex flex-wrap gap-2">
             <ActionButton tone="neutral" onClick={markHistoricosInternos}>Marcar historicos internos</ActionButton>
@@ -7359,7 +7383,7 @@ function SunatView() {
             <Field label="Distrito"><TextInput value={cfg.distrito || 'LIMA'} onChange={(e) => update('distrito', e.target.value)} /></Field>
             <Field label="Provincia"><TextInput value={cfg.provincia || 'LIMA'} onChange={(e) => update('provincia', e.target.value)} /></Field>
             <Field label="Departamento"><TextInput value={cfg.departamento || 'LIMA'} onChange={(e) => update('departamento', e.target.value)} /></Field>
-            <Field label="Usuario SOL (solo codigo secundario)"><TextInput value={cfg.usuario_sol || ''} onChange={(e) => update('usuario_sol', e.target.value)} placeholder="Ej: 77136020 (sin RUC delante)" /></Field>
+            <Field label="Usuario SOL (solo codigo secundario)"><TextInput value={cfg.usuario_sol || ''} onChange={(e) => update('usuario_sol', e.target.value)} placeholder="Ej: ARMY (sin RUC delante)" /></Field>
             <Field label="Clave SOL (contraseña Army SUNAT)"><TextInput type="password" value={cfg.clave_sol === 'CONFIGURADO' ? '' : (cfg.clave_sol || '')} onChange={(e) => update('clave_sol', e.target.value)} placeholder={cfg.clave_sol === 'CONFIGURADO' ? 'Clave guardada — escribe solo si quieres cambiarla' : 'Clave SOL de Computer Army'} /></Field>
             <Field label="Clave certificado PFX"><TextInput type="password" value={cfg.certificado_password === 'CONFIGURADO' ? '' : (cfg.certificado_password || '')} onChange={(e) => update('certificado_password', e.target.value)} placeholder={cfg.certificado_password === 'CONFIGURADO' ? 'Clave de certificado guardada' : 'Clave del PFX'} /></Field>
             <Field label="Endpoint SUNAT"><TextInput value={cfg.endpoint_url || ''} onChange={(e) => update('endpoint_url', e.target.value)} placeholder="Automatico por ambiente si queda vacio" /></Field>
