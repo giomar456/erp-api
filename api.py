@@ -693,6 +693,52 @@ def is_test_product_name(*values):
     return any(marker in text for marker in TEST_PRODUCT_MARKERS)
 
 
+def venta_linea_es_prueba(modo_prueba, *values):
+    if modo_prueba:
+        return True
+    return is_test_product_name(*values)
+
+
+def procesar_modo_prueba_venta(cur, producto_id, cantidad, series_texto, sucursal):
+    """Venta flexible: no exige coincidencia nombre/serie ni bloquea por producto incorrecto."""
+    sucursal = inventario_sucursal(sucursal)
+    cantidad = max(0, int(float(cantidad or 0)))
+    selected = split_series_text(series_texto)
+    touched_products = set()
+
+    for serie in selected:
+        cur.execute("""
+        SELECT ps.id, ps.producto_id
+        FROM producto_series ps
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s
+          AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE', 'RESERVADO')
+        ORDER BY ps.id
+        LIMIT 1
+        """, (DEFAULT_SUCURSAL, sucursal, serie))
+        row = cur.fetchone()
+        if row:
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+            WHERE id=%s
+            """, (row[0],))
+            if row[1]:
+                touched_products.add(row[1])
+
+    if producto_id and cantidad > 0 and not selected:
+        cur.execute("""
+        UPDATE productos SET stock = GREATEST(COALESCE(stock,0) - %s, 0)
+        WHERE id = %s AND COALESCE(sucursal,%s)=%s
+        """, (cantidad, producto_id, DEFAULT_SUCURSAL, sucursal))
+        touched_products.add(producto_id)
+
+    for pid in touched_products:
+        sync_producto_stock_from_series(cur, pid, sucursal)
+    return None
+
+
 def normalize_match_text(value):
     text = str(value or "").upper()
     text = re.sub(r"[^A-Z0-9]+", " ", text)
@@ -1303,6 +1349,7 @@ class Venta(BaseModel):
     metodo_pago: str = ""
     sucursal: str = DEFAULT_SUCURSAL
     emitir_legal_sunat: bool = False
+    modo_prueba: bool = False
 
 
 class Cliente(BaseModel):
@@ -4895,6 +4942,7 @@ def crear_venta(data: Venta):
         if doc_tipo_upper:
             data.tipo = doc_tipo_upper
         legal_sunat = bool(getattr(data, "emitir_legal_sunat", False))
+        modo_prueba = bool(getattr(data, "modo_prueba", False))
         row, serie_error = _resolver_fila_serie_documento(cur, doc_tipo_upper, sucursal, legal_sunat)
         if serie_error or not row:
             conn.close()
@@ -4939,6 +4987,13 @@ def crear_venta(data: Venta):
                         marca = marca or (prod[1] or "")
                         modelo = modelo or (prod[2] or "")
                 series_texto = item.series_texto or item.serie
+                if venta_linea_es_prueba(modo_prueba, descripcion, marca, modelo):
+                    error_prueba = procesar_modo_prueba_venta(cur, producto_id, item.cantidad, series_texto, sucursal)
+                    if error_prueba:
+                        conn.rollback()
+                        conn.close()
+                        return {"ok": False, "success": False, "msg": error_prueba}
+                    continue
                 if is_test_product_name(descripcion, marca, modelo) or ((not producto_id) and series_texto):
                     error_combo = procesar_combo_generico_venta(cur, descripcion, series_texto, sucursal)
                     if error_combo:
