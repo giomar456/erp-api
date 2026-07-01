@@ -1636,6 +1636,10 @@ class Producto(BaseModel):
     observacion: Optional[str] = ""
     almacen: Optional[str] = "TIENDA"
     sku_woo: Optional[str] = ""
+    categoria_web: Optional[str] = ""
+    subcategoria_web: Optional[str] = ""
+    woo_categoria_id: Optional[int] = 0
+    woo_subcategoria_id: Optional[int] = 0
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -1871,6 +1875,10 @@ def migrate_schema():
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
         cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS categoria_web TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS subcategoria_web TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_categoria_id INT")
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_subcategoria_id INT")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS series (
@@ -3826,28 +3834,44 @@ def actualizar_reserva(reserva_id: int, data: dict):
 
 
 # ================= PRODUCTOS =================
+def ensure_producto_web_columns(cur):
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS categoria_web TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS subcategoria_web TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_categoria_id INT")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_subcategoria_id INT")
+
+
 @app.post("/productos")
 def crear_producto(data: Producto):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = inventario_sucursal(data.sucursal)
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    ensure_producto_web_columns(cur)
 
     cur.execute("""
-    INSERT INTO productos (nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal,sku_woo)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    INSERT INTO productos (
+        nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal,sku_woo,
+        categoria_web,subcategoria_web,woo_categoria_id,woo_subcategoria_id
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
-    """, (data.nombre, data.categoria, data.marca,
-          data.modelo, data.precio_compra,
-          data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), sucursal, (data.sku_woo or "").strip().upper()))
+    """, (
+        data.nombre, data.categoria, data.marca, data.modelo, data.precio_compra,
+        data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "",
+        (data.almacen or "TIENDA").strip().upper(), sucursal, (data.sku_woo or "").strip().upper(),
+        (data.categoria_web or "").strip(), (data.subcategoria_web or "").strip(),
+        int(data.woo_categoria_id or 0), int(data.woo_subcategoria_id or 0),
+    ))
     producto_id = cur.fetchone()[0]
 
     conn.commit()
     conn.close()
 
-    return {"ok": True, "id": producto_id}
+    woo_sync = maybe_sync_new_product_to_woo(producto_id, sucursal=sucursal)
+    return {"ok": True, "id": producto_id, "woo_sync": woo_sync}
 
 
 @app.get("/productos")
@@ -3856,9 +3880,7 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal_real = norm_sucursal(sucursal)
     sucursal = inventario_sucursal(sucursal_real)
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    ensure_producto_web_columns(cur)
     cur.execute("""
     UPDATE productos p
     SET stock = (
@@ -3883,6 +3905,10 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
            COALESCE(observacion, '') AS observacion,
            COALESCE(almacen, 'TIENDA') AS almacen,
            COALESCE(sku_woo, '') AS sku_woo,
+           COALESCE(categoria_web, '') AS categoria_web,
+           COALESCE(subcategoria_web, '') AS subcategoria_web,
+           COALESCE(woo_categoria_id, 0) AS woo_categoria_id,
+           COALESCE(woo_subcategoria_id, 0) AS woo_subcategoria_id,
            %s AS sucursal,
            COALESCE(sucursal,%s) AS inventario_sucursal
     FROM productos
@@ -3903,18 +3929,21 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
     cur = conn.cursor()
     sucursal = inventario_sucursal(data.sucursal or sucursal)
     try:
-        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
-        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
-        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+        ensure_producto_web_columns(cur)
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
-            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s, sku_woo=%s
+            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s, sku_woo=%s,
+            categoria_web=%s, subcategoria_web=%s, woo_categoria_id=%s, woo_subcategoria_id=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
         """, (
             data.nombre, data.categoria, data.marca, data.modelo,
-            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "", (data.almacen or "TIENDA").strip().upper(), (data.sku_woo or "").strip().upper(), producto_id, DEFAULT_SUCURSAL, sucursal
+            data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "",
+            (data.almacen or "TIENDA").strip().upper(), (data.sku_woo or "").strip().upper(),
+            (data.categoria_web or "").strip(), (data.subcategoria_web or "").strip(),
+            int(data.woo_categoria_id or 0), int(data.woo_subcategoria_id or 0),
+            producto_id, DEFAULT_SUCURSAL, sucursal
         ))
         row = cur.fetchone()
         if not row:
@@ -3927,6 +3956,32 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         conn.rollback()
         conn.close()
         return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.get("/public/producto/{producto_id}/imagen")
+@app.get("/productos/{producto_id}/imagen")
+def servir_imagen_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(imagen_url,'') AS imagen_url
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    row = dict_fetchone(cur)
+    conn.close()
+    if not row:
+        return Response("Imagen no encontrada", status_code=404, media_type="text/plain")
+    imagen_url = str(row.get("imagen_url") or "").strip()
+    if not imagen_url:
+        return Response("Sin imagen", status_code=404, media_type="text/plain")
+    if imagen_url.startswith(("http://", "https://")):
+        return Response(status_code=302, headers={"Location": imagen_url})
+    raw, mime = parse_data_image_url(imagen_url)
+    if not raw:
+        return Response("Imagen invalida", status_code=404, media_type="text/plain")
+    return Response(content=raw, media_type=mime or "image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.delete("/productos/{producto_id}")
@@ -8012,11 +8067,20 @@ def web_config_for_sucursal(sucursal: str = DEFAULT_SUCURSAL):
 
 def save_web_config_for_sucursal(sucursal: str, data: dict):
     sucursal = norm_sucursal(sucursal)
+    prev = web_config_for_sucursal(sucursal)
+    wc_secret = str(data.get("wc_consumer_secret") or data.get("consumer_secret") or "").strip()
+    if not wc_secret:
+        wc_secret = str(prev.get("wc_consumer_secret") or "").strip()
+    wp_password = str(data.get("wp_app_password") or "").strip()
+    if not wp_password:
+        wp_password = str(prev.get("wp_app_password") or "").strip()
     clean = {
         "wc_store_url": str(data.get("wc_store_url") or data.get("store_url") or "").strip().rstrip("/"),
         "wc_consumer_key": str(data.get("wc_consumer_key") or data.get("consumer_key") or "").strip(),
-        "wc_consumer_secret": str(data.get("wc_consumer_secret") or data.get("consumer_secret") or "").strip(),
+        "wc_consumer_secret": wc_secret,
         "woo_auto_sync": bool(data.get("woo_auto_sync", False)),
+        "wp_username": str(data.get("wp_username") or prev.get("wp_username") or "").strip(),
+        "wp_app_password": wp_password,
     }
     conn = get_conn()
     cur = conn.cursor()
@@ -8109,19 +8173,222 @@ def woo_payload_from_model(data: WooProduct):
     return payload
 
 
-def woo_category_for_name(name: str, sucursal: str = DEFAULT_SUCURSAL):
+def parse_data_image_url(value):
+    value = str(value or "").strip()
+    if not value.startswith("data:image") or "," not in value:
+        return None, None
+    try:
+        header, encoded = value.split(",", 1)
+        mime = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
+        raw = base64.b64decode(encoded)
+        return raw, mime
+    except Exception:
+        return None, None
+
+
+def public_product_image_url(producto_id, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    return (
+        f"{public_base_url()}/public/producto/{int(producto_id)}/imagen"
+        f"?sucursal={urllib.parse.quote(sucursal)}"
+    )
+
+
+def wp_credentials(sucursal: str = DEFAULT_SUCURSAL):
+    web_cfg = web_config_for_sucursal(sucursal)
+    site = (web_cfg.get("wc_store_url") or "").strip().rstrip("/")
+    user = (web_cfg.get("wp_username") or os.getenv("WP_USERNAME") or "").strip()
+    pwd = (web_cfg.get("wp_app_password") or os.getenv("WP_APP_PASSWORD") or "").strip()
+    if not site and sucursal == DEFAULT_SUCURSAL:
+        site = (os.getenv("WC_STORE_URL") or os.getenv("WOOCOMMERCE_URL") or os.getenv("WP_URL") or "").strip().rstrip("/")
+    if site and user and pwd:
+        return site, user, pwd
+    return None
+
+
+def wp_upload_media(image_bytes, filename, mime_type, sucursal: str = DEFAULT_SUCURSAL):
+    creds = wp_credentials(sucursal)
+    if not creds:
+        return {"ok": False, "msg": "Configura usuario y contraseña de aplicación WordPress para subir imagenes."}
+    site, user, pwd = creds
+    token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+    url = f"{site}/wp-json/wp/v2/media"
+    headers = {
+        "Authorization": f"Basic {token}",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": mime_type or "image/jpeg",
+        "Accept": "application/json",
+    }
+    try:
+        req = urllib.request.Request(url, data=image_bytes, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+        source_url = data.get("source_url") or data.get("guid", {}).get("rendered", "")
+        if not source_url:
+            return {"ok": False, "msg": "WordPress no devolvio la URL de la imagen."}
+        return {"ok": True, "source_url": source_url, "media_id": data.get("id"), "data": data}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(raw) if raw else {}
+            msg = detail.get("message") if isinstance(detail, dict) else raw
+        except Exception:
+            msg = raw
+        return {"ok": False, "status": e.code, "msg": msg or "Error al subir imagen a WordPress"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+def woo_resolve_product_image_url(p: dict, sucursal: str = DEFAULT_SUCURSAL):
+    img = str(p.get("imagen_url") or "").strip()
+    if not img:
+        return ""
+    if img.startswith(("http://", "https://")):
+        return img
+    producto_id = p.get("id")
+    if not producto_id:
+        return ""
+    raw, mime = parse_data_image_url(img)
+    if raw:
+        ext = "jpg"
+        if "png" in (mime or ""):
+            ext = "png"
+        elif "webp" in (mime or ""):
+            ext = "webp"
+        sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{producto_id}"
+        uploaded = wp_upload_media(raw, f"{sku}.{ext}", mime, sucursal=sucursal)
+        if uploaded.get("ok"):
+            return uploaded.get("source_url") or ""
+        return public_product_image_url(producto_id, sucursal)
+    return ""
+
+
+def woo_auto_sync_enabled(sucursal: str = DEFAULT_SUCURSAL):
+    return bool(web_config_for_sucursal(sucursal).get("woo_auto_sync", False))
+
+
+def woo_save_product_link(producto_id, woo_data: dict, sku: str, sucursal: str = DEFAULT_SUCURSAL):
+    woo_id = int(woo_data.get("id") or 0) if isinstance(woo_data, dict) else 0
+    sku = str(sku or "").strip().upper()
+    if not woo_id and not sku:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    cur.execute("""
+        UPDATE productos
+        SET woo_id=CASE WHEN %s > 0 THEN %s ELSE woo_id END,
+            sku_woo=CASE WHEN %s <> '' THEN %s ELSE sku_woo END
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (woo_id, woo_id, sku, sku, producto_id, DEFAULT_SUCURSAL, norm_sucursal(sucursal)))
+    conn.commit()
+    conn.close()
+
+
+def woo_category_for_name(name: str, sucursal: str = DEFAULT_SUCURSAL, parent_id: int = 0, create: bool = False):
     name = str(name or "").strip()
     if not name:
         return None
-    found = woo_request("get", "products/categories", sucursal=sucursal, params={"search": name, "per_page": 20})
+    params = {"search": name, "per_page": 100}
+    if parent_id:
+        params["parent"] = int(parent_id)
+    found = woo_request("get", "products/categories", sucursal=sucursal, params=params)
     if found.get("ok"):
         for cat in found.get("data") or []:
             if str(cat.get("name", "")).strip().lower() == name.lower():
-                return {"id": cat.get("id"), "name": cat.get("name")}
-    created = woo_request("post", "products/categories", sucursal=sucursal, json={"name": name})
+                return {
+                    "id": cat.get("id"),
+                    "name": cat.get("name"),
+                    "parent": cat.get("parent") or 0,
+                }
+    if not create:
+        return None
+    payload = {"name": name}
+    if parent_id:
+        payload["parent"] = int(parent_id)
+    created = woo_request("post", "products/categories", sucursal=sucursal, json=payload)
     if created.get("ok") and isinstance(created.get("data"), dict):
-        return {"id": created["data"].get("id"), "name": created["data"].get("name")}
+        data = created["data"]
+        return {"id": data.get("id"), "name": data.get("name"), "parent": data.get("parent") or 0}
     return None
+
+
+def woo_list_categories(sucursal: str = DEFAULT_SUCURSAL, parent_id: int = None):
+    sucursal = norm_sucursal(sucursal)
+    params = {"per_page": 100, "orderby": "name", "order": "asc"}
+    if parent_id is not None:
+        params["parent"] = int(parent_id)
+    rows = []
+    page = 1
+    while page <= 10:
+        params["page"] = page
+        r = woo_request("get", "products/categories", sucursal=sucursal, params=params)
+        if not r.get("ok"):
+            return r
+        batch = r.get("data") or []
+        if not batch:
+            break
+        for item in batch:
+            rows.append({
+                "id": item.get("id"),
+                "name": item.get("name") or "",
+                "slug": item.get("slug") or "",
+                "parent": int(item.get("parent") or 0),
+                "count": int(item.get("count") or 0),
+            })
+        if len(batch) < 100:
+            break
+        page += 1
+    return {"ok": True, "data": rows}
+
+
+def woo_categories_tree(sucursal: str = DEFAULT_SUCURSAL):
+    r = woo_list_categories(sucursal=sucursal, parent_id=None)
+    if not r.get("ok"):
+        return r
+    all_rows = r.get("data") or []
+    by_parent = defaultdict(list)
+    names = {}
+    for row in all_rows:
+        names[int(row["id"])] = row["name"]
+        by_parent[int(row.get("parent") or 0)].append(row)
+    tree = []
+    for parent in sorted(by_parent.get(0, []), key=lambda x: str(x.get("name", "")).lower()):
+        children = sorted(by_parent.get(int(parent["id"]), []), key=lambda x: str(x.get("name", "")).lower())
+        tree.append({
+            **parent,
+            "subcategorias": children,
+        })
+    return {"ok": True, "data": tree, "flat": all_rows, "names": names}
+
+
+def woo_category_ids_for_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
+    sub_id = int(p.get("woo_subcategoria_id") or 0)
+    if sub_id > 0:
+        return [{"id": sub_id}]
+    cat_id = int(p.get("woo_categoria_id") or 0)
+    if cat_id > 0:
+        return [{"id": cat_id}]
+    sub_name = str(p.get("subcategoria_web") or "").strip()
+    parent_name = str(p.get("categoria_web") or "").strip()
+    parent_id = 0
+    if parent_name:
+        parent = woo_category_for_name(parent_name, sucursal=sucursal, parent_id=0, create=False)
+        if parent and parent.get("id"):
+            parent_id = int(parent["id"])
+    if sub_name:
+        sub = woo_category_for_name(sub_name, sucursal=sucursal, parent_id=parent_id, create=False)
+        if sub and sub.get("id"):
+            return [{"id": int(sub["id"])}]
+    if parent_id:
+        return [{"id": parent_id}]
+    if parent_name:
+        parent = woo_category_for_name(parent_name, sucursal=sucursal, parent_id=0, create=False)
+        if parent and parent.get("id"):
+            return [{"id": int(parent["id"])}]
+    return []
 
 
 def woo_payload_from_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
@@ -8134,14 +8401,18 @@ def woo_payload_from_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
         "manage_stock": True,
         "stock_quantity": int(p.get("stock") or 0),
         "short_description": f"{p.get('marca','')} {p.get('modelo','')}".strip(),
-        "description": f"Categoria: {p.get('categoria','')}",
+        "description": (
+            f"Categoria ERP: {p.get('categoria','')}\n"
+            f"Categoria web: {p.get('categoria_web','')}\n"
+            f"Subcategoria web: {p.get('subcategoria_web','')}"
+        ).strip(),
     }
-    img = str(p.get("imagen_url") or "").strip()
-    if img.startswith(("http://", "https://")):
-        payload["images"] = [{"src": img}]
-    cat = woo_category_for_name(p.get("categoria", ""), sucursal=sucursal)
-    if cat and cat.get("id"):
-        payload["categories"] = [{"id": int(cat["id"])}]
+    image_url = woo_resolve_product_image_url(p, sucursal=sucursal)
+    if image_url:
+        payload["images"] = [{"src": image_url}]
+    categories = woo_category_ids_for_product(p, sucursal=sucursal)
+    if categories:
+        payload["categories"] = categories
     return sku, payload
 
 
@@ -8159,7 +8430,145 @@ def woo_upsert_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
         action = "creado"
     if not r.get("ok"):
         return r
-    return {"ok": True, "action": action, "data": r.get("data", {})}
+    woo_data = r.get("data", {}) or {}
+    woo_save_product_link(p.get("id"), woo_data, sku, sucursal=sucursal)
+    return {"ok": True, "action": action, "sku": sku, "data": woo_data}
+
+
+def woo_create_new_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
+    sku, payload = woo_payload_from_erp_product(p, sucursal=sucursal)
+    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+    if not found.get("ok"):
+        return found
+    existing = found.get("data") or []
+    if existing:
+        return {
+            "ok": True,
+            "skipped": True,
+            "msg": f"El SKU {sku} ya existe en la web. No se actualiza automaticamente.",
+            "woo_id": existing[0].get("id"),
+        }
+    r = woo_request("post", "products", sucursal=sucursal, json=payload)
+    if not r.get("ok"):
+        return r
+    woo_data = r.get("data", {}) or {}
+    woo_save_product_link(p.get("id"), woo_data, sku, sucursal=sucursal)
+    return {"ok": True, "action": "creado", "sku": sku, "data": woo_data}
+
+
+def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    if not woo_auto_sync_enabled(sucursal):
+        return {"ok": True, "skipped": True, "msg": "Sync de productos nuevos desactivado."}
+    if not woo_config(sucursal):
+        return {"ok": False, "skipped": True, "msg": "WooCommerce no configurado para esta sucursal."}
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("""
+        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock,
+               COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo,
+               COALESCE(categoria_web,'') AS categoria_web, COALESCE(subcategoria_web,'') AS subcategoria_web,
+               COALESCE(woo_categoria_id,0) AS woo_categoria_id, COALESCE(woo_subcategoria_id,0) AS woo_subcategoria_id
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    p = dict_fetchone(cur)
+    conn.close()
+    if not p:
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+    r = woo_create_new_erp_product(p, sucursal=sucursal)
+    if r.get("skipped"):
+        return r
+    if not r.get("ok"):
+        return r
+    return {
+        "ok": True,
+        "synced": True,
+        "action": r.get("action"),
+        "sku": r.get("sku"),
+        "woo_id": (r.get("data") or {}).get("id"),
+        "msg": f"Producto nuevo publicado en WooCommerce.",
+    }
+
+
+def woo_apply_web_categories_to_erp(sucursal: str = DEFAULT_SUCURSAL, limit: int = 500):
+    sucursal = norm_sucursal(sucursal)
+    tree = woo_categories_tree(sucursal=sucursal)
+    if not tree.get("ok"):
+        return tree
+    names = tree.get("names") or {}
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("""
+        SELECT id, COALESCE(sku_woo,'') AS sku_woo
+        FROM productos
+        WHERE COALESCE(sucursal,%s)=%s
+        ORDER BY id
+        LIMIT %s
+    """, (DEFAULT_SUCURSAL, sucursal, max(1, min(int(limit or 500), 2000))))
+    productos = dict_fetchall(cur)
+    updated = 0
+    sin_match = 0
+    errores = []
+    for p in productos:
+        sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{p['id']}"
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+        if not found.get("ok"):
+            errores.append({"id": p.get("id"), "sku": sku, "msg": found.get("msg", "Error WooCommerce")})
+            continue
+        items = found.get("data") or []
+        if not items:
+            sin_match += 1
+            continue
+        item = items[0]
+        categories = item.get("categories") or []
+        cat_id = 0
+        sub_id = 0
+        cat_name = ""
+        sub_name = ""
+        parent_id = 0
+        if categories:
+            last = categories[-1] if isinstance(categories[-1], dict) else {}
+            cat_id = int(last.get("id") or 0)
+            sub_name = str(last.get("name") or names.get(cat_id) or "").strip()
+            detail = woo_request("get", f"products/categories/{cat_id}", sucursal=sucursal) if cat_id else {}
+            parent_id = int((detail.get("data") or {}).get("parent") or 0) if detail.get("ok") else 0
+            if parent_id > 0:
+                sub_id = cat_id
+                cat_name = str(names.get(parent_id) or "").strip()
+                if not cat_name:
+                    parent = woo_request("get", f"products/categories/{parent_id}", sucursal=sucursal)
+                    if parent.get("ok"):
+                        cat_name = str((parent.get("data") or {}).get("name") or "").strip()
+            else:
+                cat_name = sub_name
+                sub_name = ""
+                sub_id = 0
+        woo_cat_id = parent_id if sub_id else cat_id
+        cur.execute("""
+            UPDATE productos
+            SET categoria_web=%s, subcategoria_web=%s, woo_categoria_id=%s, woo_subcategoria_id=%s,
+                woo_id=%s
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (
+            cat_name, sub_name, woo_cat_id, sub_id,
+            int(item.get("id") or 0),
+            p["id"], DEFAULT_SUCURSAL, sucursal,
+        ))
+        updated += 1
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "success": True,
+        "updated": updated,
+        "sin_match": sin_match,
+        "total": len(productos),
+        "msg": f"Categorias web aplicadas al ERP: {updated}. Sin coincidencia por SKU: {sin_match}.",
+        "errores": errores[:20],
+    }
 
 
 def woo_sync_price_by_sku(sku: str, price, sucursal: str = DEFAULT_SUCURSAL):
@@ -8377,6 +8786,8 @@ def obtener_web_config(sucursal: str = DEFAULT_SUCURSAL):
     public = dict(data)
     if public.get("wc_consumer_secret"):
         public["wc_consumer_secret_masked"] = True
+    if public.get("wp_app_password"):
+        public["wp_app_password_masked"] = True
     return {"ok": True, "success": True, "data": public}
 
 
@@ -8385,6 +8796,21 @@ def guardar_web_config(data: dict, sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(data.get("sucursal") or data.get("empresa") or sucursal)
     clean = save_web_config_for_sucursal(sucursal, data)
     return {"ok": True, "success": True, "sucursal": sucursal, "data": clean}
+
+
+@app.get("/web/woocommerce/categories")
+def woo_categories(parent_id: int = None, tree: bool = False, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    if tree:
+        return woo_categories_tree(sucursal=sucursal)
+    return woo_list_categories(sucursal=sucursal, parent_id=parent_id)
+
+
+@app.post("/web/woocommerce/apply-categories-to-erp")
+def woo_apply_categories_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal((data or {}).get("sucursal") or (data or {}).get("empresa") or sucursal)
+    limit = int((data or {}).get("limit") or 500)
+    return woo_apply_web_categories_to_erp(sucursal=sucursal, limit=limit)
 
 
 @app.get("/web/woocommerce/test")
@@ -8441,7 +8867,8 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
+        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock,
+               COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
         FROM productos
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
@@ -8449,11 +8876,47 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn.close()
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
-
     r = woo_upsert_erp_product(p, sucursal=sucursal)
     if not r.get("ok"):
         return r
     return {"ok": True, "msg": f"Producto {r.get('action')} en WooCommerce.", "data": r.get("data", {})}
+
+
+@app.post("/web/woocommerce/upload-image/{producto_id}")
+def woo_upload_product_image(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, nombre, COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo, COALESCE(woo_id,0) AS woo_id
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    p = dict_fetchone(cur)
+    conn.close()
+    if not p:
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+    image_url = woo_resolve_product_image_url(p, sucursal=sucursal)
+    if not image_url:
+        return {"ok": False, "msg": "El producto no tiene imagen para subir."}
+    sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{producto_id}"
+    woo_id = int(p.get("woo_id") or 0)
+    if not woo_id:
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+        if found.get("ok") and (found.get("data") or []):
+            woo_id = int(found["data"][0].get("id") or 0)
+    if not woo_id:
+        return {"ok": False, "msg": "Primero sincroniza el producto con WooCommerce."}
+    updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"images": [{"src": image_url}]})
+    if not updated.get("ok"):
+        return updated
+    return {
+        "ok": True,
+        "msg": "Imagen enviada a WooCommerce.",
+        "image_url": image_url,
+        "woo_id": woo_id,
+        "data": updated.get("data", {}),
+    }
 
 
 @app.post("/web/woocommerce/sync-products")
