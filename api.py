@@ -6932,6 +6932,8 @@ def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURS
             value = str(clean.get(secret_key) or "").strip()
             if value in ("", "CONFIGURADO"):
                 clean[secret_key] = current.get(secret_key) or ""
+        if not str(clean.get("endpoint_url") or "").strip():
+            clean["endpoint_url"] = SUNAT_DEFAULT_ENDPOINTS.get(clean["ambiente"], SUNAT_DEFAULT_ENDPOINTS["BETA"])
         cur.execute("""
         INSERT INTO app_config (clave, valor, actualizado)
         VALUES (%s,%s,CURRENT_TIMESTAMP)
