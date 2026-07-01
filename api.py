@@ -6488,6 +6488,10 @@ def _sunat_get_config(cur, sucursal):
     return cfg
 
 
+def _sunat_emision_habilitada():
+    return str(os.getenv("SUNAT_EMISION_HABILITADA", "0")).strip().lower() in ("1", "true", "si", "yes", "on")
+
+
 def _sunat_public_config(cfg):
     public = dict(cfg)
     for key in ("clave_sol", "certificado_pfx_base64", "certificado_password"):
@@ -6496,7 +6500,36 @@ def _sunat_public_config(cfg):
     public["listo_envio"] = bool(public.get("ruc") and public.get("usuario_sol") and cfg.get("clave_sol") and public.get("endpoint_url"))
     public["firma_configurada"] = bool(cfg.get("certificado_pfx_base64") and cfg.get("certificado_password"))
     public["envio_automatico"] = bool(str(cfg.get("envio_automatico")).lower() in ("1", "true", "si", "yes", "on"))
+    public["listo_emitir"] = bool(public["listo_envio"] and public["firma_configurada"])
+    public["emision_habilitada"] = _sunat_emision_habilitada()
+    public["puede_enviar_sunat"] = bool(public["listo_emitir"] and public["emision_habilitada"])
     return public
+
+
+def _sunat_verificar_certificado(cfg):
+    if not cfg.get("certificado_pfx_base64") or not cfg.get("certificado_password"):
+        return {"ok": False, "msg": "Sin certificado digital configurado."}
+    if not load_key_and_certificates:
+        return {"ok": False, "msg": "Falta libreria cryptography en el servidor."}
+    try:
+        pfx_bytes = base64.b64decode(cfg.get("certificado_pfx_base64"))
+        private_key, certificate, extra_certs = load_key_and_certificates(
+            pfx_bytes,
+            str(cfg.get("certificado_password") or "").encode("utf-8"),
+        )
+        if not private_key or not certificate:
+            return {"ok": False, "msg": "El certificado no contiene llave privada valida."}
+        subject = certificate.subject.rfc4514_string()
+        not_after = certificate.not_valid_after_utc.isoformat() if hasattr(certificate, "not_valid_after_utc") else ""
+        return {
+            "ok": True,
+            "msg": "Certificado ARMY cargado correctamente.",
+            "subject": subject,
+            "vence": not_after,
+            "cadenas_extra": len(extra_certs or []),
+        }
+    except Exception as exc:
+        return {"ok": False, "msg": str(exc)}
 
 
 def _sunat_documento_payload(cur, documento_id, sucursal):
@@ -6841,16 +6874,53 @@ def diagnostico_sunat(sucursal: str = DEFAULT_SUCURSAL):
             "error_0110": {
                 "significado": "SUNAT no reconoce el tipo de usuario para facturacion electronica.",
                 "causas_frecuentes": [
-                    "LOOKBAIL entra al portal web pero no tiene perfil de Comprobantes de Pago / Factura Electronica.",
+                    "ARMY entra al portal web pero no tiene perfil de Comprobantes de Pago / Factura Electronica.",
                     "El usuario secundario fue creado bajo otro RUC distinto al configurado en el ERP.",
                     "La clave guardada en el ERP no coincide con la que pruebas manualmente en el portal.",
                 ],
                 "que_revisar_en_sunat": [
-                    "Mis tramites > Administracion de usuarios secundarios > LOOKBAIL > Asignar programas.",
-                    "Tributarios > Comprobantes de pago: SEE-SOL, SEE-Contribuyente, Factura Electronica y subopciones.",
-                    "Confirmar que el RUC del portal sea 20613247603 (PC FAST), no otro RUC.",
+                    "Mis tramites > Administracion de usuarios secundarios > ARMY > Asignar programas.",
+                    "Tributarios > Comprobantes de pago: SEE-Contribuyente, Envio de documentos, Factura y Boleta electronica.",
+                    "Confirmar que el RUC del portal sea 20611068701 (COMPUTER ARMY).",
                 ],
             },
+            "emision_habilitada": _sunat_emision_habilitada(),
+            "listo_emitir": bool(public.get("listo_envio") and public.get("firma_configurada")),
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/sunat/verificar")
+def verificar_instalacion_sunat(sucursal: str = DEFAULT_SUCURSAL):
+    """Valida credenciales y certificado sin enviar ningun documento a SUNAT."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cfg = _sunat_get_config(cur, sucursal)
+        public = _sunat_public_config(cfg)
+        certificado = _sunat_verificar_certificado(cfg)
+        listo_emitir = bool(public.get("listo_emitir") and certificado.get("ok"))
+        return {
+            "ok": listo_emitir,
+            "success": listo_emitir,
+            "sucursal": sucursal,
+            "nota": "Verificacion local completada. No se envio ningun comprobante a SUNAT.",
+            "portal_login": {
+                "ruc": public.get("ruc"),
+                "usuario_sol": public.get("usuario_sol"),
+            },
+            "soap_login": {
+                "username": _sunat_soap_username(cfg),
+                "clave_configurada": bool(cfg.get("clave_sol")),
+            },
+            "config": public,
+            "certificado": certificado,
+            "listo_emitir": listo_emitir,
+            "emision_habilitada": public.get("emision_habilitada"),
+            "puede_enviar_sunat": bool(listo_emitir and public.get("emision_habilitada")),
+            "bloqueo_emision": None if public.get("emision_habilitada") else "Emision bloqueada en servidor hasta activar SUNAT_EMISION_HABILITADA.",
         }
     finally:
         conn.close()
@@ -7066,6 +7136,14 @@ def descargar_sunat_zip(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
 @app.post("/sunat/documentos/{documento_id}/enviar")
 def enviar_documento_sunat(documento_id: int, data: SunatEnviarRequest = None, sucursal: str = DEFAULT_SUCURSAL):
     data = data or SunatEnviarRequest()
+    if not _sunat_emision_habilitada():
+        return {
+            "ok": False,
+            "success": False,
+            "msg": "Emision SUNAT bloqueada en el servidor. La configuracion esta lista, pero aun no se envian comprobantes.",
+            "sunat_estado": "PENDIENTE",
+            "bloqueo": "SUNAT_EMISION_HABILITADA=0",
+        }
     conn = get_conn()
     cur = conn.cursor()
     try:
