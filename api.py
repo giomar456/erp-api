@@ -248,6 +248,15 @@ def usuario_puede_editar_documento(data):
     return False
 
 
+def usuario_puede_editar_precio_venta(data):
+    if not isinstance(data, dict):
+        return False
+    for key in ("usuario", "usuario_emisor", "usuario_edicion", "editor", "user"):
+        if norm_usuario_permiso(data.get(key)) in DOCUMENT_EDIT_USERS:
+            return True
+    return False
+
+
 def usuario_puede_editar_series(data):
     if not isinstance(data, dict):
         return False
@@ -1622,6 +1631,12 @@ class DocumentoConvertirUpdate(BaseModel):
 class DocumentoDetalleSeriesUpdate(BaseModel):
     series_texto: str = ""
     usuario: str = ""
+
+
+class ProductoPrecioVentaUpdate(BaseModel):
+    precio_venta: float = 0
+    usuario: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class Producto(BaseModel):
@@ -3956,6 +3971,54 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         conn.rollback()
         conn.close()
         return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.patch("/productos/{producto_id}/precio-venta")
+def actualizar_precio_venta_producto(producto_id: int, data: ProductoPrecioVentaUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    if not usuario_puede_editar_precio_venta(data.model_dump() if hasattr(data, "model_dump") else data.dict()):
+        return {"ok": False, "success": False, "msg": "Solo Giomar puede actualizar precios desde ventas."}
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = inventario_sucursal(data.sucursal or sucursal)
+    try:
+        precio = round(max(0, float(data.precio_venta or 0)), 2)
+        cur.execute("""
+        UPDATE productos
+        SET precio_venta=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        RETURNING id, nombre, precio_venta
+        """, (precio, producto_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "success": False, "msg": "Producto no encontrado."}
+        usuario = str(data.usuario or "giomar").strip() or "giomar"
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,'',%s,'PRECIO VENTA',%s)
+        """, (
+            usuario,
+            sucursal,
+            json.dumps({
+                "producto_id": row[0],
+                "nombre": row[1],
+                "precio_venta": float(row[2] or 0),
+                "origen": "ventas",
+            }, ensure_ascii=False),
+        ))
+        conn.commit()
+        return {
+            "ok": True,
+            "success": True,
+            "id": row[0],
+            "nombre": row[1],
+            "precio_venta": float(row[2] or 0),
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        conn.close()
 
 
 @app.get("/public/producto/{producto_id}/imagen")
