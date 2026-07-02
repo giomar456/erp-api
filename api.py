@@ -1611,6 +1611,9 @@ class SunatPlataformRegistro(BaseModel):
     entorno: str = "beta"
     api_client_id: str = ""
     api_client_secret: str = ""
+    api_key: str = ""
+    api_secret: str = ""
+    completar_instalacion: bool = True
 
 
 class SunatEnviarRequest(BaseModel):
@@ -7394,14 +7397,64 @@ def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucur
                 except Exception:
                     pass
         if status >= 400:
-            return {
-                "ok": False,
-                "success": False,
-                "http_status": status,
-                "base_url": used_base,
-                "respuesta": body,
-                "aviso_api_secret": PLATAFORM_API_SECRET_AVISO,
-            }
+            errores = body.get("errores") if isinstance(body, dict) else {}
+            ruc_duplicado = isinstance(errores, dict) and errores.get("ruc")
+            old_key = str(data.api_key or cfg.get("api_key") or "").strip()
+            old_secret = str(data.api_secret or cfg.get("api_secret") or "").strip()
+            if ruc_duplicado and old_key and old_secret and plataform_sunat:
+                reg_status, reg_body, reg_base = plataform_sunat._request(
+                    "POST",
+                    "/empresa/credenciales/regenerar",
+                    api_key=old_key,
+                    api_secret=old_secret,
+                    json_body={},
+                    base_url=used_base,
+                )
+                if reg_status < 400:
+                    status, body, used_base = reg_status, reg_body, reg_base
+                else:
+                    return {
+                        "ok": False,
+                        "success": False,
+                        "http_status": reg_status,
+                        "base_url": reg_base,
+                        "respuesta": reg_body,
+                        "msg": (
+                            "RUC ya registrado. En el video: Postman > Genera uno nuevo api key y api secret "
+                            "(POST /empresa/credenciales/regenerar) con el api_key y api_secret anteriores."
+                        ),
+                        "aviso_api_secret": PLATAFORM_API_SECRET_AVISO,
+                    }
+            elif ruc_duplicado:
+                return {
+                    "ok": False,
+                    "success": False,
+                    "http_status": status,
+                    "base_url": used_base,
+                    "respuesta": body,
+                    "msg": (
+                        "RUC ya registrado en Kodevo. Paso del video: copia api_key/api_secret del POST /registro "
+                        "o usa POST /empresa/credenciales/regenerar en Postman y reenvia esas credenciales aqui."
+                    ),
+                    "pasos_video": [
+                        "POST /registro (ya hecho para 20611068701)",
+                        "Copiar api_key y api_secret de la respuesta 201",
+                        "Si se perdio el secret: POST /empresa/credenciales/regenerar",
+                        "POST /sucursales",
+                        "POST /series",
+                        "POST /boletas con enviar_automatico: true",
+                    ],
+                    "aviso_api_secret": PLATAFORM_API_SECRET_AVISO,
+                }
+            else:
+                return {
+                    "ok": False,
+                    "success": False,
+                    "http_status": status,
+                    "base_url": used_base,
+                    "respuesta": body,
+                    "aviso_api_secret": PLATAFORM_API_SECRET_AVISO,
+                }
         datos = body.get("datos") if isinstance(body, dict) else {}
         api_key = ""
         api_secret = ""
@@ -7421,6 +7474,57 @@ def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucur
             ON CONFLICT (clave) DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
             """, (f"sunat:{sucursal}", json.dumps(cfg, ensure_ascii=False)))
             conn.commit()
+        pasos_video = {}
+        if data.completar_instalacion and api_key and api_secret and plataform_sunat:
+            headers_ok = {"api_key": api_key, "api_secret": api_secret}
+            suc_payload = {
+                "nombre": str(cfg.get("nombre_comercial") or "Sucursal Principal"),
+                "cod_local": "0001",
+                "direccion": str(cfg.get("direccion") or ""),
+                "ubigeo": str(cfg.get("ubigeo") or "150101"),
+                "es_principal": True,
+            }
+            s_status, s_body, _ = plataform_sunat._request(
+                "POST",
+                "/sucursales",
+                api_key=api_key,
+                api_secret=api_secret,
+                json_body=suc_payload,
+                base_url=used_base,
+            )
+            sucursal_id = int(cfg.get("api_sucursal_id") or 1)
+            if isinstance(s_body, dict) and isinstance(s_body.get("datos"), dict) and s_body["datos"].get("id"):
+                try:
+                    sucursal_id = max(1, int(s_body["datos"]["id"]))
+                except Exception:
+                    pass
+            cfg["api_sucursal_id"] = sucursal_id
+            series_payload = {
+                "series": [
+                    {"tipo": "factura", "serie": "F002", "sucursal_id": sucursal_id},
+                    {"tipo": "boleta", "serie": "B002", "sucursal_id": sucursal_id, "correlativo_inicial": 1},
+                ]
+            }
+            ser_status, ser_body, _ = plataform_sunat._request(
+                "POST",
+                "/series",
+                api_key=api_key,
+                api_secret=api_secret,
+                json_body=series_payload,
+                base_url=used_base,
+            )
+            pasos_video = {
+                "sucursal": {"http_status": s_status, "body": s_body},
+                "series": {"http_status": ser_status, "body": ser_body},
+                "sucursal_id": sucursal_id,
+            }
+            cur.execute("""
+            INSERT INTO app_config (clave, valor, actualizado)
+            VALUES (%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT (clave) DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
+            """, (f"sunat:{sucursal}", json.dumps(cfg, ensure_ascii=False)))
+            conn.commit()
+
         public = _sunat_public_config(cfg)
         return {
             "ok": True,
@@ -7430,6 +7534,7 @@ def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucur
             "data": public,
             "respuesta": body,
             "credenciales_una_vez": credenciales_una_vez,
+            "pasos_video": pasos_video or None,
             "aviso_api_secret": PLATAFORM_API_SECRET_AVISO_REGISTRO,
             "msg": "Empresa registrada. Copia el api_secret ahora: solo se muestra una vez.",
         }
