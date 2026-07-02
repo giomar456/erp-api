@@ -6755,7 +6755,9 @@ def _sunat_get_config(cur, sucursal):
             if isinstance(saved, dict):
                 for key, value in saved.items():
                     if key == "usuario_sol":
-                        cfg[key] = str(value or "").strip().upper()
+                        val = str(value or "").strip().upper()
+                        if val:
+                            cfg[key] = val
                         continue
                     if value not in (None, ""):
                         cfg[key] = str(value).strip()
