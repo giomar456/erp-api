@@ -1574,6 +1574,8 @@ class SunatConfigUpdate(BaseModel):
     api_base_url: str = ""
     api_key: str = ""
     api_secret: str = ""
+    api_client_id: str = ""
+    api_client_secret: str = ""
     api_sucursal_id: int = 1
     ruc: str = ""
     razon_social: str = ""
@@ -1607,6 +1609,8 @@ class SunatPlataformRegistro(BaseModel):
     certificado_pfx_base64: str = ""
     cert_password: str = ""
     entorno: str = "beta"
+    api_client_id: str = ""
+    api_client_secret: str = ""
 
 
 class SunatEnviarRequest(BaseModel):
@@ -6719,9 +6723,11 @@ def _sunat_get_config(cur, sucursal):
         "ambiente": _sunat_env(sucursal, "AMBIENTE", "BETA").strip().upper() or "BETA",
         "envio_automatico": str(_sunat_env(sucursal, "ENVIO_AUTOMATICO", "")).strip().lower() in ("1", "true", "si", "yes", "on"),
         "proveedor_sunat": str(_sunat_env(sucursal, "PROVEEDOR", "directo")).strip().lower() or "directo",
-        "api_base_url": str(_sunat_env(sucursal, "API_BASE_URL", os.getenv("PLATAFORM_SUNAT_BASE_URL", "https://apigo.apuuraydev.com/api/v1"))).strip(),
+        "api_base_url": str(_sunat_env(sucursal, "API_BASE_URL", os.getenv("PLATAFORM_SUNAT_BASE_URL", "https://apisunatv2.kodevo.es/api/v1"))).strip(),
         "api_key": str(_sunat_env(sucursal, "API_KEY", "")).strip(),
         "api_secret": str(_sunat_env(sucursal, "API_SECRET", "")).strip(),
+        "api_client_id": str(_sunat_env(sucursal, "API_CLIENT_ID", "")).strip(),
+        "api_client_secret": str(_sunat_env(sucursal, "API_CLIENT_SECRET", "")).strip(),
         "api_sucursal_id": int(_sunat_env(sucursal, "API_SUCURSAL_ID", "1") or "1"),
         "ruc": _sunat_env(sucursal, "RUC", "").strip(),
         "razon_social": _sunat_env(sucursal, "RAZON_SOCIAL", "").strip(),
@@ -6762,7 +6768,7 @@ def _sunat_get_config(cur, sucursal):
         proveedor = "directo"
     cfg["proveedor_sunat"] = "plataform" if proveedor in ("plataform", "plataforma", "api", "kodevo", "apigo") else "directo"
     if not str(cfg.get("api_base_url") or "").strip():
-        cfg["api_base_url"] = "https://apigo.apuuraydev.com/api/v1"
+        cfg["api_base_url"] = "https://apisunatv2.kodevo.es/api/v1"
     try:
         cfg["api_sucursal_id"] = max(1, int(cfg.get("api_sucursal_id") or 1))
     except Exception:
@@ -6780,7 +6786,7 @@ def _sunat_emision_habilitada():
 
 def _sunat_public_config(cfg):
     public = dict(cfg)
-    for key in ("clave_sol", "certificado_pfx_base64", "certificado_password", "api_secret"):
+    for key in ("clave_sol", "certificado_pfx_base64", "certificado_password", "api_secret", "api_client_secret"):
         public[key] = "CONFIGURADO" if cfg.get(key) else ""
     public["ruc"] = _sunat_clean_ruc(public.get("ruc"))
     public["proveedor_sunat"] = str(cfg.get("proveedor_sunat") or "directo").strip().lower()
@@ -7361,7 +7367,8 @@ def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucur
                 return {"ok": False, "success": False, "msg": "Falta certificado .pfx/.p12. Subelo en la pantalla SUNAT o indica cert_path."}
         if not cert_password:
             return {"ok": False, "success": False, "msg": "Falta contrasena del certificado."}
-        entorno = "produccion" if str(cfg.get("ambiente") or "BETA").upper() == "PRODUCCION" else str(data.entorno or "beta").strip().lower()
+        entorno_raw = "production" if str(cfg.get("ambiente") or "BETA").upper() == "PRODUCCION" else str(data.entorno or "beta").strip().lower()
+        entorno = "production" if entorno_raw in ("produccion", "production", "prod") else "beta"
         try:
             status, body, used_base = plataform_sunat.registrar_empresa(
                 ruc=_sunat_clean_ruc(cfg.get("ruc")),
@@ -7373,6 +7380,11 @@ def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucur
                 cert_path=cert_path,
                 cert_password=cert_password,
                 entorno=entorno,
+                client_id=str(data.api_client_id or cfg.get("api_client_id") or "").strip(),
+                client_secret=str(data.api_client_secret or cfg.get("api_client_secret") or "").strip(),
+                departamento=str(cfg.get("departamento") or "LIMA").strip(),
+                provincia=str(cfg.get("provincia") or "LIMA").strip(),
+                distrito=str(cfg.get("distrito") or "LIMA").strip(),
                 base_url=str(cfg.get("api_base_url") or "").strip(),
             )
         finally:
