@@ -1359,6 +1359,7 @@ class Venta(BaseModel):
     sucursal: str = DEFAULT_SUCURSAL
     emitir_legal_sunat: bool = False
     modo_prueba: bool = False
+    proforma_origen_id: Optional[int] = None
 
 
 class Cliente(BaseModel):
@@ -5223,6 +5224,28 @@ def crear_venta(data: Venta):
                 f"{data.tipo} {numero} - {data.cliente_nombre}",
                 total, data.usuario_emisor, data.tipo, numero, estado_pago, metodo_pago, caja_observacion, sucursal
             ))
+
+        proforma_origen_id = getattr(data, "proforma_origen_id", None)
+        if proforma_origen_id and doc_tipo_upper in ("BOLETA", "FACTURA"):
+            try:
+                proforma_origen_id = int(proforma_origen_id)
+            except Exception:
+                proforma_origen_id = None
+        if proforma_origen_id:
+            cur.execute("""
+            SELECT id, tipo
+            FROM ventas
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            LIMIT 1
+            """, (proforma_origen_id, DEFAULT_SUCURSAL, sucursal))
+            orig = cur.fetchone()
+            if orig and str(orig[1] or "").upper() == "PROFORMA":
+                cur.execute("""
+                UPDATE ventas
+                SET estado='PROCESADO', estado_pago='PROCESADO',
+                    observacion=TRIM(COALESCE(observacion,'') || %s)
+                WHERE id=%s
+                """, (f"\nConvertida a {data.tipo} {numero}", proforma_origen_id))
 
         conn.commit()
         conn.close()
