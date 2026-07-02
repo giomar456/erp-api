@@ -737,6 +737,10 @@ function canEditProcessedDocuments(user) {
   return DOCUMENT_EDIT_USERS.has(normalizeUserForPermission(user));
 }
 
+function canManageSaleProductPrice(user) {
+  return DOCUMENT_EDIT_USERS.has(normalizeUserForPermission(user));
+}
+
 function canEmitLegalSunat(user) {
   return SUNAT_EMIT_USERS.has(normalizeUserForPermission(user));
 }
@@ -2611,6 +2615,10 @@ function VentasView({ user, sound, soundEnabled, setView }) {
   const [payment, setPayment] = useState({ estado_pago: 'DEUDA', metodo_pago: '' });
   const [saleObs, setSaleObs] = useState('');
   const [modoPrueba, setModoPrueba] = useState(false);
+  const [guardarPrecioCatalogo, setGuardarPrecioCatalogo] = useState(true);
+  const [searchPriceDraft, setSearchPriceDraft] = useState({});
+  const [savingProductPriceId, setSavingProductPriceId] = useState(null);
+  const canSalePrice = canManageSaleProductPrice(saleUserName);
   const [query, setQuery] = useState('');
   const [cart, setCart] = useState([]);
   const [productSeriesById, setProductSeriesById] = useState({});
@@ -2938,10 +2946,63 @@ function VentasView({ user, sound, soundEnabled, setView }) {
     };
   };
 
-  const addProduct = async (p) => {
-    const line = await buildProductLine(p);
+  const getSearchPriceValue = (p) => {
+    const draft = searchPriceDraft[p.id];
+    if (draft !== undefined && draft !== null && String(draft).trim() !== '') {
+      return parsePrice(draft);
+    }
+    return Number(p.precio_venta || p.precio || 0);
+  };
+
+  const setSearchPriceValue = (productId, value) => {
+    setSearchPriceDraft((current) => ({ ...current, [productId]: value }));
+  };
+
+  const persistProductSalePrice = async (p, priceValue) => {
+    const precio = Math.round(parsePrice(priceValue) * 100) / 100;
+    if (!precio) {
+      alert('Ingresa un precio mayor a 0.');
+      return null;
+    }
+    setSavingProductPriceId(p.id);
+    try {
+      const res = await apiFetch(`/productos/${p.id}/precio-venta`, {
+        method: 'PATCH',
+        json: { precio_venta: precio, usuario: saleUserName },
+      });
+      if (!okResponse(res)) {
+        alert(res.msg || 'No se pudo guardar el precio.');
+        return null;
+      }
+      const updated = {
+        ...p,
+        precio_venta: res.precio_venta ?? precio,
+        precio: res.precio_venta ?? precio,
+      };
+      setProducts((current) => current.map((row) => (row.id === p.id ? { ...row, ...updated } : row)));
+      setSearchPriceDraft((current) => ({ ...current, [p.id]: String(res.precio_venta ?? precio) }));
+      return updated;
+    } finally {
+      setSavingProductPriceId(null);
+    }
+  };
+
+  const addProduct = async (p, options = {}) => {
+    const { saveCatalogPrice = false, priceOverride = null } = options;
+    let product = p;
+    const price = priceOverride ?? getSearchPriceValue(p);
+    if (canSalePrice && saveCatalogPrice) {
+      const saved = await persistProductSalePrice(p, price);
+      if (!saved) return;
+      product = saved;
+    }
+    const line = await buildProductLine(product, { precio: price });
     setCart((current) => [...current, line]);
     setQuery('');
+  };
+
+  const saveSearchProductPriceOnly = async (p) => {
+    await persistProductSalePrice(p, getSearchPriceValue(p));
   };
 
   const moveCartLine = (idx, direction) => {
@@ -3129,8 +3190,19 @@ function VentasView({ user, sound, soundEnabled, setView }) {
               <input type="checkbox" checked={modoPrueba} onChange={(e) => setModoPrueba(e.target.checked)} />
               Modo PRUEBA
             </label>
+            {canSalePrice && (
+              <label className="flex items-center gap-1.5 text-xs font-black text-emerald-800">
+                <input type="checkbox" checked={guardarPrecioCatalogo} onChange={(e) => setGuardarPrecioCatalogo(e.target.checked)} />
+                Guardar precio en inventario
+              </label>
+            )}
           </div>
         </div>
+        {canSalePrice && (
+          <div className="mb-1.5 rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-bold leading-tight text-emerald-900">
+            Giomar: al buscar productos puedes editar el precio y guardarlo para todos. Usa GUARDAR o activa la casilla para que se guarde al agregar.
+          </div>
+        )}
         {modoPrueba && (
           <div className="mb-1.5 rounded border border-violet-200 bg-violet-50 px-2 py-1 text-[10px] font-bold leading-tight text-violet-900">
             Modo PRUEBA activo: puedes vender cualquier producto sin coincidir nombre y sin alertas de series incorrectas.
@@ -3219,17 +3291,52 @@ function VentasView({ user, sound, soundEnabled, setView }) {
         {showProductSuggestions && (
           <div className="mb-2 max-h-[24vh] overflow-auto rounded-md border border-slate-200 bg-white">
             {filtered.map((p) => (
-              <button key={p.id} onClick={() => addProduct(p)} className="grid w-full grid-cols-[40px_minmax(0,1fr)_88px_72px] items-center gap-2 border-b border-slate-100 px-2 py-1 text-left hover:bg-slate-50">
-                <div className="h-9 w-9 overflow-hidden rounded bg-slate-100">
-                  {safeImageSrc(p.imagen_url) ? <img src={safeImageSrc(p.imagen_url)} alt="" className="h-full w-full object-cover" /> : <div className="grid h-full w-full place-items-center text-[10px] font-black text-slate-400">IMG</div>}
+              canSalePrice ? (
+                <div key={p.id} className="grid w-full grid-cols-[40px_minmax(0,1fr)_92px_72px_58px_58px] items-center gap-2 border-b border-slate-100 px-2 py-1">
+                  <div className="h-9 w-9 overflow-hidden rounded bg-slate-100">
+                    {safeImageSrc(p.imagen_url) ? <img src={safeImageSrc(p.imagen_url)} alt="" className="h-full w-full object-cover" /> : <div className="grid h-full w-full place-items-center text-[10px] font-black text-slate-400">IMG</div>}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-black uppercase text-slate-950">{p.nombre}</div>
+                    <div className="truncate text-[10px] uppercase text-slate-500">{p.categoria || 'SIN CATEGORIA'}{p.marca ? ` - ${p.marca}` : ''}</div>
+                  </div>
+                  <TextInput
+                    value={searchPriceDraft[p.id] ?? String(p.precio_venta || p.precio || '')}
+                    onChange={(e) => setSearchPriceValue(p.id, e.target.value)}
+                    inputMode="decimal"
+                    className="h-8 text-xs font-black text-emerald-800"
+                    placeholder="Precio"
+                  />
+                  <div className={`rounded px-2 py-1 text-center text-[10px] font-black ${Number(p.stock || 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>Stk {p.stock || 0}</div>
+                  <button
+                    type="button"
+                    disabled={savingProductPriceId === p.id}
+                    onClick={() => saveSearchProductPriceOnly(p)}
+                    className="rounded bg-emerald-600 px-1 py-1 text-[9px] font-black leading-none text-white disabled:opacity-50"
+                  >
+                    {savingProductPriceId === p.id ? '...' : 'GUARDAR'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => addProduct(p, { saveCatalogPrice: guardarPrecioCatalogo, priceOverride: getSearchPriceValue(p) })}
+                    className="rounded bg-blue-600 px-1 py-1 text-[9px] font-black leading-none text-white"
+                  >
+                    + AGREGAR
+                  </button>
                 </div>
-                <div className="min-w-0">
-                  <div className="truncate text-xs font-black uppercase text-slate-950">{p.nombre}</div>
-                  <div className="truncate text-[10px] uppercase text-slate-500">{p.categoria || 'SIN CATEGORIA'}{p.marca ? ` - ${p.marca}` : ''}</div>
-                </div>
-                <div className="text-right text-sm font-black text-emerald-700">{money(p.precio_venta || p.precio)}</div>
-                <div className={`rounded px-2 py-1 text-center text-[10px] font-black ${Number(p.stock || 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>Stk {p.stock || 0}</div>
-              </button>
+              ) : (
+                <button key={p.id} onClick={() => addProduct(p)} className="grid w-full grid-cols-[40px_minmax(0,1fr)_88px_72px] items-center gap-2 border-b border-slate-100 px-2 py-1 text-left hover:bg-slate-50">
+                  <div className="h-9 w-9 overflow-hidden rounded bg-slate-100">
+                    {safeImageSrc(p.imagen_url) ? <img src={safeImageSrc(p.imagen_url)} alt="" className="h-full w-full object-cover" /> : <div className="grid h-full w-full place-items-center text-[10px] font-black text-slate-400">IMG</div>}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-black uppercase text-slate-950">{p.nombre}</div>
+                    <div className="truncate text-[10px] uppercase text-slate-500">{p.categoria || 'SIN CATEGORIA'}{p.marca ? ` - ${p.marca}` : ''}</div>
+                  </div>
+                  <div className="text-right text-sm font-black text-emerald-700">{money(p.precio_venta || p.precio)}</div>
+                  <div className={`rounded px-2 py-1 text-center text-[10px] font-black ${Number(p.stock || 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>Stk {p.stock || 0}</div>
+                </button>
+              )
             ))}
             {!filtered.length && <Empty text="No hay productos con esa busqueda." />}
           </div>
@@ -4615,14 +4722,23 @@ function ProductosView({ user }) {
     setNewCategory('');
     setNewCategoryOpen(false);
   };
-  const save = async () => {
+  const save = async (syncToWoo = false) => {
     setSaving(true);
     try {
-      const payload = { ...form, precio_compra: Number(form.precio_compra || 0), precio_venta: Number(form.precio_venta || 0), stock: Number(form.stock || 0) };
+      const payload = {
+        ...form,
+        precio_compra: Number(form.precio_compra || 0),
+        precio_venta: Number(form.precio_venta || 0),
+        stock: Number(form.stock || 0),
+        sync_to_woo: !!syncToWoo,
+      };
       const res = await apiFetch(form.id ? `/productos/${form.id}` : '/productos', { method: form.id ? 'PUT' : 'POST', json: payload });
       if (okResponse(res)) {
-        if (!form.id && res.woo_sync?.synced) alert(`Producto guardado.\n\nWooCommerce: ${res.woo_sync.msg || 'Producto nuevo publicado.'}`);
-        else if (!form.id && res.woo_sync?.skipped) alert(`Producto guardado.\n\nWooCommerce: ${res.woo_sync.msg || 'No sincronizado.'}`);
+        let msg = 'Producto guardado.';
+        if (res.woo_sync?.synced) msg += `\n\nWooCommerce: ${res.woo_sync.msg || 'Producto publicado en la pagina.'}`;
+        else if (res.woo_sync?.skipped) msg += `\n\nWooCommerce: ${res.woo_sync.msg || 'No sincronizado.'}`;
+        else if (form.id && !syncToWoo) msg += '\n\nUsa "Guardar y subir a la pagina" para actualizar la web.';
+        alert(msg);
         setForm(emptyProduct);
         setEditorOpen(false);
         await load();
@@ -4899,7 +5015,7 @@ function ProductosView({ user }) {
               <div className="grid grid-cols-2 gap-2"><Field label="Marca"><TextInput value={form.marca} onChange={(e) => setForm({ ...form, marca: e.target.value })} /></Field><Field label="Modelo"><TextInput value={form.modelo} onChange={(e) => setForm({ ...form, modelo: e.target.value })} /></Field></div>
               <Field label="Codigo web / SKU"><TextInput value={form.sku_woo || ''} onChange={(e) => setForm({ ...form, sku_woo: e.target.value.trim().toUpperCase() })} placeholder="Ejemplo: ERP-1024 o RAM-K16-001" /></Field>
               <div className="rounded-md border border-cyan-200 bg-cyan-50 p-3">
-                <div className="mb-2 text-xs font-black text-cyan-900">Categoria pagina web (solo ERP, editar no sincroniza)</div>
+                <div className="mb-2 text-xs font-black text-cyan-900">Categoria pagina web. Al crear se publica solo. Al editar usa &quot;Guardar y subir a la pagina&quot;.</div>
                 <div className="grid gap-2 sm:grid-cols-2">
                   <Field label="Cat. web">
                     <SelectInput value={form.categoria_web || ''} onChange={(e) => {
@@ -4954,7 +5070,8 @@ function ProductosView({ user }) {
             <footer className="grid grid-cols-2 gap-2 border-t border-slate-200 p-3 sm:flex sm:justify-end">
               {form.id && <ActionButton tone="danger" onClick={remove}>Eliminar</ActionButton>}
               <ActionButton tone="neutral" onClick={() => setForm(emptyProduct)}>Limpiar</ActionButton>
-              <ActionButton disabled={saving} onClick={save}>{form.id ? 'Actualizar' : 'Guardar'}</ActionButton>
+              <ActionButton disabled={saving} onClick={() => save(false)}>{form.id ? 'Actualizar' : 'Guardar'}</ActionButton>
+              {form.id && <ActionButton tone="violet" disabled={saving} onClick={() => save(true)}>{saving ? 'Subiendo...' : 'Guardar y subir a la pagina'}</ActionButton>}
             </footer>
           </section>
         </div>
@@ -7357,7 +7474,7 @@ function WebView() {
             </Field>
             <label className="flex items-center gap-2 text-sm font-bold">
               <input type="checkbox" checked={!!cfg.woo_auto_sync} onChange={(e) => setCfg({ ...cfg, woo_auto_sync: e.target.checked })} />
-              Sync solo productos nuevos al crear (editar no sincroniza)
+              Al crear se publica automaticamente en WooCommerce. Al editar usa &quot;Guardar y subir a la pagina&quot;.
             </label>
             <ActionButton tone="blue" onClick={async () => {
               const res = await apiFetch('/web/woocommerce/apply-categories-to-erp', { method: 'POST', json: { limit: 500 } });

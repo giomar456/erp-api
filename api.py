@@ -1655,6 +1655,7 @@ class Producto(BaseModel):
     subcategoria_web: Optional[str] = ""
     woo_categoria_id: Optional[int] = 0
     woo_subcategoria_id: Optional[int] = 0
+    sync_to_woo: Optional[bool] = False
     sucursal: str = DEFAULT_SUCURSAL
 
 
@@ -3966,7 +3967,10 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
             return {"ok": False, "success": False, "msg": "Producto no encontrado"}
         conn.commit()
         conn.close()
-        return {"ok": True, "success": True, "id": row[0]}
+        woo_sync = None
+        if bool(data.sync_to_woo):
+            woo_sync = maybe_sync_updated_product_to_woo(producto_id, sucursal=sucursal)
+        return {"ok": True, "success": True, "id": row[0], "woo_sync": woo_sync}
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -8519,14 +8523,7 @@ def woo_create_new_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
     return {"ok": True, "action": "creado", "sku": sku, "data": woo_data}
 
 
-def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
-    sucursal = norm_sucursal(sucursal)
-    if not woo_auto_sync_enabled(sucursal):
-        return {"ok": True, "skipped": True, "msg": "Sync de productos nuevos desactivado."}
-    if not woo_config(sucursal):
-        return {"ok": False, "skipped": True, "msg": "WooCommerce no configurado para esta sucursal."}
-    conn = get_conn()
-    cur = conn.cursor()
+def _erp_product_for_woo_sync(cur, producto_id: int, sucursal: str):
     ensure_producto_web_columns(cur)
     cur.execute("""
         SELECT id, nombre, categoria, marca, modelo, precio_venta, stock,
@@ -8536,7 +8533,16 @@ def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCU
         FROM productos
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
-    p = dict_fetchone(cur)
+    return dict_fetchone(cur)
+
+
+def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    if not woo_config(sucursal):
+        return {"ok": False, "skipped": True, "msg": "WooCommerce no configurado para esta sucursal."}
+    conn = get_conn()
+    cur = conn.cursor()
+    p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
     conn.close()
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
@@ -8551,7 +8557,31 @@ def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCU
         "action": r.get("action"),
         "sku": r.get("sku"),
         "woo_id": (r.get("data") or {}).get("id"),
-        "msg": f"Producto nuevo publicado en WooCommerce.",
+        "msg": "Producto nuevo publicado en WooCommerce.",
+    }
+
+
+def maybe_sync_updated_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = norm_sucursal(sucursal)
+    if not woo_config(sucursal):
+        return {"ok": False, "skipped": True, "msg": "WooCommerce no configurado para esta sucursal."}
+    conn = get_conn()
+    cur = conn.cursor()
+    p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
+    conn.close()
+    if not p:
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+    r = woo_upsert_erp_product(p, sucursal=sucursal)
+    if not r.get("ok"):
+        return r
+    action = r.get("action") or "actualizado"
+    return {
+        "ok": True,
+        "synced": True,
+        "action": action,
+        "sku": r.get("sku"),
+        "woo_id": (r.get("data") or {}).get("id"),
+        "msg": f"Producto {action} en WooCommerce.",
     }
 
 
@@ -8929,13 +8959,7 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock,
-               COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
-        FROM productos
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
-    p = dict_fetchone(cur)
+    p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
     conn.close()
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
