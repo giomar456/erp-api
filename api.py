@@ -4381,6 +4381,59 @@ def listar_productos_duplicados(sucursal: str = DEFAULT_SUCURSAL):
     }
 
 
+@app.post("/productos/vincular-web")
+def vincular_producto_web_directo(data: dict):
+    sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL))
+    producto_id = int(data.get("producto_id") or data.get("id") or 0)
+    woo_id = int(data.get("woo_id") or 0)
+    nombre_web = str(data.get("nombre_web") or "").strip()
+    sku_woo = str(data.get("sku_woo") or data.get("sku") or "").strip().upper()
+    imagen_web = str(data.get("imagen_web") or "").strip()
+    if not producto_id or not woo_id:
+        return {"ok": False, "msg": "producto_id y woo_id son requeridos."}
+    if not sku_woo:
+        sku_woo = f"ERP-{producto_id}"
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+    cur.execute("""
+        SELECT id, nombre, COALESCE(nombre_web,'') AS nombre_web
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    producto = dict_fetchone(cur)
+    if not producto:
+        conn.close()
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+    cur.execute("""
+        UPDATE productos
+        SET woo_id=%s,
+            nombre_web=%s,
+            sku_woo=%s
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (woo_id, nombre_web, sku_woo, producto_id, DEFAULT_SUCURSAL, sucursal))
+    if imagen_web:
+        cur.execute("""
+            UPDATE productos
+            SET imagen_url=%s
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+              AND COALESCE(imagen_url,'')=''
+        """, (imagen_web, producto_id, DEFAULT_SUCURSAL, sucursal))
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "success": True,
+        "producto_id": producto_id,
+        "woo_id": woo_id,
+        "sku_woo": sku_woo,
+        "nombre_web": nombre_web,
+        "nombre_interno": producto.get("nombre"),
+        "msg": f"Producto #{producto_id} vinculado a web #{woo_id}. Nombre interno sin cambios.",
+    }
+
+
 @app.post("/productos/vincular-sku")
 def vincular_producto_por_sku(data: dict):
     sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL))
