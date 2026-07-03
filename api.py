@@ -1659,6 +1659,7 @@ class Producto(BaseModel):
     observacion: Optional[str] = ""
     almacen: Optional[str] = "TIENDA"
     sku_woo: Optional[str] = ""
+    nombre_web: Optional[str] = ""
     categoria_web: Optional[str] = ""
     subcategoria_web: Optional[str] = ""
     woo_categoria_id: Optional[int] = 0
@@ -3935,10 +3936,74 @@ def ensure_producto_web_columns(cur):
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS observacion TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku_woo TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS nombre_web TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS categoria_web TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS subcategoria_web TEXT DEFAULT ''")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_categoria_id INT")
     cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_subcategoria_id INT")
+
+
+def normalize_product_name_key(name):
+    text = str(name or "").upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def product_name_similarity(a, b):
+    ka = normalize_product_name_key(a)
+    kb = normalize_product_name_key(b)
+    if not ka or not kb:
+        return 0.0
+    if ka == kb:
+        return 1.0
+    if ka in kb or kb in ka:
+        return 0.92
+    ta = set(ka.split())
+    tb = set(kb.split())
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter / union if union else 0.0
+
+
+def _producto_row_summary(cur, producto_id, sucursal):
+    cur.execute("""
+        SELECT p.id, p.nombre, COALESCE(p.nombre_web,'') AS nombre_web,
+               COALESCE(p.sku_woo,'') AS sku_woo, COALESCE(p.woo_id,0) AS woo_id,
+               COALESCE(p.stock,0) AS stock, COALESCE(p.precio_venta,0) AS precio_venta,
+               COALESCE(p.marca,'') AS marca, COALESCE(p.modelo,'') AS modelo,
+               (
+                 SELECT COUNT(*)
+                 FROM producto_series ps
+                 WHERE ps.producto_id=p.id
+                   AND COALESCE(ps.sucursal,%s)=%s
+               ) AS series_count
+        FROM productos p
+        WHERE p.id=%s AND COALESCE(p.sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
+    return dict_fetchone(cur)
+
+
+def _woo_product_summary_by_sku(sku, sucursal):
+    sku = str(sku or "").strip().upper()
+    if not sku:
+        return {"ok": False, "msg": "SKU vacio."}
+    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+    if not found.get("ok"):
+        return found
+    items = found.get("data") or []
+    if not items:
+        return {"ok": False, "msg": f"No existe producto web con SKU {sku}."}
+    item = items[0]
+    return {
+        "ok": True,
+        "woo_id": int(item.get("id") or 0),
+        "sku": sku,
+        "nombre_web": str(item.get("name") or "").strip(),
+        "precio_web": item.get("regular_price") or item.get("price") or "0",
+        "data": item,
+    }
 
 
 @app.post("/productos")
@@ -3950,15 +4015,16 @@ def crear_producto(data: Producto):
 
     cur.execute("""
     INSERT INTO productos (
-        nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal,sku_woo,
+        nombre,categoria,marca,modelo,precio_compra,precio_venta,stock,imagen_url,observacion,almacen,sucursal,sku_woo,nombre_web,
         categoria_web,subcategoria_web,woo_categoria_id,woo_subcategoria_id
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     """, (
         data.nombre, data.categoria, data.marca, data.modelo, data.precio_compra,
         data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "",
         (data.almacen or "TIENDA").strip().upper(), sucursal, (data.sku_woo or "").strip().upper(),
+        (data.nombre_web or "").strip(),
         (data.categoria_web or "").strip(), (data.subcategoria_web or "").strip(),
         int(data.woo_categoria_id or 0), int(data.woo_subcategoria_id or 0),
     ))
@@ -4002,10 +4068,12 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
            COALESCE(observacion, '') AS observacion,
            COALESCE(almacen, 'TIENDA') AS almacen,
            COALESCE(sku_woo, '') AS sku_woo,
+           COALESCE(nombre_web, '') AS nombre_web,
            COALESCE(categoria_web, '') AS categoria_web,
            COALESCE(subcategoria_web, '') AS subcategoria_web,
            COALESCE(woo_categoria_id, 0) AS woo_categoria_id,
            COALESCE(woo_subcategoria_id, 0) AS woo_subcategoria_id,
+           COALESCE(woo_id, 0) AS woo_id,
            %s AS sucursal,
            COALESCE(sucursal,%s) AS inventario_sucursal
     FROM productos
@@ -4030,7 +4098,7 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         cur.execute("""
         UPDATE productos
         SET nombre=%s, categoria=%s, marca=%s, modelo=%s,
-            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s, sku_woo=%s,
+            precio_compra=%s, precio_venta=%s, stock=%s, imagen_url=%s, observacion=%s, almacen=%s, sku_woo=%s, nombre_web=%s,
             categoria_web=%s, subcategoria_web=%s, woo_categoria_id=%s, woo_subcategoria_id=%s
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         RETURNING id
@@ -4038,6 +4106,7 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
             data.nombre, data.categoria, data.marca, data.modelo,
             data.precio_compra, data.precio_venta, data.stock, data.imagen_url or "", data.observacion or "",
             (data.almacen or "TIENDA").strip().upper(), (data.sku_woo or "").strip().upper(),
+            (data.nombre_web or "").strip(),
             (data.categoria_web or "").strip(), (data.subcategoria_web or "").strip(),
             int(data.woo_categoria_id or 0), int(data.woo_subcategoria_id or 0),
             producto_id, DEFAULT_SUCURSAL, sucursal
@@ -4147,6 +4216,316 @@ def eliminar_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         conn.commit()
         conn.close()
         return {"ok": True, "success": True, "id": row[0]}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.get("/productos/duplicados")
+def listar_productos_duplicados(sucursal: str = DEFAULT_SUCURSAL):
+    sucursal = inventario_sucursal(norm_sucursal(sucursal))
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+    cur.execute("""
+        SELECT p.id, p.nombre, COALESCE(p.nombre_web,'') AS nombre_web,
+               COALESCE(p.sku_woo,'') AS sku_woo, COALESCE(p.woo_id,0) AS woo_id,
+               COALESCE(p.stock,0) AS stock, COALESCE(p.marca,'') AS marca,
+               (
+                 SELECT COUNT(*)
+                 FROM producto_series ps
+                 WHERE ps.producto_id=p.id AND COALESCE(ps.sucursal,%s)=%s
+               ) AS series_count
+        FROM productos p
+        WHERE COALESCE(p.sucursal,%s)=%s
+        ORDER BY p.id
+    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+    rows = dict_fetchall(cur)
+    conn.close()
+
+    groups = []
+    seen_group_keys = set()
+
+    by_sku = defaultdict(list)
+    by_woo = defaultdict(list)
+    for row in rows:
+        sku = str(row.get("sku_woo") or "").strip().upper()
+        if sku and not sku.startswith("ERP-"):
+            by_sku[sku].append(row)
+        woo_id = int(row.get("woo_id") or 0)
+        if woo_id > 0:
+            by_woo[woo_id].append(row)
+
+    for sku, items in by_sku.items():
+        if len(items) < 2:
+            continue
+        key = f"sku:{sku}"
+        if key in seen_group_keys:
+            continue
+        seen_group_keys.add(key)
+        groups.append({
+            "tipo": "sku",
+            "clave": sku,
+            "motivo": f"Mismo SKU web ({sku}) en varios productos ERP",
+            "items": sorted(items, key=lambda x: (-int(x.get("series_count") or 0), -int(x.get("stock") or 0), int(x.get("id") or 0))),
+            "sugerido_id": sorted(items, key=lambda x: (-int(x.get("series_count") or 0), -int(x.get("stock") or 0), int(x.get("id") or 0)))[0]["id"],
+        })
+
+    for woo_id, items in by_woo.items():
+        if len(items) < 2:
+            continue
+        key = f"woo:{woo_id}"
+        if key in seen_group_keys:
+            continue
+        seen_group_keys.add(key)
+        groups.append({
+            "tipo": "woo_id",
+            "clave": str(woo_id),
+            "motivo": f"Mismo woo_id ({woo_id}) en varios productos ERP",
+            "items": sorted(items, key=lambda x: (-int(x.get("series_count") or 0), -int(x.get("stock") or 0), int(x.get("id") or 0))),
+            "sugerido_id": sorted(items, key=lambda x: (-int(x.get("series_count") or 0), -int(x.get("stock") or 0), int(x.get("id") or 0)))[0]["id"],
+        })
+
+    used_ids = set()
+    for i, a in enumerate(rows):
+        if int(a.get("id") or 0) in used_ids:
+            continue
+        cluster = [a]
+        for b in rows[i + 1:]:
+            if int(b.get("id") or 0) in used_ids:
+                continue
+            sim = product_name_similarity(a.get("nombre"), b.get("nombre"))
+            if sim >= 0.72:
+                cluster.append(b)
+        if len(cluster) >= 2:
+            for item in cluster:
+                used_ids.add(int(item.get("id") or 0))
+            ordered = sorted(cluster, key=lambda x: (-int(x.get("series_count") or 0), -int(x.get("stock") or 0), int(x.get("id") or 0)))
+            groups.append({
+                "tipo": "nombre_similar",
+                "clave": normalize_product_name_key(ordered[0].get("nombre"))[:60],
+                "motivo": "Nombres internos muy parecidos (posible doble producto)",
+                "items": ordered,
+                "sugerido_id": ordered[0]["id"],
+            })
+
+    groups.sort(key=lambda g: (-len(g.get("items") or []), g.get("tipo") or ""))
+    return {
+        "ok": True,
+        "success": True,
+        "total_grupos": len(groups),
+        "total_productos": len(rows),
+        "grupos": groups,
+        "msg": f"Se detectaron {len(groups)} grupo(s) de posibles duplicados.",
+    }
+
+
+@app.post("/productos/vincular-sku")
+def vincular_producto_por_sku(data: dict):
+    sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL))
+    producto_id = int(data.get("producto_id") or data.get("id") or 0)
+    if not producto_id:
+        return {"ok": False, "msg": "producto_id requerido."}
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+    cur.execute("""
+        SELECT id, nombre, COALESCE(sku_woo,'') AS sku_woo, COALESCE(nombre_web,'') AS nombre_web
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    producto = dict_fetchone(cur)
+    if not producto:
+        conn.close()
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+    sku = str(data.get("sku_woo") or data.get("sku") or producto.get("sku_woo") or "").strip().upper()
+    if not sku:
+        conn.close()
+        return {"ok": False, "msg": "Asigna un SKU web al producto antes de vincular."}
+
+    web = _woo_product_summary_by_sku(sku, sucursal=sucursal)
+    if not web.get("ok"):
+        conn.close()
+        return web
+
+    cur.execute("""
+        SELECT id, nombre
+        FROM productos
+        WHERE id<>%s AND COALESCE(sucursal,%s)=%s
+          AND (COALESCE(sku_woo,'')=%s OR COALESCE(woo_id,0)=%s)
+        ORDER BY id
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal, sku, int(web.get("woo_id") or 0)))
+    otros = dict_fetchall(cur)
+    solo_vincular = bool(data.get("solo_vincular", True))
+    nombre_web = str(data.get("nombre_web") or web.get("nombre_web") or "").strip()
+
+    cur.execute("""
+        UPDATE productos
+        SET sku_woo=%s,
+            woo_id=%s,
+            nombre_web=CASE WHEN %s<>'' THEN %s ELSE nombre_web END
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (sku, int(web.get("woo_id") or 0), nombre_web, nombre_web, producto_id, DEFAULT_SUCURSAL, sucursal))
+    conn.commit()
+    conn.close()
+
+    msg = f"Producto ERP #{producto_id} vinculado al SKU {sku} (web: {nombre_web or web.get('nombre_web')}). Nombre interno se mantiene: {producto.get('nombre')}."
+    if otros:
+        otros_txt = ", ".join(f"#{o['id']} {o.get('nombre')}" for o in otros[:5])
+        msg += f" Aviso: hay otros productos ERP con el mismo SKU/woo_id: {otros_txt}. Usa Fusionar para limpiar."
+    if not solo_vincular and woo_config(sucursal):
+        sync = woo_sync_price_by_sku(sku, data.get("precio_venta"), sucursal=sucursal)
+        if sync.get("ok"):
+            msg += f" Precio web actualizado a {sync.get('regular_price')}."
+    return {
+        "ok": True,
+        "success": True,
+        "producto_id": producto_id,
+        "sku": sku,
+        "woo_id": int(web.get("woo_id") or 0),
+        "nombre_interno": producto.get("nombre"),
+        "nombre_web": nombre_web or web.get("nombre_web"),
+        "otros_duplicados": otros,
+        "msg": msg,
+    }
+
+
+@app.post("/productos/fusionar")
+def fusionar_productos_duplicados(data: dict):
+    sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL))
+    keeper_id = int(data.get("keeper_id") or data.get("principal_id") or data.get("producto_id") or 0)
+    duplicate_id = int(data.get("duplicate_id") or data.get("duplicado_id") or 0)
+    if not keeper_id or not duplicate_id:
+        return {"ok": False, "msg": "keeper_id y duplicate_id son requeridos."}
+    if keeper_id == duplicate_id:
+        return {"ok": False, "msg": "No puedes fusionar un producto consigo mismo."}
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        ensure_producto_web_columns(cur)
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+        keeper = _producto_row_summary(cur, keeper_id, sucursal)
+        duplicate = _producto_row_summary(cur, duplicate_id, sucursal)
+        if not keeper or not duplicate:
+            conn.close()
+            return {"ok": False, "msg": "Producto principal o duplicado no encontrado."}
+
+        cur.execute("""
+            SELECT id, regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g') AS serie_key, serie
+            FROM producto_series
+            WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s
+        """, (duplicate_id, DEFAULT_SUCURSAL, sucursal))
+        dup_series = dict_fetchall(cur)
+        cur.execute("""
+            SELECT regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g') AS serie_key
+            FROM producto_series
+            WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s
+        """, (keeper_id, DEFAULT_SUCURSAL, sucursal))
+        keeper_keys = {str(r.get("serie_key") or "") for r in dict_fetchall(cur)}
+
+        moved_series = 0
+        deleted_series = 0
+        for row in dup_series:
+            key = str(row.get("serie_key") or "")
+            if key and key in keeper_keys:
+                cur.execute("DELETE FROM producto_series WHERE id=%s", (row.get("id"),))
+                deleted_series += 1
+            else:
+                cur.execute("UPDATE producto_series SET producto_id=%s WHERE id=%s", (keeper_id, row.get("id")))
+                moved_series += 1
+                if key:
+                    keeper_keys.add(key)
+
+        cur.execute("UPDATE ventas_detalle SET producto_id=%s WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s",
+                    (keeper_id, duplicate_id, DEFAULT_SUCURSAL, sucursal))
+        ventas_movidas = cur.rowcount
+
+        cur.execute("""
+            SELECT nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
+                   COALESCE(imagen_url,'') AS imagen_url, COALESCE(observacion,'') AS observacion,
+                   COALESCE(sku_woo,'') AS sku_woo, COALESCE(nombre_web,'') AS nombre_web,
+                   COALESCE(woo_id,0) AS woo_id,
+                   COALESCE(categoria_web,'') AS categoria_web, COALESCE(subcategoria_web,'') AS subcategoria_web,
+                   COALESCE(woo_categoria_id,0) AS woo_categoria_id, COALESCE(woo_subcategoria_id,0) AS woo_subcategoria_id
+            FROM productos
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (duplicate_id, DEFAULT_SUCURSAL, sucursal))
+        dup_full = dict_fetchone(cur)
+        cur.execute("""
+            SELECT nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
+                   COALESCE(imagen_url,'') AS imagen_url, COALESCE(observacion,'') AS observacion,
+                   COALESCE(sku_woo,'') AS sku_woo, COALESCE(nombre_web,'') AS nombre_web,
+                   COALESCE(woo_id,0) AS woo_id,
+                   COALESCE(categoria_web,'') AS categoria_web, COALESCE(subcategoria_web,'') AS subcategoria_web,
+                   COALESCE(woo_categoria_id,0) AS woo_categoria_id, COALESCE(woo_subcategoria_id,0) AS woo_subcategoria_id
+            FROM productos
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (keeper_id, DEFAULT_SUCURSAL, sucursal))
+        keep_full = dict_fetchone(cur)
+
+        cur.execute("""
+            UPDATE productos
+            SET categoria=CASE WHEN COALESCE(categoria,'')='' THEN %s ELSE categoria END,
+                marca=CASE WHEN COALESCE(marca,'')='' THEN %s ELSE marca END,
+                modelo=CASE WHEN COALESCE(modelo,'')='' THEN %s ELSE modelo END,
+                precio_compra=CASE WHEN COALESCE(precio_compra,0)=0 THEN %s ELSE precio_compra END,
+                precio_venta=CASE WHEN COALESCE(precio_venta,0)=0 THEN %s ELSE precio_venta END,
+                imagen_url=CASE WHEN COALESCE(imagen_url,'')='' THEN %s ELSE imagen_url END,
+                observacion=TRIM(COALESCE(observacion,'') || CASE WHEN %s<>'' THEN %s ELSE '' END),
+                sku_woo=CASE WHEN COALESCE(sku_woo,'')='' THEN %s ELSE sku_woo END,
+                nombre_web=CASE WHEN COALESCE(nombre_web,'')='' THEN %s ELSE nombre_web END,
+                woo_id=CASE WHEN COALESCE(woo_id,0)=0 THEN %s ELSE woo_id END,
+                categoria_web=CASE WHEN COALESCE(categoria_web,'')='' THEN %s ELSE categoria_web END,
+                subcategoria_web=CASE WHEN COALESCE(subcategoria_web,'')='' THEN %s ELSE subcategoria_web END,
+                woo_categoria_id=CASE WHEN COALESCE(woo_categoria_id,0)=0 THEN %s ELSE woo_categoria_id END,
+                woo_subcategoria_id=CASE WHEN COALESCE(woo_subcategoria_id,0)=0 THEN %s ELSE woo_subcategoria_id END
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (
+            dup_full.get("categoria"), dup_full.get("marca"), dup_full.get("modelo"),
+            dup_full.get("precio_compra"), dup_full.get("precio_venta"), dup_full.get("imagen_url"),
+            dup_full.get("observacion") or "", f"\nFusionado desde #{duplicate_id}: {dup_full.get('nombre')}",
+            dup_full.get("sku_woo"), dup_full.get("nombre_web"), dup_full.get("woo_id"),
+            dup_full.get("categoria_web"), dup_full.get("subcategoria_web"),
+            dup_full.get("woo_categoria_id"), dup_full.get("woo_subcategoria_id"),
+            keeper_id, DEFAULT_SUCURSAL, sucursal,
+        ))
+
+        cur.execute("""
+            UPDATE productos
+            SET stock = (
+                SELECT COUNT(*)
+                FROM producto_series ps
+                WHERE ps.producto_id=%s
+                  AND COALESCE(ps.sucursal,%s)=%s
+                  AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+            )
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (keeper_id, DEFAULT_SUCURSAL, sucursal, keeper_id, DEFAULT_SUCURSAL, sucursal))
+
+        cur.execute("DELETE FROM producto_series WHERE producto_id=%s AND COALESCE(sucursal,%s)=%s", (duplicate_id, DEFAULT_SUCURSAL, sucursal))
+        cur.execute("DELETE FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (duplicate_id, DEFAULT_SUCURSAL, sucursal))
+        deleted = cur.fetchone()
+        if not deleted:
+            conn.rollback()
+            conn.close()
+            return {"ok": False, "msg": "No se pudo eliminar el producto duplicado."}
+
+        conn.commit()
+        conn.close()
+        return {
+            "ok": True,
+            "success": True,
+            "keeper_id": keeper_id,
+            "duplicate_id": duplicate_id,
+            "series_movidas": moved_series,
+            "series_eliminadas_conflicto": deleted_series,
+            "ventas_detalle_movidas": ventas_movidas,
+            "msg": f"Fusionado #{duplicate_id} -> #{keeper_id}. Series movidas: {moved_series}. Duplicado eliminado.",
+        }
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -8675,8 +9054,9 @@ def woo_category_ids_for_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
 
 def woo_payload_from_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
     sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{p['id']}"
+    display_name = str(p.get("nombre_web") or "").strip() or p.get("nombre") or f"Producto {p['id']}"
     payload = {
-        "name": p.get("nombre") or f"Producto {p['id']}",
+        "name": display_name,
         "sku": sku,
         "status": "publish",
         "regular_price": str(float(p.get("precio_venta") or 0)),
@@ -8743,6 +9123,7 @@ def _erp_product_for_woo_sync(cur, producto_id: int, sucursal: str):
     cur.execute("""
         SELECT id, nombre, categoria, marca, modelo, precio_venta, stock,
                COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo,
+               COALESCE(nombre_web,'') AS nombre_web,
                COALESCE(categoria_web,'') AS categoria_web, COALESCE(subcategoria_web,'') AS subcategoria_web,
                COALESCE(woo_categoria_id,0) AS woo_categoria_id, COALESCE(woo_subcategoria_id,0) AS woo_subcategoria_id
         FROM productos
