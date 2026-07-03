@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Plataform API SUNAT — Tablero</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --surface: #121a2b;
+      --surface2: #1a2438;
+      --border: #2a3650;
+      --text: #e8edf7;
+      --muted: #8b9bb8;
+      --accent: #3b82f6;
+      --accent2: #22c55e;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --radius: 12px;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, transparent 60%),
+                  radial-gradient(900px 500px at 100% 0%, #1a3d2e 0%, transparent 55%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+    .sidebar {
+      background: rgba(18,26,43,.95);
+      border-right: 1px solid var(--border);
+      padding: 24px 16px;
+      position: sticky; top: 0; height: 100vh;
+    }
+    .brand { font-weight: 700; font-size: 1.1rem; margin-bottom: 4px; }
+    .brand span { color: var(--accent); }
+    .sub { color: var(--muted); font-size: .82rem; margin-bottom: 24px; }
+    .nav button {
+      width: 100%; text-align: left; border: 0; background: transparent;
+      color: var(--text); padding: 12px 14px; border-radius: 10px;
+      cursor: pointer; margin-bottom: 6px; font-size: .95rem;
+    }
+    .nav button:hover, .nav button.active { background: var(--surface2); }
+    .nav button.active { outline: 1px solid var(--accent); }
+    .main { padding: 28px; }
+    .topbar {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 24px; gap: 12px; flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 1.6rem; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--surface2); border: 1px solid var(--border);
+      padding: 8px 12px; border-radius: 999px; font-size: .85rem;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .dot.ok { background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
+    .grid { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .card {
+      background: rgba(18,26,43,.9);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 { margin: 0 0 12px; font-size: 1.1rem; }
+    .muted { color: var(--muted); font-size: .9rem; }
+    label { display: block; font-size: .85rem; color: var(--muted); margin: 12px 0 6px; }
+    input, select, textarea {
+      width: 100%; background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; font-size: .95rem;
+    }
+    textarea { min-height: 80px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px) { .row { grid-template-columns: 1fr; } .layout { grid-template-columns: 1fr; } .sidebar { height: auto; position: static; } }
+    .btn {
+      border: 0; border-radius: 10px; padding: 11px 16px;
+      font-weight: 600; cursor: pointer; font-size: .92rem;
+    }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-success { background: var(--accent2); color: #052e16; }
+    .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .btn-danger { background: var(--danger); color: white; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .alert {
+      border-radius: 10px; padding: 12px 14px; margin-top: 14px;
+      border: 1px solid var(--border); background: var(--surface2);
+      white-space: pre-wrap; word-break: break-word; font-size: .9rem;
+    }
+    .alert.ok { border-color: #166534; background: rgba(34,197,94,.12); }
+    .alert.err { border-color: #7f1d1d; background: rgba(239,68,68,.12); }
+    .alert.warn { border-color: #92400e; background: rgba(245,158,11,.12); }
+    .cred-box {
+      font-family: Consolas, monospace; font-size: .82rem;
+      background: var(--bg); border: 1px dashed var(--border);
+      padding: 12px; border-radius: 10px; margin-top: 8px;
+    }
+    .hidden { display: none !important; }
+    .stat { font-size: 1.8rem; font-weight: 700; }
+    .copy { font-size: .8rem; margin-left: 8px; color: var(--accent); cursor: pointer; }
+    .menu-mobile { display: none; margin-bottom: 12px; }
+    @media (max-width: 720px) { .menu-mobile { display: block; } .nav { display: none; } }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">Plataform <span>SUNAT</span></div>
+      <div class="sub">Servidor en Render — G&amp;G ERP</div>
+      <select class="menu-mobile" id="navMobile" onchange="go(this.value)">
+        <option value="inicio">Inicio</option>
+        <option value="registro">Registrar empresa</option>
+        <option value="acceso">Acceder con API</option>
+        <option value="empresa">Mi empresa</option>
+        <option value="sucursales">Sucursales</option>
+        <option value="series">Series</option>
+      </select>
+      <nav class="nav" id="nav">
+        <button type="button" data-view="inicio" class="active">Inicio</button>
+        <button type="button" data-view="registro">Registrar empresa</button>
+        <button type="button" data-view="acceso">Acceder con API</button>
+        <button type="button" data-view="empresa">Mi empresa</button>
+        <button type="button" data-view="sucursales">Sucursales</button>
+        <button type="button" data-view="series">Series</button>
+      </nav>
+      <div style="margin-top:24px" class="muted" id="sessionInfo">Sin sesión API</div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <h1 id="pageTitle">Tablero API SUNAT</h1>
+        <div class="chip"><span class="dot" id="statusDot"></span><span id="statusText">Comprobando servidor…</span></div>
+      </div>
+
+      <section id="view-inicio" class="view">
+        <div class="grid grid-2">
+          <div class="card">
+            <h2>Estado del servidor</h2>
+            <div class="stat" id="apiState">—</div>
+            <p class="muted" id="apiMessage">Cargando…</p>
+            <p class="muted">Base URL: <code id="baseUrlLabel"></code></p>
+          </div>
+          <div class="card">
+            <h2>Endpoints disponibles</h2>
+            <ul class="muted" id="endpointList"></ul>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <h2>Enlaces rápidos</h2>
+          <div class="actions">
+            <button class="btn btn-primary" onclick="go('registro')">Registrar nueva empresa</button>
+            <button class="btn btn-ghost" onclick="go('acceso')">Ingresar con api_key</button>
+            <a class="btn btn-ghost" href="/docs" target="_blank" rel="noopener">Documentación Swagger</a>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-registro" class="view hidden">
+        <div class="card">
+          <h2>Registrar empresa en SUNAT</h2>
+          <p class="muted">Equivalente a <code>POST /api/v1/registro</code> en Postman. Sube el certificado .p12 y recibe tu api_key y api_secret.</p>
+          <form id="formRegistro">
+            <div class="row">
+              <div><label>RUC (11 dígitos)</label><input name="ruc" required maxlength="11" placeholder="20611068701" /></div>
+              <div><label>Razón social</label><input name="razon_social" required placeholder="MI EMPRESA SAC" /></div>
+            </div>
+            <label>Dirección</label><input name="direccion" placeholder="Av. ..." />
+            <div class="row">
+              <div><label>Ubigeo</label><input name="ubigeo" value="150101" /></div>
+              <div><label>Plan</label><select name="plan"><option value="pro">pro</option><option value="free">free</option></select></div>
+            </div>
+            <div class="row">
+              <div><label>Departamento</label><input name="departamento" value="LIMA" /></div>
+              <div><label>Provincia</label><input name="provincia" value="LIMA" /></div>
+            </div>
+            <label>Distrito</label><input name="distrito" value="LIMA" />
+            <div class="row">
+              <div><label>Usuario SOL</label><input name="sol_user" required placeholder="ARMY" /></div>
+              <div><label>Clave SOL</label><input name="sol_pass" type="password" required /></div>
+            </div>
+            <div class="row">
+              <div><label>Contraseña certificado .p12</label><input name="contrasena_certificado" type="password" required /></div>
+              <div><label>Entorno</label><select name="entorno"><option value="production">production</option><option value="beta">beta</option></select></div>
+            </div>
+            <label>Certificado digital (.p12)</label><input name="certificado" type="file" accept=".p12,.pfx" required />
+            <div class="actions">
+              <button class="btn btn-success" type="submit">Registrar empresa</button>
+            </div>
+          </form>
+          <div id="registroResult"></div>
+        </div>
+      </section>
+
+      <section id="view-acceso" class="view hidden">
+        <div class="card">
+          <h2>Acceder con credenciales API</h2>
+          <p class="muted">Ingresa el api_key y api_secret que recibiste al registrar (o regenerar).</p>
+          <label>API Key</label><input id="inpKey" placeholder="V4..." />
+          <label>API Secret</label><input id="inpSecret" type="password" placeholder="hash de 64 caracteres" />
+          <div class="actions">
+            <button class="btn btn-primary" onclick="guardarSesion()">Guardar y validar</button>
+            <button class="btn btn-ghost" onclick="cerrarSesion()">Cerrar sesión</button>
+          </div>
+          <div id="accesoResult"></div>
+        </div>
+      </section>
+
+      <section id="view-empresa" class="view hidden">
+        <div class="card">
+          <h2>Datos de mi empresa</h2>
+          <p class="muted">Consulta <code>GET /api/v1/empresa</code></p>
+          <div class="actions">
+            <button class="btn btn-primary" onclick="cargarEmpresa()">Actualizar datos</button>
+            <button class="btn btn-danger" onclick="regenerarCredenciales()">Regenerar api_key / secret</button>
+          </div>
+          <div id="empresaResult"></div>
+        </div>
+      </section>
+
+      <section id="view-sucursales" class="view hidden">
+        <div class="card">
+          <h2>Crear sucursal</h2>
+          <label>Nombre</label><input id="sucNombre" value="Sucursal Principal" />
+          <div class="row">
+            <div><label>Código local</label><input id="sucCod" value="0001" /></div>
+            <div><label>Ubigeo</label><input id="sucUbigeo" value="150101" /></div>
+          </div>
+          <label>Dirección</label><input id="sucDir" />
+          <div class="actions"><button class="btn btn-success" onclick="crearSucursal()">Crear sucursal</button></div>
+          <div id="sucursalResult"></div>
+        </div>
+      </section>
+
+      <section id="view-series" class="view hidden">
+        <div class="card">
+          <h2>Configurar series</h2>
+          <p class="muted">Ejemplo boleta B001 y factura F001.</p>
+          <div class="row">
+            <div><label>Tipo</label><select id="serTipo"><option value="boleta">boleta</option><option value="factura">factura</option></select></div>
+            <div><label>Serie</label><input id="serSerie" value="B001" /></div>
+          </div>
+          <div class="row">
+            <div><label>Sucursal ID</label><input id="serSuc" type="number" value="1" /></div>
+            <div><label>Correlativo inicial</label><input id="serCorr" type="number" value="1" /></div>
+          </div>
+          <div class="actions"><button class="btn btn-success" onclick="crearSeries()">Guardar series</button></div>
+          <div id="seriesResult"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const API_BASE = window.location.origin + "/api/v1";
+    const LS_KEY = "plataform_sunat_creds";
+
+    const titles = {
+      inicio: "Inicio",
+      registro: "Registrar empresa",
+      acceso: "Acceder con API",
+      empresa: "Mi empresa",
+      sucursales: "Sucursales",
+      series: "Series",
+    };
+
+    function creds() {
+      try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; }
+    }
+    function setCreds(k, s) { localStorage.setItem(LS_KEY, JSON.stringify({ api_key: k, api_secret: s })); refreshSession(); }
+    function clearCreds() { localStorage.removeItem(LS_KEY); refreshSession(); }
+    function authHeaders() {
+      const c = creds();
+      return { "X-Api-Key": c.api_key || "", "X-Api-Secret": c.api_secret || "", "Accept": "application/json" };
+    }
+    function refreshSession() {
+      const c = creds();
+      const el = document.getElementById("sessionInfo");
+      if (c.api_key) {
+        el.textContent = "Sesión: " + c.api_key.slice(0, 12) + "…";
+        document.getElementById("inpKey").value = c.api_key;
+        document.getElementById("inpSecret").value = c.api_secret || "";
+      } else {
+        el.textContent = "Sin sesión API";
+      }
+    }
+    function showResult(id, ok, text) {
+      const el = document.getElementById(id);
+      el.className = "alert " + (ok ? "ok" : "err");
+      el.textContent = text;
+    }
+    function go(view) {
+      document.querySelectorAll(".view").forEach(v => v.classList.add("hidden"));
+      document.getElementById("view-" + view).classList.remove("hidden");
+      document.querySelectorAll(".nav button").forEach(b => b.classList.toggle("active", b.dataset.view === view));
+      document.getElementById("pageTitle").textContent = titles[view] || "Tablero";
+      const mob = document.getElementById("navMobile");
+      if (mob) mob.value = view;
+    }
+    document.getElementById("nav").addEventListener("click", e => {
+      const btn = e.target.closest("button[data-view]");
+      if (btn) go(btn.dataset.view);
+    });
+
+    async function checkHealth() {
+      const dot = document.getElementById("statusDot");
+      const txt = document.getElementById("statusText");
+      try {
+        const r = await fetch(API_BASE + "/system/info");
+        const j = await r.json();
+        if (r.ok && j.estado === "exito") {
+          dot.classList.add("ok");
+          txt.textContent = "Servidor activo";
+          document.getElementById("apiState").textContent = "ONLINE";
+          document.getElementById("apiMessage").textContent = j.mensaje || "";
+          document.getElementById("baseUrlLabel").textContent = j.datos?.base_url || API_BASE;
+          const ul = document.getElementById("endpointList");
+          ul.innerHTML = (j.datos?.endpoints || []).map(e => "<li>" + e + "</li>").join("");
+        } else throw new Error(j.mensaje || "Error");
+      } catch (e) {
+        dot.classList.remove("ok");
+        txt.textContent = "Servidor no disponible";
+        document.getElementById("apiState").textContent = "OFFLINE";
+        document.getElementById("apiMessage").textContent = String(e);
+      }
+    }
+
+    document.getElementById("formRegistro").addEventListener("submit", async ev => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      const box = document.getElementById("registroResult");
+      box.className = "alert";
+      box.textContent = "Registrando…";
+      try {
+        const r = await fetch(API_BASE + "/registro", { method: "POST", body: fd });
+        const j = await r.json();
+        if (r.status === 201 && j.datos) {
+          setCreds(j.datos.api_key, j.datos.api_secret);
+          box.className = "alert ok";
+          box.innerHTML = "✅ " + (j.mensaje || "Registrado") + "\n\n"
+            + "api_key: " + j.datos.api_key + "\n"
+            + "api_secret: " + j.datos.api_secret + "\n\n"
+            + "⚠️ Guarda el api_secret ahora. Solo se muestra una vez.";
+        } else {
+          box.className = "alert err";
+          box.textContent = (j.mensaje || "Error") + "\n" + JSON.stringify(j.errores || j, null, 2);
+        }
+      } catch (e) {
+        box.className = "alert err";
+        box.textContent = String(e);
+      }
+    });
+
+    async function guardarSesion() {
+      const k = document.getElementById("inpKey").value.trim();
+      const s = document.getElementById("inpSecret").value.trim();
+      if (!k || !s) { showResult("accesoResult", false, "Completa api_key y api_secret."); return; }
+      setCreds(k, s);
+      try {
+        const r = await fetch(API_BASE + "/empresa", { headers: authHeaders() });
+        const j = await r.json();
+        if (r.ok) {
+          showResult("accesoResult", true, "✅ Credenciales válidas. Empresa: " + (j.datos?.razon_social || j.datos?.ruc));
+          go("empresa");
+          cargarEmpresa();
+        } else {
+          clearCreds();
+          showResult("accesoResult", false, j.mensaje || JSON.stringify(j));
+        }
+      } catch (e) {
+        showResult("accesoResult", false, String(e));
+      }
+    }
+    function cerrarSesion() { clearCreds(); showResult("accesoResult", true, "Sesión cerrada."); }
+
+    async function cargarEmpresa() {
+      const box = document.getElementById("empresaResult");
+      const c = creds();
+      if (!c.api_key) { box.className = "alert warn"; box.textContent = "Primero accede con tu api_key en la sección Acceder."; return; }
+      try {
+        const r = await fetch(API_BASE + "/empresa", { headers: authHeaders() });
+        const j = await r.json();
+        box.className = "alert " + (r.ok ? "ok" : "err");
+        box.textContent = r.ok ? JSON.stringify(j.datos || j, null, 2) : (j.mensaje || JSON.stringify(j));
+      } catch (e) {
+        box.className = "alert err"; box.textContent = String(e);
+      }
+    }
+
+    async function regenerarCredenciales() {
+      if (!confirm("¿Regenerar credenciales? Las anteriores dejarán de funcionar.")) return;
+      try {
+        const r = await fetch(API_BASE + "/empresa/credenciales/regenerar", { method: "POST", headers: authHeaders() });
+        const j = await r.json();
+        const box = document.getElementById("empresaResult");
+        if (r.ok && j.datos) {
+          setCreds(j.datos.api_key || j.datos.nueva_api_key, j.datos.api_secret || j.datos.nueva_api_secret);
+          box.className = "alert ok";
+          box.textContent = "Nuevas credenciales:\napi_key: " + (j.datos.api_key || "") + "\napi_secret: " + (j.datos.api_secret || "");
+        } else {
+          box.className = "alert err"; box.textContent = j.mensaje || JSON.stringify(j);
+        }
+      } catch (e) {
+        document.getElementById("empresaResult").className = "alert err";
+        document.getElementById("empresaResult").textContent = String(e);
+      }
+    }
+
+    async function crearSucursal() {
+      const body = {
+        nombre: document.getElementById("sucNombre").value,
+        cod_local: document.getElementById("sucCod").value,
+        direccion: document.getElementById("sucDir").value,
+        ubigeo: document.getElementById("sucUbigeo").value,
+        es_principal: true,
+      };
+      try {
+        const r = await fetch(API_BASE + "/sucursales", { method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const j = await r.json();
+        showResult("sucursalResult", r.ok, JSON.stringify(j, null, 2));
+      } catch (e) { showResult("sucursalResult", false, String(e)); }
+    }
+
+    async function crearSeries() {
+      const tipo = document.getElementById("serTipo").value;
+      const body = {
+        series: [{
+          tipo,
+          serie: document.getElementById("serSerie").value.toUpperCase(),
+          sucursal_id: Number(document.getElementById("serSuc").value || 1),
+          correlativo_inicial: Number(document.getElementById("serCorr").value || 1),
+        }],
+      };
+      try {
+        const r = await fetch(API_BASE + "/series", { method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const j = await r.json();
+        showResult("seriesResult", r.ok, JSON.stringify(j, null, 2));
+      } catch (e) { showResult("seriesResult", false, String(e)); }
+    }
+
+    document.getElementById("baseUrlLabel").textContent = API_BASE;
+    refreshSession();
+    checkHealth();
+    go("inicio");
+  </script>
+</body>
+</html>
