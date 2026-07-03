@@ -68,6 +68,15 @@ app.add_middleware(
 
 if plataform_sunat_router is not None:
     app.include_router(plataform_sunat_router, prefix="/api/v1")
+    try:
+        from plataform_sunat_server import sunat_panel_page
+    except Exception:
+        sunat_panel_page = None
+    if sunat_panel_page is not None:
+        @app.get("/sunat-panel")
+        @app.get("/sunat-panel/")
+        def sunat_panel_web():
+            return sunat_panel_page()
 
 class CachedStaticFiles(StaticFiles):
     def __init__(self, *args, cache_seconds=86400, **kwargs):
@@ -100,6 +109,8 @@ def root():
         "success": True,
         "app": "G&G ERP API",
         "web_url": "/erp/" if os.path.isdir(WEBAPP_DIR) else "",
+        "sunat_panel_url": "/sunat-panel",
+        "sunat_api_url": "/api/v1/system/info",
     }
 
 
