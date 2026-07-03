@@ -3985,6 +3985,65 @@ def _producto_row_summary(cur, producto_id, sucursal):
     return dict_fetchone(cur)
 
 
+def _woo_image_key(url):
+    u = str(url or "").strip().lower().split("?")[0]
+    return u.rsplit("/", 1)[-1] if u else ""
+
+
+def _erp_id_from_woo_sku(sku):
+    m = re.match(r"^ERP-(\d+)$", str(sku or "").strip().upper())
+    return int(m.group(1)) if m else 0
+
+
+def _woo_list_all_products(sucursal, search=""):
+    items = []
+    page = 1
+    while page <= 30:
+        params = {"per_page": 100, "page": page, "orderby": "date", "order": "desc"}
+        if search:
+            params["search"] = search
+        r = woo_request("get", "products", sucursal=sucursal, params=params)
+        if not r.get("ok"):
+            return r
+        batch = r.get("data") or []
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return {"ok": True, "data": items, "total": len(items)}
+
+
+def _match_score_erp_woo(erp, woo):
+    woo_name = str(woo.get("name") or "")
+    woo_id = int(woo.get("id") or 0)
+    woo_sku = str(woo.get("sku") or "").strip().upper()
+    images = woo.get("images") or []
+    woo_img = _woo_image_key(images[0].get("src") if images and isinstance(images[0], dict) else "")
+    erp_id = int(erp.get("id") or 0)
+    sim_name = max(
+        product_name_similarity(woo_name, erp.get("nombre")),
+        product_name_similarity(woo_name, erp.get("nombre_web")),
+    )
+    score = sim_name
+    reasons = []
+    if erp_id == _erp_id_from_woo_sku(woo_sku):
+        score += 0.55
+        reasons.append("sku_erp_id")
+    if int(erp.get("woo_id") or 0) == woo_id and woo_id > 0:
+        score += 0.4
+        reasons.append("woo_id")
+    if str(erp.get("sku_woo") or "").strip().upper() == woo_sku and woo_sku:
+        score += 0.35
+        reasons.append("sku_match")
+    erp_img = _woo_image_key(erp.get("imagen_url"))
+    if erp_img and woo_img and erp_img == woo_img:
+        score += 0.25
+        reasons.append("imagen")
+    return score, sim_name, reasons
+
+
 def _woo_product_summary_by_sku(sku, sucursal):
     sku = str(sku or "").strip().upper()
     if not sku:
@@ -4530,6 +4589,170 @@ def fusionar_productos_duplicados(data: dict):
         conn.rollback()
         conn.close()
         return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.post("/productos/limpiar-duplicados-web")
+def limpiar_duplicados_web(data: dict = None):
+    data = data or {}
+    sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL))
+    dry_run = bool(data.get("dry_run", True))
+    min_score = float(data.get("min_score", 0.78))
+    min_fusion_sim = float(data.get("min_fusion_sim", 0.82))
+
+    woo_all = _woo_list_all_products(sucursal)
+    if not woo_all.get("ok"):
+        return woo_all
+
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+    cur.execute("""
+        SELECT p.id, p.nombre, COALESCE(p.nombre_web,'') AS nombre_web,
+               COALESCE(p.sku_woo,'') AS sku_woo, COALESCE(p.woo_id,0) AS woo_id,
+               COALESCE(p.stock,0) AS stock, COALESCE(p.imagen_url,'') AS imagen_url,
+               (
+                 SELECT COUNT(*)
+                 FROM producto_series ps
+                 WHERE ps.producto_id=p.id AND COALESCE(ps.sucursal,%s)=%s
+               ) AS series_count
+        FROM productos p
+        WHERE COALESCE(p.sucursal,%s)=%s
+        ORDER BY p.id
+    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+    erp_rows = dict_fetchall(cur)
+    conn.close()
+
+    acciones = []
+    vinculados = 0
+    fusionados = 0
+    used_erp_ids = set()
+
+    for woo in woo_all.get("data") or []:
+        woo_id = int(woo.get("id") or 0)
+        woo_name = str(woo.get("name") or "").strip()
+        woo_sku = str(woo.get("sku") or "").strip().upper()
+        images = woo.get("images") or []
+        woo_image = images[0].get("src", "") if images and isinstance(images[0], dict) else ""
+        hint_id = _erp_id_from_woo_sku(woo_sku)
+
+        scored = []
+        for erp in erp_rows:
+            if int(erp.get("id") or 0) in used_erp_ids:
+                continue
+            score, sim_name, reasons = _match_score_erp_woo(erp, woo)
+            if hint_id and int(erp.get("id") or 0) == hint_id:
+                score = max(score, 1.35)
+                if "sku_erp_id" not in reasons:
+                    reasons.append("sku_erp_id")
+            if score >= min_score or (hint_id and int(erp.get("id") or 0) == hint_id):
+                scored.append({
+                    "erp": erp,
+                    "score": score,
+                    "sim_name": sim_name,
+                    "reasons": reasons,
+                })
+
+        if not scored:
+            continue
+
+        scored.sort(key=lambda x: (
+            -int(x["erp"].get("series_count") or 0),
+            -int(x["erp"].get("stock") or 0),
+            -float(x["score"]),
+            int(x["erp"].get("id") or 0),
+        ))
+        keeper_item = next((x for x in scored if int(x["erp"].get("id") or 0) == hint_id), None) or scored[0]
+        keeper = keeper_item["erp"]
+        keeper_id = int(keeper.get("id") or 0)
+        duplicates = []
+        for item in scored:
+            erp = item["erp"]
+            dup_id = int(erp.get("id") or 0)
+            if dup_id == keeper_id:
+                continue
+            sim_keeper = product_name_similarity(keeper.get("nombre"), erp.get("nombre"))
+            if item["sim_name"] >= min_fusion_sim or sim_keeper >= 0.9 or "sku_erp_id" in keeper_item.get("reasons", []):
+                duplicates.append({
+                    "id": dup_id,
+                    "nombre": erp.get("nombre"),
+                    "sim_web": round(item["sim_name"], 3),
+                    "sim_keeper": round(sim_keeper, 3),
+                    "reasons": item.get("reasons") or [],
+                })
+
+        link_action = {
+            "keeper_id": keeper_id,
+            "keeper_nombre": keeper.get("nombre"),
+            "woo_id": woo_id,
+            "woo_name": woo_name,
+            "woo_sku": woo_sku,
+            "nombre_web": woo_name,
+            "imagen_web": woo_image,
+            "duplicates": duplicates,
+        }
+        acciones.append(link_action)
+
+        if dry_run:
+            continue
+
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE productos
+                SET sku_woo=%s,
+                    woo_id=%s,
+                    nombre_web=%s
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (woo_sku, woo_id, woo_name, keeper_id, DEFAULT_SUCURSAL, sucursal))
+            if woo_image:
+                cur.execute("""
+                    UPDATE productos
+                    SET imagen_url=%s
+                    WHERE id=%s AND COALESCE(sucursal,%s)=%s
+                      AND COALESCE(imagen_url,'')=''
+                """, (woo_image, keeper_id, DEFAULT_SUCURSAL, sucursal))
+            conn.commit()
+            vinculados += 1
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            link_action["error_vinculo"] = str(e)
+            continue
+        conn.close()
+
+        for dup in duplicates:
+            dup_id = int(dup.get("id") or 0)
+            if dup_id in used_erp_ids:
+                continue
+            fusion = fusionar_productos_duplicados({
+                "sucursal": sucursal,
+                "keeper_id": keeper_id,
+                "duplicate_id": dup_id,
+            })
+            dup["fusion"] = fusion
+            if fusion.get("ok"):
+                fusionados += 1
+                used_erp_ids.add(dup_id)
+                erp_rows = [r for r in erp_rows if int(r.get("id") or 0) != dup_id]
+
+    msg = (
+        f"Modo {'simulacion' if dry_run else 'ejecucion'}: "
+        f"{len(acciones)} producto(s) web analizados con match ERP. "
+        f"Vinculados: {vinculados}. Fusionados: {fusionados}."
+    )
+    return {
+        "ok": True,
+        "success": True,
+        "dry_run": dry_run,
+        "total_web": len(woo_all.get("data") or []),
+        "grupos": len(acciones),
+        "vinculados": vinculados,
+        "fusionados": fusionados,
+        "acciones": acciones[:80],
+        "msg": msg,
+    }
 
 
 @app.get("/series")
@@ -9512,9 +9735,9 @@ def woo_test(sucursal: str = DEFAULT_SUCURSAL):
 
 
 @app.get("/web/woocommerce/products")
-def woo_products(search: str = "", sucursal: str = DEFAULT_SUCURSAL):
+def woo_products(search: str = "", page: int = 1, per_page: int = 50, sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
-    params = {"per_page": 50, "orderby": "date", "order": "desc"}
+    params = {"per_page": min(max(int(per_page or 50), 1), 100), "page": max(int(page or 1), 1), "orderby": "date", "order": "desc"}
     if search:
         params["search"] = search
     r = woo_request("get", "products", sucursal=sucursal, params=params)
