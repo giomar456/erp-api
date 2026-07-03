@@ -49,9 +49,13 @@ except Exception:
 try:
     from plataform_sunat_server import router as plataform_sunat_router
     from plataform_sunat_server import ensure_plataform_tables
-except Exception:
+except Exception as _plataform_import_exc:
     plataform_sunat_router = None
     ensure_plataform_tables = None
+    import logging
+    logging.getLogger("uvicorn.error").warning(
+        "plataform_sunat_server no cargado: %s", _plataform_import_exc
+    )
 
 app = FastAPI()
 app.add_middleware(
