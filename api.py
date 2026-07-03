@@ -46,6 +46,13 @@ try:
 except Exception:
     plataform_sunat = None
 
+try:
+    from plataform_sunat_server import router as plataform_sunat_router
+    from plataform_sunat_server import ensure_plataform_tables
+except Exception:
+    plataform_sunat_router = None
+    ensure_plataform_tables = None
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -54,6 +61,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if plataform_sunat_router is not None:
+    app.include_router(plataform_sunat_router, prefix="/api/v1")
 
 class CachedStaticFiles(StaticFiles):
     def __init__(self, *args, cache_seconds=86400, **kwargs):
@@ -2186,6 +2196,9 @@ def migrate_schema():
             nota TEXT
         );
         """)
+
+        if ensure_plataform_tables is not None:
+            ensure_plataform_tables(cur)
 
         conn.commit()
         conn.close()
