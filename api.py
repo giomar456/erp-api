@@ -1808,6 +1808,15 @@ def migrate_schema():
             ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuario_ventas_borradores (
+            usuario TEXT NOT NULL,
+            sucursal TEXT NOT NULL DEFAULT 'computer_army',
+            payload TEXT NOT NULL DEFAULT '{}',
+            actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (usuario, sucursal)
+        );
+        """)
         ensure_usuario_permisos_table(cur)
 
         for usuario, clave, rol in [
@@ -2307,6 +2316,70 @@ def perfil_usuario(usuario: str = ""):
     data["permisos"] = permisos_usuario(cur, data.get("id"), data.get("usuario"), data.get("rol"))
     conn.close()
     return {"ok": True, "found": True, **data}
+
+
+def ensure_usuario_ventas_borradores_table(cur):
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usuario_ventas_borradores (
+        usuario TEXT NOT NULL,
+        sucursal TEXT NOT NULL DEFAULT 'computer_army',
+        payload TEXT NOT NULL DEFAULT '{}',
+        actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (usuario, sucursal)
+    );
+    """)
+
+
+@app.get("/ventas/borradores")
+def obtener_ventas_borradores(usuario: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    usuario = (usuario or "").strip()
+    if not usuario:
+        return {"ok": False, "msg": "Usuario requerido."}
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_usuario_ventas_borradores_table(cur)
+    cur.execute("""
+        SELECT payload, actualizado
+        FROM usuario_ventas_borradores
+        WHERE lower(usuario)=lower(%s) AND sucursal=%s
+    """, (usuario, sucursal))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"ok": True, "found": False, "data": None}
+    try:
+        data = json.loads(row[0] or "{}")
+    except Exception:
+        data = {}
+    updated_at = row[1].isoformat() if row[1] else None
+    return {"ok": True, "found": True, "data": data, "updated_at": updated_at}
+
+
+@app.put("/ventas/borradores")
+def guardar_ventas_borradores(data: dict):
+    usuario = (data.get("usuario") or "").strip()
+    if not usuario:
+        return {"ok": False, "msg": "Usuario requerido."}
+    sucursal = norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL)
+    payload = {
+        "saleTabs": data.get("saleTabs") or [],
+        "activeTabId": data.get("activeTabId") or "",
+        "saleDrafts": data.get("saleDrafts") or {},
+        "updatedAt": data.get("updatedAt") or int(time.time() * 1000),
+    }
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_usuario_ventas_borradores_table(cur)
+    cur.execute("""
+        INSERT INTO usuario_ventas_borradores (usuario, sucursal, payload, actualizado)
+        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (usuario, sucursal)
+        DO UPDATE SET payload=EXCLUDED.payload, actualizado=CURRENT_TIMESTAMP
+    """, (usuario, sucursal, json.dumps(payload, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "success": True}
 
 
 @app.post("/usuarios")
