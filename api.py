@@ -111,7 +111,19 @@ def root():
         "web_url": "/erp/" if os.path.isdir(WEBAPP_DIR) else "",
         "sunat_panel_url": "/sunat-panel",
         "sunat_api_url": "/api/v1/system/info",
+        "pc_fast_url": "/pc-fast",
     }
+
+
+@app.get("/pc-fast")
+@app.get("/pc-fast/")
+def pc_fast_launch():
+    html = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8" />
+<title>PC FAST STORE</title><script>
+localStorage.setItem('gg_erp_empresa','pc_fast_store');
+location.replace('/erp/');
+</script></head><body><p>Abriendo PC FAST STORE…</p></body></html>"""
+    return Response(content=html, media_type="text/html")
 
 
 @app.get("/erp")
