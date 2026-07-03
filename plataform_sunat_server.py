@@ -11,7 +11,7 @@ import secrets
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 try:
     from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
@@ -19,6 +19,8 @@ except Exception:
     load_key_and_certificates = None
 
 router = APIRouter(tags=["plataform-sunat"])
+
+PANEL_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plataform_sunat_panel.html")
 
 PUBLIC_BASE = (
     os.getenv("PLATAFORM_SUNAT_PUBLIC_URL")
@@ -182,6 +184,22 @@ def _require_auth(
         conn.close()
 
 
+@router.get("/panel", include_in_schema=False)
+def panel_redirect_api():
+    if os.path.isfile(PANEL_HTML):
+        return FileResponse(PANEL_HTML, media_type="text/html")
+    return _err("Panel web no disponible en este deploy.", status=404)
+
+
+def sunat_panel_page():
+    if os.path.isfile(PANEL_HTML):
+        return FileResponse(PANEL_HTML, media_type="text/html")
+    return JSONResponse(
+        status_code=404,
+        content={"estado": "error", "mensaje": "Panel SUNAT no publicado en este deploy."},
+    )
+
+
 @router.get("/system/info")
 def system_info():
     return {
@@ -191,7 +209,9 @@ def system_info():
             "servidor": PUBLIC_BASE,
             "base_url": f"{PUBLIC_BASE}/api/v1",
             "proveedor": "G&G ERP Render",
+            "panel_web": f"{PUBLIC_BASE}/sunat-panel",
             "endpoints": [
+                "GET /sunat-panel (tablero web)",
                 "POST /registro",
                 "POST /empresa/credenciales/regenerar",
                 "GET /empresa",
