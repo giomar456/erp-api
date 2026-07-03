@@ -270,6 +270,7 @@ def norm_sucursal(value: str = ""):
 
 DOCUMENT_EDIT_USERS = {"giomar"}
 SERIES_EDIT_USERS = {"giomar", "mily"}
+COMPRAS_SERIES_EDIT_USERS = {"giomar", "mily", "tiffco"}
 
 
 def norm_usuario_permiso(value=""):
@@ -299,6 +300,15 @@ def usuario_puede_editar_series(data):
         return False
     for key in ("usuario", "usuario_ingreso", "usuario_emisor", "usuario_registro", "usuario_edicion", "editor", "user"):
         if norm_usuario_permiso(data.get(key)) in SERIES_EDIT_USERS:
+            return True
+    return False
+
+
+def usuario_puede_editar_series_compras(data):
+    if not isinstance(data, dict):
+        return False
+    for key in ("usuario", "usuario_ingreso", "usuario_emisor", "usuario_registro", "usuario_edicion", "editor", "user"):
+        if norm_usuario_permiso(data.get(key)) in COMPRAS_SERIES_EDIT_USERS:
             return True
     return False
 
@@ -8870,11 +8880,11 @@ def guardar_compra(data: Compra):
             if series_texto and str(series_texto).strip():
                 compra_tiene_series = True
                 break
-        if compra_tiene_series and not usuario_puede_editar_series({
+        if compra_tiene_series and not usuario_puede_editar_series_compras({
             "usuario": data.usuario or data.usuario_registro,
             "usuario_registro": data.usuario_registro or data.usuario,
         }):
-            return {"ok": False, "msg": "Solo giomar y mily pueden ingresar series en compras."}
+            return {"ok": False, "msg": "Solo giomar, mily y tiffco pueden ingresar series en compras."}
 
         if proveedor:
             cur.execute("""
