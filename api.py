@@ -5931,71 +5931,145 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         return {"ok": False, "data": [], "msg": str(e)}
 
 
-@app.get("/backup/export")
-def exportar_backup(sucursal: str = DEFAULT_SUCURSAL):
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        sucursal = norm_sucursal(sucursal)
-        tables = [
-            "productos",
-            "producto_series",
-            "ventas",
-            "ventas_detalle",
-            "caja_movimientos",
-            "clientes",
-            "compras",
-            "proveedores",
-            "garantias",
-            "usuarios",
-            "auditoria",
-            "stock_transferencias",
-            "inventario_conteos",
-            "inventario_conteo_scans",
-            "app_config",
-        ]
-        data = {
-            "ok": True,
-            "success": True,
-            "sucursal": sucursal,
-            "generado": lima_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "tablas": {},
-        }
-        for table in tables:
-            try:
-                if table == "app_config":
-                    cur.execute("SELECT * FROM app_config ORDER BY clave")
-                elif table == "auditoria":
-                    cur.execute("SELECT * FROM auditoria WHERE COALESCE(empresa,%s)=%s ORDER BY id", (DEFAULT_SUCURSAL, sucursal))
-                elif table == "stock_transferencias":
-                    cur.execute("""
+_BACKUP_TABLES_FULL = [
+    "usuarios",
+    "usuario_permisos",
+    "sucursales",
+    "sucursal_permisos",
+    "usuarios_online",
+    "usuario_ventas_borradores",
+    "boquitoqui_mensajes",
+    "clientes",
+    "reservas_clientes",
+    "productos",
+    "series",
+    "producto_series",
+    "inventario_conteos",
+    "inventario_conteo_scans",
+    "ventas",
+    "ventas_detalle",
+    "caja_movimientos",
+    "proveedores",
+    "compras",
+    "garantias",
+    "servicios_tecnicos",
+    "stock_transferencias",
+    "auditoria",
+    "app_config",
+    "plataform_empresas",
+    "plataform_sucursales",
+    "plataform_series",
+]
+
+
+def _backup_jsonable_rows(rows):
+    out = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append(_jsonable_row(row))
+        else:
+            out.append(row)
+    return out
+
+
+def _exportar_tablas_backup(cur, tables, sucursal: str = "", full: bool = False):
+    payload = {}
+    stats = {}
+    for table in tables:
+        try:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name=%s
+                )
+            """, (table,))
+            if not cur.fetchone()[0]:
+                payload[table] = []
+                stats[table] = 0
+                continue
+            if full or table in ("app_config", "usuario_permisos", "sucursales", "sucursal_permisos", "series", "plataform_empresas", "plataform_sucursales", "plataform_series"):
+                cur.execute(f"SELECT * FROM {table} ORDER BY 1")
+            elif table == "auditoria" and sucursal:
+                cur.execute("SELECT * FROM auditoria WHERE COALESCE(empresa,%s)=%s ORDER BY id", (DEFAULT_SUCURSAL, sucursal))
+            elif table == "stock_transferencias" and sucursal:
+                cur.execute("""
                     SELECT * FROM stock_transferencias
                     WHERE COALESCE(sucursal_origen,'')=%s OR COALESCE(sucursal_destino,'')=%s
                     ORDER BY id
-                    """, (sucursal, sucursal))
-                elif table == "inventario_conteo_scans":
-                    cur.execute("""
+                """, (sucursal, sucursal))
+            elif table == "inventario_conteo_scans" and sucursal:
+                cur.execute("""
                     SELECT s.*
                     FROM inventario_conteo_scans s
                     LEFT JOIN inventario_conteos c ON c.id=s.conteo_id
                     WHERE COALESCE(c.sucursal,%s)=%s
                     ORDER BY s.id
-                    """, (DEFAULT_SUCURSAL, sucursal))
-                elif table == "ventas_detalle":
-                    cur.execute("""
-                    SELECT vd.*
-                    FROM ventas_detalle vd
-                    LEFT JOIN ventas v ON v.id=vd.venta_id
-                    WHERE COALESCE(vd.sucursal,%s)=%s OR COALESCE(v.sucursal,%s)=%s
-                    ORDER BY vd.id
-                    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
-                else:
-                    cur.execute(f"SELECT * FROM {table} WHERE COALESCE(sucursal,%s)=%s ORDER BY 1", (DEFAULT_SUCURSAL, sucursal))
-                data["tablas"][table] = dict_fetchall(cur)
-            except Exception as table_error:
-                data["tablas"][table] = {"error": str(table_error)}
+                """, (DEFAULT_SUCURSAL, sucursal))
+            elif sucursal:
+                cur.execute(f"SELECT * FROM {table} WHERE COALESCE(sucursal,%s)=%s ORDER BY 1", (DEFAULT_SUCURSAL, sucursal))
+            else:
+                cur.execute(f"SELECT * FROM {table} ORDER BY 1")
+            rows = _backup_jsonable_rows(dict_fetchall(cur))
+            payload[table] = rows
+            stats[table] = len(rows)
+        except Exception as table_error:
+            payload[table] = {"error": str(table_error)}
+            stats[table] = -1
+    return payload, stats
+
+
+@app.get("/backup/stats")
+def backup_stats():
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        _, stats = _exportar_tablas_backup(cur, _BACKUP_TABLES_FULL, full=True)
         release_conn(conn)
-        return data
+        return {"ok": True, "success": True, "generado": lima_now().strftime("%Y-%m-%d %H:%M:%S"), "stats": stats}
+    except Exception as e:
+        release_conn(conn)
+        return {"ok": False, "msg": str(e)}
+
+
+@app.get("/backup/export-full")
+def exportar_backup_full():
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        tablas, stats = _exportar_tablas_backup(cur, _BACKUP_TABLES_FULL, full=True)
+        release_conn(conn)
+        return {
+            "ok": True,
+            "success": True,
+            "modo": "full",
+            "sucursal": "TODAS",
+            "generado": lima_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stats": stats,
+            "tablas": tablas,
+        }
+    except Exception as e:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": str(e)}
+
+
+@app.get("/backup/export")
+def exportar_backup(sucursal: str = DEFAULT_SUCURSAL, full: bool = False):
+    if full:
+        return exportar_backup_full()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        tablas, stats = _exportar_tablas_backup(cur, _BACKUP_TABLES_FULL, sucursal=sucursal, full=False)
+        release_conn(conn)
+        return {
+            "ok": True,
+            "success": True,
+            "sucursal": sucursal,
+            "generado": lima_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stats": stats,
+            "tablas": tablas,
+        }
     except Exception as e:
         release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
