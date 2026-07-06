@@ -187,8 +187,24 @@ def root():
 
 
 @app.get("/health")
-def health_check():
-    return {"ok": True, "status": "up", "ts": datetime.utcnow().isoformat() + "Z"}
+def health_check(db: bool = False):
+    out = {"ok": True, "status": "up", "ts": datetime.utcnow().isoformat() + "Z"}
+    if db:
+        conn = None
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            out["db"] = "ok"
+        except Exception as exc:
+            out["db"] = "error"
+            out["db_error"] = str(exc)[:240]
+            out["ok"] = False
+            out["status"] = "degraded"
+        finally:
+            release_conn(conn)
+    return out
 
 
 @app.get("/pc-fast")
@@ -609,8 +625,8 @@ def _init_db_pool():
     with _DB_POOL_LOCK:
         if _DB_POOL is not None:
             return _DB_POOL
-        min_conn = max(1, int(os.getenv("DB_POOL_MIN", "1") or "1"))
-        max_conn = max(min_conn, int(os.getenv("DB_POOL_MAX", "6") or "6"))
+        min_conn = max(1, int(os.getenv("DB_POOL_MIN", "2") or "2"))
+        max_conn = max(min_conn, int(os.getenv("DB_POOL_MAX", "12") or "12"))
         _DB_POOL = pg_pool.ThreadedConnectionPool(
             minconn=min_conn,
             maxconn=max_conn,
@@ -619,8 +635,37 @@ def _init_db_pool():
         return _DB_POOL
 
 
+def release_conn(conn):
+    if conn is None:
+        return
+    pool = _DB_POOL
+    try:
+        if pool is not None:
+            pool.putconn(conn)
+        else:
+            conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def get_conn():
-    return _init_db_pool().getconn()
+    last_err = None
+    for attempt in range(3):
+        try:
+            return _init_db_pool().getconn()
+        except pg_pool.PoolError as exc:
+            last_err = exc
+            import logging
+            logging.getLogger("uvicorn.error").warning(
+                "DB pool agotado, reintento %s/3", attempt + 1
+            )
+            time.sleep(0.2 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("No se pudo obtener conexion de base de datos")
 
 
 def close_db_pool():
@@ -1380,7 +1425,7 @@ def buscar_cliente_db(documento, sucursal=DEFAULT_SUCURSAL):
     LIMIT 1
     """, (DEFAULT_SUCURSAL, documento, DEFAULT_SUCURSAL, sucursal))
     row = dict_fetchone(cur)
-    conn.close()
+    release_conn(conn)
     if not row:
         return None
     row.update({"ok": True, "success": True, "found": True, "source": "clientes"})
@@ -1914,16 +1959,19 @@ def home():
 
 @app.get("/test-conn")
 def test_conn():
+    conn = None
     try:
         conn = get_conn()
-        conn.close()
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        release_conn(conn)
 
 
 def migrate_schema():
     """Crea tablas y columnas nuevas (idempotente). Se ejecuta al arranque y desde GET /init."""
+    conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -2381,12 +2429,17 @@ def migrate_schema():
             """)
 
         conn.commit()
-        conn.close()
-
         return {"ok": True, "msg": "Base completa lista"}
 
     except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return {"ok": False, "error": str(e)}
+    finally:
+        release_conn(conn)
 
 
 @app.get("/init")
@@ -2456,10 +2509,10 @@ def login(data: dict):
                 (DEFAULT_SUCURSAL, data["usuario"], data["clave"]))
     user = dict_fetchone(cur)
     if not user:
-        conn.close()
+        release_conn(conn)
         return {"ok": False}
     user["permisos"] = permisos_usuario(cur, user.get("id"), user.get("usuario"), user.get("rol"))
-    conn.close()
+    release_conn(conn)
     if str(user["usuario"]).strip().lower() != "giomar":
         user_branch = norm_sucursal(user.get("sucursal"))
         if user_branch != sucursal:
@@ -2486,7 +2539,7 @@ def listar_usuarios(sucursal: str = DEFAULT_SUCURSAL):
         ORDER BY usuario
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -2505,10 +2558,10 @@ def perfil_usuario(usuario: str = ""):
     """, (DEFAULT_SUCURSAL, usuario.strip()))
     data = dict_fetchone(cur)
     if not data:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "found": False}
     data["permisos"] = permisos_usuario(cur, data.get("id"), data.get("usuario"), data.get("rol"))
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "found": True, **data}
 
 
@@ -2539,7 +2592,7 @@ def obtener_ventas_borradores(usuario: str = "", sucursal: str = DEFAULT_SUCURSA
         WHERE lower(usuario)=lower(%s) AND sucursal=%s
     """, (usuario, sucursal))
     row = cur.fetchone()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": True, "found": False, "data": None}
     try:
@@ -2572,7 +2625,7 @@ def guardar_ventas_borradores(data: dict):
         DO UPDATE SET payload=EXCLUDED.payload, actualizado=CURRENT_TIMESTAMP
     """, (usuario, sucursal, json.dumps(payload, ensure_ascii=False)))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True}
 
 
@@ -2591,12 +2644,12 @@ def guardar_usuario(data: Usuario):
     if rol not in ("ADMIN", "VENTAS"):
         rol = "VENTAS"
     if not usuario:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Usuario obligatorio"}
     cur.execute("SELECT id FROM usuarios WHERE lower(usuario)=lower(%s)", (usuario,))
     existing = cur.fetchone()
     if not existing and not clave:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Usuario y clave son obligatorios"}
     if existing:
         cur.execute("""
@@ -2616,7 +2669,7 @@ def guardar_usuario(data: Usuario):
         """, (usuario, clave, rol, foto_url, fondo_url, sucursal, radio_enabled, color_tema))
     user_id = cur.fetchone()[0]
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "id": user_id}
 
 
@@ -2631,7 +2684,7 @@ def listar_sucursales():
         ORDER BY nombre
     """)
     data = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -2652,7 +2705,7 @@ def guardar_sucursal(data: dict):
     """, (codigo, nombre))
     seed_branch_series(cur, codigo)
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "codigo": codigo, "nombre": nombre}
 
 
@@ -2668,7 +2721,7 @@ def eliminar_sucursal(codigo: str, usuario: str = ""):
     cur.execute("UPDATE sucursales SET activa=FALSE WHERE codigo=%s RETURNING codigo", (codigo,))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Sucursal no encontrada."}
     return {"ok": True, "success": True, "codigo": codigo}
@@ -2689,7 +2742,7 @@ def obtener_permisos_sucursal(codigo: str):
     cur.execute("SELECT permisos FROM sucursal_permisos WHERE sucursal=%s", (codigo,))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     permisos = dict(DEFAULT_FEATURES)
     permisos["pagina_web"] = False
     if row and row[0]:
@@ -2733,7 +2786,7 @@ def guardar_permisos_sucursal(codigo: str, data: dict):
     DO UPDATE SET permisos=EXCLUDED.permisos, actualizado=CURRENT_TIMESTAMP
     """, (codigo, json.dumps(permisos, ensure_ascii=False)))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "sucursal": codigo, "permisos": permisos}
 
 
@@ -2750,7 +2803,7 @@ def actualizar_foto_usuario(usuario_id: int, data: dict):
     """, (foto_url, usuario_id))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True}
@@ -2769,7 +2822,7 @@ def actualizar_fondo_usuario_admin(usuario_id: int, data: UsuarioFondoUpdate):
     """, (fondo_url, usuario_id))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "fondo_url": fondo_url}
@@ -2782,10 +2835,10 @@ def cambiar_rol_usuario(usuario_id: int, data: UsuarioRolUpdate):
     cur.execute("SELECT usuario FROM usuarios WHERE id=%s", (usuario_id,))
     current = cur.fetchone()
     if not current:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Usuario no encontrado"}
     if str(current[0]).strip().lower() == "giomar":
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Giomar es control maestro y no se puede cambiar su rol"}
     rol = (data.rol or "VENTAS").upper()
     if rol not in ("ADMIN", "VENTAS"):
@@ -2797,7 +2850,7 @@ def cambiar_rol_usuario(usuario_id: int, data: UsuarioRolUpdate):
     """, (rol, usuario_id))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "rol": rol}
@@ -2814,7 +2867,7 @@ def cambiar_boquitoqui_usuario(usuario_id: int, data: UsuarioRadioUpdate):
     """, (bool(data.boquitoqui_enabled), usuario_id))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "boquitoqui_enabled": bool(data.boquitoqui_enabled)}
@@ -2832,7 +2885,7 @@ def cambiar_color_usuario_admin(usuario_id: int, data: UsuarioColorUpdate):
     """, (color, usuario_id))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "color_tema": color}
@@ -2853,7 +2906,7 @@ def cambiar_color_usuario(data: UsuarioColorUpdate):
     """, (color, usuario))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "color_tema": color}
@@ -2874,7 +2927,7 @@ def cambiar_fondo_usuario(data: UsuarioFondoUpdate):
     """, (fondo_url, usuario))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Usuario no encontrado"}
     return {"ok": True, "success": True, "id": row[0], "fondo_url": fondo_url}
@@ -2889,14 +2942,14 @@ def obtener_permisos_usuario(usuario_id: int):
         cur.execute("SELECT id, usuario, rol FROM usuarios WHERE id=%s", (usuario_id,))
         user = dict_fetchone(cur)
         if not user:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Usuario no encontrado."}
         permisos = permisos_usuario(cur, user.get("id"), user.get("usuario"), user.get("rol"))
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "usuario_id": usuario_id, "permisos": permisos}
     except Exception as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -2912,10 +2965,10 @@ def guardar_permisos_usuario(usuario_id: int, data: dict):
         cur.execute("SELECT id, usuario FROM usuarios WHERE id=%s", (usuario_id,))
         user = dict_fetchone(cur)
         if not user:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Usuario no encontrado."}
         if str(user.get("usuario") or "").strip().lower() == "giomar":
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Giomar maestro siempre tiene todos los permisos."}
         permisos = normalize_feature_permissions(data.get("permisos") or {})
         cur.execute("""
@@ -2925,11 +2978,11 @@ def guardar_permisos_usuario(usuario_id: int, data: dict):
         DO UPDATE SET permisos=EXCLUDED.permisos, actualizado=CURRENT_TIMESTAMP
         """, (usuario_id, json.dumps(permisos, ensure_ascii=False)))
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "usuario_id": usuario_id, "permisos": permisos}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -2959,7 +3012,7 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
     data = dict_fetchall(cur)
     for item in data:
         item["permisos"] = permisos_usuario(cur, item.get("id"), item.get("usuario"), item.get("rol"))
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "data": data}
 
 
@@ -2981,7 +3034,7 @@ def registrar_usuario_online(data: UsuarioOnlineHeartbeat):
                       ultima_actividad=CURRENT_TIMESTAMP
     """, (usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:80]))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True}
 
 
@@ -2992,14 +3045,14 @@ def eliminar_usuario(usuario_id: int):
     cur.execute("SELECT usuario FROM usuarios WHERE id=%s", (usuario_id,))
     row = cur.fetchone()
     if not row:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Usuario no encontrado"}
     if str(row[0]).strip().lower() == "giomar":
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "No se puede eliminar Giomar"}
     cur.execute("DELETE FROM usuarios WHERE id=%s", (usuario_id,))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True}
 
 
@@ -3097,7 +3150,7 @@ def enviar_boquitoqui_live(data: BoquitoquiMensaje):
             LIMIT 50
         """, (usuario, sucursal, sucursal))
         recipients = [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
-        conn.close()
+        release_conn(conn)
     if not recipients:
         return {"ok": False, "success": False, "msg": "No hay usuario receptor."}
 
@@ -3154,7 +3207,7 @@ def registrar_auditoria(data: dict):
     ))
     audit_id = cur.fetchone()[0]
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "id": audit_id}
 
 
@@ -3194,7 +3247,7 @@ def listar_auditoria(q: str = "", limit: int = 1000):
     """, (texto, texto, texto, texto, texto, texto, limit))
     data = dict_fetchall(cur)
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -3224,7 +3277,7 @@ def guardar_config_documento(data: dict):
     DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
     """, (clave, json.dumps(data, ensure_ascii=False)))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True}
 
 
@@ -3312,7 +3365,7 @@ def cargar_config_documento_dict(sucursal=DEFAULT_SUCURSAL):
         cur.execute("SELECT valor FROM app_config WHERE clave=%s", ("documento",))
         row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if row and row[0]:
         try:
             saved = json.loads(row[0])
@@ -3752,7 +3805,7 @@ def crear_cliente(data: Cliente):
     cliente_id = cur.fetchone()[0]
 
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
     return {"ok": True, "id": cliente_id}
 
@@ -3772,7 +3825,7 @@ def listar_clientes(sucursal: str = DEFAULT_SUCURSAL):
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
 
-    conn.close()
+    release_conn(conn)
 
     return data
 
@@ -3825,7 +3878,7 @@ def listar_servicios_tecnicos(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
         """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto, texto))
         return dict_fetchall(cur)
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/servicios-tecnicos")
@@ -3866,11 +3919,11 @@ def guardar_servicio_tecnico(data: ServicioTecnico):
         ))
         row = cur.fetchone()
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": row[0], "fecha": row[1]}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -3892,10 +3945,10 @@ def crear_reserva(data: ReservaCliente):
         row = cur.fetchone()
         producto_nombre = row[0] if row else ""
     if not documento:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": "Ingresa DNI/RUC del cliente para controlar la reserva."}
     if not producto_nombre:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": "Selecciona o escribe el producto reservado."}
     cantidad = max(1, int(data.cantidad or 1))
     monto_total = round(float(data.monto_total or 0), 2)
@@ -3907,7 +3960,7 @@ def crear_reserva(data: ReservaCliente):
     try:
         comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data)
     except ValueError as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
     cur.execute("""
     INSERT INTO reservas_clientes (
@@ -3932,7 +3985,7 @@ def crear_reserva(data: ReservaCliente):
     ))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "id": row[0], "fecha": row[1], "saldo": saldo}
 
 
@@ -3996,7 +4049,7 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
             LIMIT 100
         """, (documento_digits, DEFAULT_SUCURSAL, sucursal))
         documentos = [_jsonable_row(row) for row in dict_fetchall(cur)]
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "data": reservas, "reservas": reservas, "documentos": documentos}
 
 
@@ -4031,7 +4084,7 @@ def detalle_reserva(reserva_id: int, sucursal: str = DEFAULT_SUCURSAL):
         LIMIT 1
     """, (reserva_id, DEFAULT_SUCURSAL, sucursal))
     row = dict_fetchone(cur)
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "success": False, "msg": "Reserva no encontrada."}
     row = _jsonable_row(row)
@@ -4073,7 +4126,7 @@ def actualizar_reserva(reserva_id: int, data: dict):
     """, (reserva_id, DEFAULT_SUCURSAL, sucursal))
     row = cur.fetchone()
     if not row:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": "Reserva no encontrada."}
     total = round(float(monto_total if monto_total not in (None, "") else row[0] or 0), 2)
     reservado = round(float(monto_reserva if monto_reserva not in (None, "") else row[1] or 0), 2)
@@ -4081,7 +4134,7 @@ def actualizar_reserva(reserva_id: int, data: dict):
     try:
         comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data, row[2] or "")
     except ValueError as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
     cur.execute("""
         UPDATE reservas_clientes
@@ -4120,7 +4173,7 @@ def actualizar_reserva(reserva_id: int, data: dict):
         reserva_id, DEFAULT_SUCURSAL, sucursal
     ))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "id": reserva_id, "saldo": saldo, "estado": estado}
 
 
@@ -4283,7 +4336,7 @@ def crear_producto(data: Producto):
     producto_id = cur.fetchone()[0]
 
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
     invalidate_productos_cache(sucursal)
     woo_sync = None
@@ -4344,7 +4397,7 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL, lite: bool = True):
     ORDER BY p.nombre
     """, (DEFAULT_SUCURSAL, sucursal, sucursal_real, DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = [_jsonable_row(row) for row in dict_fetchall(cur)]
-    conn.close()
+    release_conn(conn)
     if lite:
         for row in data:
             row["imagen_url"] = _producto_imagen_lista(
@@ -4385,10 +4438,10 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         ))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Producto no encontrado"}
         conn.commit()
-        conn.close()
+        release_conn(conn)
         woo_sync = None
         if bool(data.sync_to_woo):
             woo_sync = maybe_sync_updated_product_to_woo(producto_id, sucursal=sucursal)
@@ -4404,7 +4457,7 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         return {"ok": True, "success": True, "id": row[0], "woo_sync": woo_sync}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -4425,7 +4478,7 @@ def actualizar_precio_venta_producto(producto_id: int, data: ProductoPrecioVenta
         """, (precio, producto_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Producto no encontrado."}
         usuario = str(data.usuario or "giomar").strip() or "giomar"
         cur.execute("""
@@ -4454,7 +4507,7 @@ def actualizar_precio_venta_producto(producto_id: int, data: ProductoPrecioVenta
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.get("/public/producto/{producto_id}/imagen")
@@ -4469,7 +4522,7 @@ def servir_imagen_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     row = dict_fetchone(cur)
-    conn.close()
+    release_conn(conn)
     if not row:
         return Response("Imagen no encontrada", status_code=404, media_type="text/plain")
     imagen_url = str(row.get("imagen_url") or "").strip()
@@ -4493,15 +4546,15 @@ def eliminar_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         cur.execute("DELETE FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (producto_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Producto no encontrado"}
         conn.commit()
-        conn.close()
+        release_conn(conn)
         invalidate_productos_cache(sucursal)
         return {"ok": True, "success": True, "id": row[0]}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -4526,7 +4579,7 @@ def listar_productos_duplicados(sucursal: str = DEFAULT_SUCURSAL):
         ORDER BY p.id
     """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
     rows = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
 
     groups = []
     seen_group_keys = set()
@@ -4628,7 +4681,7 @@ def vincular_producto_web_directo(data: dict):
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     producto = dict_fetchone(cur)
     if not producto:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Producto ERP no encontrado."}
     cur.execute("""
         UPDATE productos
@@ -4645,7 +4698,7 @@ def vincular_producto_web_directo(data: dict):
               AND COALESCE(imagen_url,'')=''
         """, (imagen_web, producto_id, DEFAULT_SUCURSAL, sucursal))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {
         "ok": True,
         "success": True,
@@ -4675,16 +4728,16 @@ def vincular_producto_por_sku(data: dict):
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     producto = dict_fetchone(cur)
     if not producto:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Producto ERP no encontrado."}
     sku = str(data.get("sku_woo") or data.get("sku") or producto.get("sku_woo") or "").strip().upper()
     if not sku:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Asigna un SKU web al producto antes de vincular."}
 
     web = _woo_product_summary_by_sku(sku, sucursal=sucursal)
     if not web.get("ok"):
-        conn.close()
+        release_conn(conn)
         return web
 
     cur.execute("""
@@ -4706,7 +4759,7 @@ def vincular_producto_por_sku(data: dict):
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (sku, int(web.get("woo_id") or 0), nombre_web, nombre_web, producto_id, DEFAULT_SUCURSAL, sucursal))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
     msg = f"Producto ERP #{producto_id} vinculado al SKU {sku} (web: {nombre_web or web.get('nombre_web')}). Nombre interno se mantiene: {producto.get('nombre')}."
     if otros:
@@ -4747,7 +4800,7 @@ def fusionar_productos_duplicados(data: dict):
         keeper = _producto_row_summary(cur, keeper_id, sucursal)
         duplicate = _producto_row_summary(cur, duplicate_id, sucursal)
         if not keeper or not duplicate:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Producto principal o duplicado no encontrado."}
 
         cur.execute("""
@@ -4847,11 +4900,11 @@ def fusionar_productos_duplicados(data: dict):
         deleted = cur.fetchone()
         if not deleted:
             conn.rollback()
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "No se pudo eliminar el producto duplicado."}
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -4864,7 +4917,7 @@ def fusionar_productos_duplicados(data: dict):
         }
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -4898,7 +4951,7 @@ def limpiar_duplicados_web(data: dict = None):
         ORDER BY p.id
     """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
     erp_rows = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
 
     acciones = []
     vinculados = 0
@@ -4994,10 +5047,10 @@ def limpiar_duplicados_web(data: dict = None):
             vinculados += 1
         except Exception as e:
             conn.rollback()
-            conn.close()
+            release_conn(conn)
             link_action["error_vinculo"] = str(e)
             continue
-        conn.close()
+        release_conn(conn)
 
         for dup in duplicates:
             dup_id = int(dup.get("id") or 0)
@@ -5072,7 +5125,7 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
     ORDER BY ps.id DESC
     """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, serie_norm, serie_norm, texto, texto, texto, texto, texto, texto))
     data = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -5110,7 +5163,7 @@ def listar_series_duplicadas(sucursal: str = DEFAULT_SUCURSAL):
         """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
         return dict_fetchall(cur)
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/series")
@@ -5125,13 +5178,13 @@ def guardar_serie_producto(data: SerieProducto):
         series = split_series_text(data.serie)
         almacen = (data.almacen or "TIENDA").strip().upper()
         if not series:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
         cur.execute("SELECT stock, nombre FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
         producto = cur.fetchone()
         if not producto:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Producto no encontrado"}
         prod_nombre = producto[1] or f"ID {data.producto_id}"
 
@@ -5215,7 +5268,7 @@ def guardar_serie_producto(data: SerieProducto):
             ),
         )
 
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": serie_ids[0], "ids": serie_ids, "series_guardadas": series}
     except Exception as e:
         try:
@@ -5223,7 +5276,7 @@ def guardar_serie_producto(data: SerieProducto):
         except Exception:
             pass
         try:
-            conn.close()
+            release_conn(conn)
         except Exception:
             pass
         return {"ok": False, "msg": str(e)}
@@ -5241,7 +5294,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         series = split_series_text(data.serie)
         almacen = (data.almacen or "TIENDA").strip().upper()
         if not series:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "La serie no puede estar vacia"}
 
         cur.execute("""
@@ -5257,13 +5310,13 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         """, (DEFAULT_SUCURSAL, sucursal, serie_id, DEFAULT_SUCURSAL, sucursal))
         old_row = dict_fetchone(cur)
         if not old_row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Serie no encontrada"}
         producto_anterior = old_row.get("producto_id")
 
         cur.execute("SELECT id FROM productos WHERE id=%s AND COALESCE(sucursal,%s)=%s", (data.producto_id, DEFAULT_SUCURSAL, sucursal))
         if not cur.fetchone():
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Producto no encontrado"}
 
         cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
@@ -5284,7 +5337,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         """, (DEFAULT_SUCURSAL, sucursal, serie, DEFAULT_SUCURSAL, sucursal, serie_id, data.producto_id))
         duplicada = dict_fetchone(cur)
         if duplicada:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": f"La serie {serie} ya existe en este producto.", "duplicada": duplicada}
         cur.execute("""
         UPDATE producto_series
@@ -5307,7 +5360,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         ))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Serie no encontrada"}
 
         estado_serie = (data.estado or "").upper()
@@ -5346,7 +5399,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
             ),
         )
 
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": serie_id, "series_guardadas": [serie]}
     except Exception as e:
         try:
@@ -5354,7 +5407,7 @@ def actualizar_serie_producto(serie_id: int, data: SerieProducto, sucursal: str 
         except Exception:
             pass
         try:
-            conn.close()
+            release_conn(conn)
         except Exception:
             pass
         return {"ok": False, "msg": str(e)}
@@ -5381,7 +5434,7 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL, usu
         """, (DEFAULT_SUCURSAL, sucursal, serie_id, DEFAULT_SUCURSAL, sucursal))
         old_row = dict_fetchone(cur)
         if not old_row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Serie no encontrada"}
         producto_id = old_row.get("producto_id")
         cur.execute("""
@@ -5408,7 +5461,7 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL, usu
                 f"Producto={old_row.get('producto_nombre') or producto_id} (ID {producto_id})"
             ),
         )
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": serie_id}
     except Exception as e:
         try:
@@ -5416,7 +5469,7 @@ def eliminar_serie_producto(serie_id: int, sucursal: str = DEFAULT_SUCURSAL, usu
         except Exception:
             pass
         try:
-            conn.close()
+            release_conn(conn)
         except Exception:
             pass
         return {"ok": False, "msg": str(e)}
@@ -5505,7 +5558,7 @@ def crear_inventario_conteo(data: InventarioConteoCreate):
         sucursal = norm_sucursal(data.sucursal)
         categoria = (data.categoria or "").strip()
         if not categoria or categoria.upper() == "TODAS":
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Selecciona una categoria para comenzar inventario."}
         cur.execute("""
         INSERT INTO inventario_conteos (categoria, usuario, sucursal, estado)
@@ -5515,11 +5568,11 @@ def crear_inventario_conteo(data: InventarioConteoCreate):
         conteo_id = cur.fetchone()[0]
         conn.commit()
         result = resumen_inventario_conteo(cur, conteo_id, sucursal)
-        conn.close()
+        release_conn(conn)
         return result
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -5530,10 +5583,10 @@ def obtener_inventario_conteo(conteo_id: int, sucursal: str = DEFAULT_SUCURSAL):
     try:
         sucursal = norm_sucursal(sucursal)
         result = resumen_inventario_conteo(cur, conteo_id, sucursal)
-        conn.close()
+        release_conn(conn)
         return result or {"ok": False, "success": False, "msg": "Conteo no encontrado"}
     except Exception as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -5545,7 +5598,7 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
         sucursal = norm_sucursal(sucursal)
         serie = normalize_serie_key(data.serie)
         if not serie:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Escanea o ingresa una serie."}
         cur.execute("""
         SELECT id, categoria, estado
@@ -5554,10 +5607,10 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
         """, (conteo_id, DEFAULT_SUCURSAL, sucursal))
         conteo = dict_fetchone(cur)
         if not conteo:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Conteo no encontrado."}
         if str(conteo.get("estado") or "").upper() != "ABIERTO":
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Este inventario ya esta cerrado."}
         cur.execute("""
         SELECT id FROM inventario_conteo_scans
@@ -5565,7 +5618,7 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
         LIMIT 1
         """, (conteo_id, serie))
         if cur.fetchone():
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "estado": "DUPLICADA", "msg": f"Serie {serie} ya fue contada."}
         cur.execute("""
         SELECT ps.producto_id, COALESCE(p.nombre,'') AS producto_nombre,
@@ -5607,11 +5660,11 @@ def escanear_inventario_conteo(conteo_id: int, data: InventarioConteoScan, sucur
             },
             "msg": "Serie contada." if estado_scan == "OK" else f"Revisar serie {serie}: {estado_scan}",
         })
-        conn.close()
+        release_conn(conn)
         return result
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -5628,15 +5681,15 @@ def cerrar_inventario_conteo(conteo_id: int, sucursal: str = DEFAULT_SUCURSAL):
         RETURNING id
         """, (conteo_id, DEFAULT_SUCURSAL, sucursal))
         if not cur.fetchone():
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Conteo no encontrado."}
         conn.commit()
         result = resumen_inventario_conteo(cur, conteo_id, sucursal)
-        conn.close()
+        release_conn(conn)
         return result
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -5650,14 +5703,14 @@ def ajustar_stock(producto_id: int, data: StockAjuste, sucursal: str = DEFAULT_S
         cur.execute("UPDATE productos SET stock=%s WHERE id=%s AND COALESCE(sucursal,%s)=%s RETURNING id", (nuevo_stock, producto_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Producto no encontrado"}
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": producto_id, "stock": nuevo_stock}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -5703,11 +5756,11 @@ def mover_series_almacen(data: SeriesMoverAlmacen, sucursal: str = DEFAULT_SUCUR
                 f"Series={series_txt}"
             ),
         )
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "actualizadas": len(rows), "almacen": almacen}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -5725,7 +5778,7 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         """, (producto_id, DEFAULT_SUCURSAL, sucursal))
         producto = cur.fetchone()
         if not producto:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "data": [], "msg": "Producto no encontrado"}
 
         _, nombre, categoria, marca, modelo = producto
@@ -5859,7 +5912,7 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
             })
 
         movimientos.sort(key=lambda x: str(x.get("fecha") or ""), reverse=True)
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -5874,7 +5927,7 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
             "movimientos": movimientos[:120],
         }
     except Exception as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "data": [], "msg": str(e)}
 
 
@@ -5941,10 +5994,10 @@ def exportar_backup(sucursal: str = DEFAULT_SUCURSAL):
                 data["tablas"][table] = dict_fetchall(cur)
             except Exception as table_error:
                 data["tablas"][table] = {"error": str(table_error)}
-        conn.close()
+        release_conn(conn)
         return data
     except Exception as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -5962,7 +6015,7 @@ def get_serie(tipo: str, sucursal: str = DEFAULT_SUCURSAL):
     """, (tipo, DEFAULT_SUCURSAL, sucursal))
     row = cur.fetchone()
 
-    conn.close()
+    release_conn(conn)
 
     if not row:
         return {"numero": "000001"}
@@ -6008,7 +6061,7 @@ def reset_series_documentos(data: SeriesDocumentoReset = None, sucursal: str = D
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 # ================= VENTAS / DOCUMENTOS =================
@@ -6027,7 +6080,7 @@ def crear_venta(data: Venta):
         modo_prueba = bool(getattr(data, "modo_prueba", False))
         row, serie_error = _resolver_fila_serie_documento(cur, doc_tipo_upper, sucursal, legal_sunat)
         if serie_error or not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": serie_error or f"No existe serie para {data.tipo}"}
 
         serie_id, serie, corr = row
@@ -6073,14 +6126,14 @@ def crear_venta(data: Venta):
                     error_prueba = procesar_modo_prueba_venta(cur, producto_id, item.cantidad, series_texto, sucursal)
                     if error_prueba:
                         conn.rollback()
-                        conn.close()
+                        release_conn(conn)
                         return {"ok": False, "success": False, "msg": error_prueba}
                     continue
                 if is_test_product_name(descripcion, marca, modelo) or ((not producto_id) and series_texto):
                     error_combo = procesar_combo_generico_venta(cur, descripcion, series_texto, sucursal)
                     if error_combo:
                         conn.rollback()
-                        conn.close()
+                        release_conn(conn)
                         return {"ok": False, "success": False, "msg": error_combo}
                     continue
                 producto_id, error_resolver = resolver_producto_por_series_venta(
@@ -6093,7 +6146,7 @@ def crear_venta(data: Venta):
                 )
                 if error_resolver:
                     conn.rollback()
-                    conn.close()
+                    release_conn(conn)
                     return {"ok": False, "success": False, "msg": error_resolver}
                 resolved_product_ids[item_index] = producto_id
                 error_series = validar_y_marcar_series_venta(
@@ -6108,7 +6161,7 @@ def crear_venta(data: Venta):
                 )
                 if error_series:
                     conn.rollback()
-                    conn.close()
+                    release_conn(conn)
                     return {"ok": False, "success": False, "msg": error_series}
 
         sunat_estado_doc, sunat_modo_doc = ("INTERNO", "NO_ENVIAR")
@@ -6200,7 +6253,7 @@ def crear_venta(data: Venta):
                 """, (f"\nConvertida a {data.tipo} {numero}", proforma_origen_id))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         invalidate_productos_cache(sucursal)
 
         sunat_auto = None
@@ -6231,7 +6284,7 @@ def crear_venta(data: Venta):
         }
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -6251,10 +6304,10 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
             doc_tipo = "BOLETA"
         series = split_series_text(data.series_texto)
         if not series:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Ingresa una o mas series para descontar stock."}
         if len(series) != len(set(series)):
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Hay series repetidas en la boleta manual."}
 
         numero = (data.numero or "").strip().upper()
@@ -6289,7 +6342,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         faltantes = [serie for serie in series if serie not in found]
         bloqueadas = [f"{serie} ({found[serie].get('estado')})" for serie in series if serie in found and found[serie].get("estado") not in ("DISPONIBLE", "RESERVADO")]
         if bloqueadas:
-            conn.close()
+            release_conn(conn)
             msg = []
             if bloqueadas:
                 msg.append("Series no disponibles: " + ", ".join(bloqueadas))
@@ -6365,7 +6418,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
             ))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -6378,7 +6431,7 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
         }
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -6412,10 +6465,10 @@ def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpda
         """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
         doc = dict_fetchone(cur)
         if not doc:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Proforma no encontrada."}
         if str(doc.get("tipo") or "").upper() != "PROFORMA":
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Solo se puede convertir una PROFORMA."}
 
         cur.execute("""
@@ -6433,7 +6486,7 @@ def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpda
         ORDER BY vd.id
         """, (documento_id,))
         rows = dict_fetchall(cur)
-        conn.close()
+        release_conn(conn)
         if not rows:
             return {"ok": False, "success": False, "msg": "La proforma no tiene productos."}
 
@@ -6494,7 +6547,7 @@ def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpda
         return {"ok": True, "success": True, "msg": f"Proforma convertida a {target_tipo} {res.get('numero')}", "documento_origen_id": documento_id, "documento_nuevo": res}
     except Exception as e:
         try:
-            conn.close()
+            release_conn(conn)
         except Exception:
             pass
         return {"ok": False, "success": False, "msg": str(e)}
@@ -6605,7 +6658,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
     finally:
         if conn is not None:
             try:
-                conn.close()
+                release_conn(conn)
             except Exception:
                 pass
 
@@ -6645,7 +6698,7 @@ def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
     finally:
         if conn is not None:
             try:
-                conn.close()
+                release_conn(conn)
             except Exception:
                 pass
 
@@ -6801,18 +6854,18 @@ def actualizar_observacion_interna_documento(documento_id: int, data: DocumentoO
         """, (observacion, documento_id, DEFAULT_SUCURSAL, sucursal))
         row = dict_fetchone(cur)
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Documento no encontrado"}
         cur.execute("""
         INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
         VALUES (%s,%s,%s,%s,%s)
         """, (data.usuario or "", "", sucursal, "OBSERVACION INTERNA DOCUMENTO", f"{row.get('tipo')} {row.get('numero')} - {observacion}"))
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, **row}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -6898,7 +6951,7 @@ def detalle_documento(documento_id: int):
     finally:
         if conn is not None:
             try:
-                conn.close()
+                release_conn(conn)
             except Exception:
                 pass
 
@@ -6918,17 +6971,17 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
         doc = cur.fetchone()
         if not doc:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Documento no encontrado"}
         tipo_actual, numero_actual, sucursal_doc, estado_actual = doc
         sucursal_inventario_doc = inventario_sucursal(sucursal_doc)
         tipo_doc_upper = str(tipo_actual or "").upper()
         if str(estado_actual or "").upper() == "ANULADO":
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "No se puede editar un documento anulado."}
         es_proforma_doc = tipo_doc_upper == "PROFORMA"
         if not es_proforma_doc and not usuario_puede_editar_documento(data):
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Solo Giomar puede cambiar boletas/facturas ya procesadas."}
 
         motivo_cambio = str(data.get("observacion_cambio") or data.get("motivo_cambio") or "").strip()
@@ -6936,7 +6989,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             if es_proforma_doc:
                 motivo_cambio = "Actualizacion de cotizacion"
             else:
-                conn.close()
+                release_conn(conn)
                 return {"ok": False, "success": False, "msg": "Debes indicar la observacion del cambio antes de guardar."}
 
         cur.execute("""
@@ -6958,7 +7011,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
 
         items = data.get("items") or data.get("detalle") or []
         if not isinstance(items, list) or not items:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "El documento debe tener productos"}
 
         total = round(sum(float((i or {}).get("total") or 0) for i in items), 2)
@@ -7012,7 +7065,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                     )
                     if error_combo:
                         conn.rollback()
-                        conn.close()
+                        release_conn(conn)
                         return {"ok": False, "success": False, "msg": error_combo}
                     combo_procesado = True
                 if not combo_procesado:
@@ -7021,7 +7074,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                     )
                     if error_resolver:
                         conn.rollback()
-                        conn.close()
+                        release_conn(conn)
                         return {"ok": False, "success": False, "msg": error_resolver}
                     error_series = validar_y_marcar_series_venta(
                         cur, producto_id, descripcion, marca, modelo, cantidad, series_texto, sucursal_doc,
@@ -7029,7 +7082,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
                     )
                     if error_series:
                         conn.rollback()
-                        conn.close()
+                        release_conn(conn)
                         return {"ok": False, "success": False, "msg": error_series}
             prepared_items.append({
                 "producto_id": producto_id,
@@ -7084,7 +7137,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
             sucursal,
         ))
         if not cur.fetchone():
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "No se pudo actualizar el documento"}
 
         cur.execute("DELETE FROM ventas_detalle WHERE venta_id=%s", (documento_id,))
@@ -7110,7 +7163,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         """, (usuario_edit, "", sucursal_doc, "DOCUMENTO ACTUALIZADO", detalle_audit))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -7127,7 +7180,7 @@ def actualizar_documento(documento_id: int, data: dict, sucursal: str = DEFAULT_
         }
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": f"Error interno al editar documento: {e}"}
 
 
@@ -7143,7 +7196,7 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
     try:
         sucursal = norm_sucursal(sucursal)
         if not usuario_puede_editar_documento({"usuario": getattr(data, "usuario", "")}):
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Solo Giomar puede cambiar series de boletas ya procesadas."}
         series_texto = (data.series_texto or "").strip()
         cur.execute("""
@@ -7154,7 +7207,7 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
         """, (series_texto, detalle_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Detalle no encontrado"}
 
         _, venta_id, producto_id = row
@@ -7179,11 +7232,11 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
         """, (data.usuario or "", "", sucursal, "SERIES DOCUMENTO ACTUALIZADAS", f"{doc_ref} - {series_texto}"))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": detalle_id, "series_texto": series_texto}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -7244,11 +7297,11 @@ def anular_documento(documento_id: int, data: dict = None, sucursal: str = DEFAU
         """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
         venta = cur.fetchone()
         if not venta:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": "Documento no encontrado"}
         tipo, numero, estado, sucursal = venta
         if str(estado or "").upper() == "ANULADO":
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": f"{tipo} {numero} ya esta anulado."}
 
         restaurar_stock_documento(cur, documento_id, tipo, sucursal)
@@ -7269,11 +7322,11 @@ def anular_documento(documento_id: int, data: dict = None, sucursal: str = DEFAU
         VALUES (%s,'',%s,'DOCUMENTO ANULADO',%s)
         """, (usuario, sucursal, f"{tipo} {numero} - {motivo}"))
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero, "msg": f"{tipo} {numero} anulado. Stock restaurado."}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
 
 
@@ -7286,7 +7339,7 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         cur.execute("SELECT tipo, numero, COALESCE(sucursal,%s) FROM ventas WHERE id=%s AND COALESCE(sucursal,%s)=%s", (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
         venta = cur.fetchone()
         if not venta:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Documento no encontrado"}
 
         tipo, numero, sucursal = venta
@@ -7301,11 +7354,11 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         cur.execute("DELETE FROM ventas WHERE id=%s", (documento_id,))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -7321,10 +7374,10 @@ def transferir_stock(data: StockTransferencia):
         destino = inventario_sucursal(destino_real)
         cantidad = int(data.cantidad or 0)
         if cantidad <= 0:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "La cantidad debe ser mayor a 0"}
         if origen == destino:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "La sucursal origen y destino usan el mismo inventario fisico."}
 
         cur.execute("""
@@ -7338,10 +7391,10 @@ def transferir_stock(data: StockTransferencia):
         """, (data.producto_id, DEFAULT_SUCURSAL, origen))
         producto = dict_fetchone(cur)
         if not producto:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Producto no encontrado en sucursal origen"}
         if int(producto.get("stock") or 0) < cantidad:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Stock insuficiente en sucursal origen"}
 
         cur.execute("""
@@ -7418,7 +7471,7 @@ def transferir_stock(data: StockTransferencia):
         ))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -7428,7 +7481,7 @@ def transferir_stock(data: StockTransferencia):
         }
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -7496,7 +7549,7 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
         ))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Documento no encontrado"}
 
         (
@@ -7526,7 +7579,7 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             ))
 
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -7548,11 +7601,11 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
         }
     except ValueError as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -7581,10 +7634,10 @@ def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal
         """, (estado, modo, estado, documento_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": "Documento no encontrado o no es boleta/factura"}
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -7597,7 +7650,7 @@ def actualizar_estado_sunat(documento_id: int, data: EstadoSunatUpdate, sucursal
         }
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -8181,7 +8234,7 @@ def diagnostico_sunat(sucursal: str = DEFAULT_SUCURSAL):
             "listo_emitir": bool(public.get("listo_envio") and public.get("firma_configurada")),
         }
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.get("/sunat/verificar")
@@ -8216,7 +8269,7 @@ def verificar_instalacion_sunat(sucursal: str = DEFAULT_SUCURSAL):
             "bloqueo_emision": None if public.get("emision_habilitada") else "Emision bloqueada en servidor hasta activar SUNAT_EMISION_HABILITADA.",
         }
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/sunat/probar-credenciales")
@@ -8256,7 +8309,7 @@ def probar_credenciales_sunat(documento_id: int, sucursal: str = DEFAULT_SUCURSA
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.get("/sunat/config")
@@ -8270,7 +8323,7 @@ def obtener_sunat_config(sucursal: str = DEFAULT_SUCURSAL):
         public["aviso_api_secret"] = PLATAFORM_API_SECRET_AVISO
         return {"ok": True, "success": True, "sucursal": sucursal, "data": public}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/sunat/config")
@@ -8321,7 +8374,7 @@ def guardar_sunat_config(data: SunatConfigUpdate, sucursal: str = DEFAULT_SUCURS
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/sunat/plataform/registrar")
@@ -8528,7 +8581,7 @@ def registrar_empresa_plataform_sunat(data: SunatPlataformRegistro = None, sucur
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/sunat/marcar-historicos-internos")
@@ -8564,7 +8617,7 @@ def marcar_historicos_internos_sunat(sucursal: str = DEFAULT_SUCURSAL):
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.post("/sunat/documentos/{documento_id}/xml")
@@ -8593,7 +8646,7 @@ def generar_sunat_xml(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.get("/sunat/documentos/{documento_id}/xml")
@@ -8615,7 +8668,7 @@ def descargar_sunat_xml(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.get("/sunat/documentos/{documento_id}/zip")
@@ -8643,7 +8696,7 @@ def descargar_sunat_zip(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def _sunat_enviar_via_plataform(cur, documento_id, doc, detalle, cfg, sucursal):
@@ -8785,7 +8838,7 @@ def enviar_documento_sunat(documento_id: int, data: SunatEnviarRequest = None, s
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def _sunat_auto_send_document(documento_id, sucursal):
@@ -8803,7 +8856,7 @@ def _sunat_auto_send_document(documento_id, sucursal):
             return {"ok": True, "auto": False, "msg": "Envio automatico SUNAT desactivado."}
     finally:
         try:
-            conn.close()
+            release_conn(conn)
         except Exception:
             pass
     return enviar_documento_sunat(
@@ -8850,7 +8903,7 @@ def estado_documento_sunat(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
             "respuesta": respuesta,
         }
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.get("/caja")
@@ -8871,7 +8924,7 @@ def listar_caja(sucursal: str = DEFAULT_SUCURSAL):
     ORDER BY id DESC
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -8896,7 +8949,7 @@ def registrar_caja(data: CajaMovimiento):
     ))
     movimiento_id = cur.fetchone()[0]
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "id": movimiento_id}
 
 
@@ -8915,7 +8968,7 @@ def listar_proveedores(sucursal: str = DEFAULT_SUCURSAL):
     ORDER BY nombre ASC, id DESC
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = [_jsonable_row(r) for r in dict_fetchall(cur)]
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -8954,7 +9007,7 @@ def listar_series_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         ps.id DESC
     """, (DEFAULT_SUCURSAL, sucursal, producto_id, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -8965,7 +9018,7 @@ def guardar_proveedor(data: Proveedor):
     sucursal = norm_sucursal(data.sucursal)
     nombre = (data.nombre or "").strip()
     if not nombre:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Proveedor requerido"}
     cur.execute("""
     INSERT INTO proveedores (nombre, ruc, telefono, direccion, sucursal)
@@ -8974,7 +9027,7 @@ def guardar_proveedor(data: Proveedor):
     """, (nombre, data.ruc or "", data.telefono or "", data.direccion or "", sucursal))
     proveedor_id = cur.fetchone()[0]
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "id": proveedor_id}
 
 
@@ -9017,7 +9070,7 @@ def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
             for it in items
         )
         data.append(item)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -9037,7 +9090,7 @@ def obtener_compra(compra_id: int, sucursal: str = DEFAULT_SUCURSAL):
     LIMIT 1
     """, (DEFAULT_SUCURSAL, compra_id, DEFAULT_SUCURSAL, sucursal))
     row = dict_fetchone(cur)
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Compra no encontrada"}
     compra = _jsonable_row(row)
@@ -9207,7 +9260,7 @@ def guardar_compra(data: Compra):
         conn.rollback()
         return {"ok": False, "msg": f"Error al guardar compra: {exc}"}
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 # ================= WOOCOMMERCE POR SUCURSAL =================
@@ -9225,7 +9278,7 @@ def web_config_for_sucursal(sucursal: str = DEFAULT_SUCURSAL):
     cur.execute("SELECT valor FROM app_config WHERE clave=%s", (f"web:{sucursal}",))
     row = cur.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row or not row[0]:
         return {}
     try:
@@ -9268,7 +9321,7 @@ def save_web_config_for_sucursal(sucursal: str, data: dict):
     DO UPDATE SET valor=EXCLUDED.valor, actualizado=CURRENT_TIMESTAMP
     """, (f"web:{sucursal}", json.dumps(clean, ensure_ascii=False)))
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return clean
 
 
@@ -9454,7 +9507,7 @@ def woo_save_product_link(producto_id, woo_data: dict, sku: str, sucursal: str =
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (woo_id, woo_id, sku, sku, producto_id, DEFAULT_SUCURSAL, norm_sucursal(sucursal)))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def woo_category_for_name(name: str, sucursal: str = DEFAULT_SUCURSAL, parent_id: int = 0, create: bool = False):
@@ -9648,7 +9701,7 @@ def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCU
     conn = get_conn()
     cur = conn.cursor()
     p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
-    conn.close()
+    release_conn(conn)
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
     r = woo_upsert_erp_product(p, sucursal=sucursal)
@@ -9672,7 +9725,7 @@ def maybe_sync_updated_product_to_woo(producto_id: int, sucursal: str = DEFAULT_
     conn = get_conn()
     cur = conn.cursor()
     p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
-    conn.close()
+    release_conn(conn)
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
     r = woo_upsert_erp_product(p, sucursal=sucursal)
@@ -9756,7 +9809,7 @@ def woo_apply_web_categories_to_erp(sucursal: str = DEFAULT_SUCURSAL, limit: int
         ))
         updated += 1
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {
         "ok": True,
         "success": True,
@@ -9973,7 +10026,7 @@ def compuvision_import_product(product_id: str, data: dict = None, sucursal: str
         producto_id = cur.fetchone()[0]
         action = "importado"
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "msg": f"Producto {action} desde CompuVision: {p.get('nombre')}", "id": producto_id, "action": action, "producto": p}
 
 
@@ -10064,7 +10117,7 @@ def woo_sync_product(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
-    conn.close()
+    release_conn(conn)
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
     r = woo_upsert_erp_product(p, sucursal=sucursal)
@@ -10084,7 +10137,7 @@ def woo_upload_product_image(producto_id: int, sucursal: str = DEFAULT_SUCURSAL)
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     p = dict_fetchone(cur)
-    conn.close()
+    release_conn(conn)
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
     image_url = woo_resolve_product_image_url(p, sucursal=sucursal)
@@ -10127,7 +10180,7 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     sql += " ORDER BY id LIMIT 300"
     cur.execute(sql, params)
     productos = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     ok = 0
     errores = []
     for p in productos:
@@ -10151,7 +10204,7 @@ def woo_sync_product_price(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
     """, (producto_id, DEFAULT_SUCURSAL, sucursal))
     p = dict_fetchone(cur)
-    conn.close()
+    release_conn(conn)
     if not p:
         return {"ok": False, "success": False, "msg": "Producto ERP no encontrado."}
     r = woo_sync_price_by_sku(p.get("sku_woo"), p.get("precio_venta"), sucursal=sucursal)
@@ -10178,7 +10231,7 @@ def woo_sync_prices(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     sql += " ORDER BY id LIMIT 500"
     cur.execute(sql, params)
     productos = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     ok = 0
     omitidos = 0
     errores = []
@@ -10229,7 +10282,7 @@ def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
             """, (image_url, p["id"], DEFAULT_SUCURSAL, sucursal))
             updated += 1
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {"ok": True, "success": True, "total": len(productos), "updated": updated, "errores": errores[:20]}
 
 
@@ -10252,7 +10305,7 @@ def woo_import_products_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURS
             r = woo_request("get", "products", sucursal=sucursal, params=params)
             if not r.get("ok"):
                 conn.rollback()
-                conn.close()
+                release_conn(conn)
                 return r
             productos_web = r.get("data") or []
             if not productos_web:
@@ -10307,11 +10360,11 @@ def woo_import_products_to_erp(data: dict = None, sucursal: str = DEFAULT_SUCURS
                 break
             page += 1
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return {"ok": True, "success": True, "created": created, "updated": updated, "errores": errores[:20]}
     except Exception as e:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -10594,7 +10647,7 @@ def buscar_serie_garantia(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
         ))
         series_rows = dict_fetchall(cur)
         if not series_rows:
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": f"No se encontro la serie {serie_q}"}
 
         serie_row = series_rows[0]
@@ -10668,7 +10721,7 @@ def buscar_serie_garantia(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
             "imagen_url": serie_row.get("imagen_url") or "",
             "stock": int(serie_row.get("stock") or 0),
         }
-        conn.close()
+        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -10678,7 +10731,7 @@ def buscar_serie_garantia(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
             "series_disponibles": [_jsonable_row(r) for r in series_disponibles],
         }
     except Exception as e:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": str(e)}
 
 
@@ -10736,7 +10789,7 @@ def listar_garantias(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
         filtro, filtro, filtro, filtro, filtro, filtro,
     ))
     data = dict_fetchall(cur)
-    conn.close()
+    release_conn(conn)
     return data
 
 
@@ -10893,7 +10946,7 @@ def detalle_garantia(garantia_id: int, sucursal: str = DEFAULT_SUCURSAL):
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
     row = _fetch_garantia_row(cur, garantia_id, sucursal)
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Garantia no encontrada"}
     return {"ok": True, "success": True, "data": _jsonable_row(row), "resoluciones": RESOLUCIONES_GARANTIA}
@@ -10913,7 +10966,7 @@ def actualizar_seguimiento_garantia(garantia_id: int, data: GarantiaSeguimiento)
     sucursal = norm_sucursal(data.sucursal)
     garantia_row = _fetch_garantia_row(cur, garantia_id, sucursal)
     if not garantia_row:
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "Garantia no encontrada"}
 
     label = RESOLUCIONES_GARANTIA.get(tipo_res, tipo_res)
@@ -10941,7 +10994,7 @@ def actualizar_seguimiento_garantia(garantia_id: int, data: GarantiaSeguimiento)
         documento_seguimiento, error_nc = _crear_nota_credito_garantia(cur, garantia_row, data, sucursal)
         if error_nc:
             conn.rollback()
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "msg": error_nc}
 
     detalle_doc = obs
@@ -10988,7 +11041,7 @@ def actualizar_seguimiento_garantia(garantia_id: int, data: GarantiaSeguimiento)
     ))
     if not cur.fetchone():
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "msg": "No se pudo actualizar la garantia"}
 
     try:
@@ -11004,7 +11057,7 @@ def actualizar_seguimiento_garantia(garantia_id: int, data: GarantiaSeguimiento)
 
     conn.commit()
     updated = _fetch_garantia_row(cur, garantia_id, sucursal)
-    conn.close()
+    release_conn(conn)
     return {
         "ok": True,
         "success": True,
@@ -11041,10 +11094,10 @@ def guardar_garantia(data: Garantia):
     error_cambio, documento_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
     if error_cambio:
         conn.rollback()
-        conn.close()
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": error_cambio}
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return {
         "ok": True,
         "success": True,
@@ -11083,10 +11136,10 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
         error_cambio, documento_cambio = _aplicar_cambio_garantia(cur, garantia_id, data, sucursal)
         if error_cambio:
             conn.rollback()
-            conn.close()
+            release_conn(conn)
             return {"ok": False, "success": False, "msg": error_cambio}
     conn.commit()
-    conn.close()
+    release_conn(conn)
     if not row:
         return {"ok": False, "msg": "Garantia no encontrada"}
     return {"ok": True, "success": True, "documento_cambio": documento_cambio}
@@ -11308,7 +11361,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
     except Exception:
         compras_pendientes = 0
 
-    conn.close()
+    release_conn(conn)
     payload = {
         "clientes": clientes,
         "productos": productos,
