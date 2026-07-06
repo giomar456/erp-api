@@ -17,4 +17,4 @@ COPY webapp /app/webapp
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --timeout-keep-alive 65 --limit-concurrency 40 --limit-max-requests 800"]

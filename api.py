@@ -1,6 +1,7 @@
 ﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
@@ -65,6 +66,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=900)
+
+_PRODUCTOS_CACHE = {}
+_PRODUCTOS_CACHE_TTL = int(os.getenv("PRODUCTOS_CACHE_TTL", "90") or "90")
+_PRODUCTOS_CACHE_LOCK = threading.Lock()
+
+
+def _productos_cache_key(sucursal: str, lite: bool = True):
+    return f"{norm_sucursal(sucursal)}|{'lite' if lite else 'full'}"
+
+
+def _productos_cache_get(sucursal: str, lite: bool = True):
+    key = _productos_cache_key(sucursal, lite)
+    with _PRODUCTOS_CACHE_LOCK:
+        item = _PRODUCTOS_CACHE.get(key)
+        if not item:
+            return None
+        if (time.time() - float(item.get("ts") or 0)) > _PRODUCTOS_CACHE_TTL:
+            _PRODUCTOS_CACHE.pop(key, None)
+            return None
+        return item.get("data")
+
+
+def _productos_cache_set(sucursal: str, lite: bool, data):
+    key = _productos_cache_key(sucursal, lite)
+    with _PRODUCTOS_CACHE_LOCK:
+        _PRODUCTOS_CACHE[key] = {"ts": time.time(), "data": data}
+
+
+def invalidate_productos_cache(sucursal: str = ""):
+    with _PRODUCTOS_CACHE_LOCK:
+        if not sucursal:
+            _PRODUCTOS_CACHE.clear()
+            return
+        prefix = f"{norm_sucursal(sucursal)}|"
+        for key in list(_PRODUCTOS_CACHE.keys()):
+            if key.startswith(prefix):
+                _PRODUCTOS_CACHE.pop(key, None)
 
 if plataform_sunat_router is not None:
     app.include_router(plataform_sunat_router, prefix="/api/v1")
@@ -113,6 +152,11 @@ def root():
         "sunat_api_url": "/api/v1/system/info",
         "pc_fast_url": "/pc-fast",
     }
+
+
+@app.get("/health")
+def health_check():
+    return {"ok": True, "status": "up", "ts": datetime.utcnow().isoformat() + "Z"}
 
 
 @app.get("/pc-fast")
@@ -514,9 +558,14 @@ def get_conn():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
         raise RuntimeError("DATABASE_URL no configurado")
+    connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "12") or "12")
     if "sslmode=" in database_url.lower():
-        return psycopg2.connect(database_url)
-    return psycopg2.connect(database_url, sslmode=os.getenv("DB_SSLMODE", "require"))
+        return psycopg2.connect(database_url, connect_timeout=connect_timeout)
+    return psycopg2.connect(
+        database_url,
+        sslmode=os.getenv("DB_SSLMODE", "require"),
+        connect_timeout=connect_timeout,
+    )
 
 
 def dict_fetchall(cur):
@@ -4142,59 +4191,79 @@ def crear_producto(data: Producto):
     conn.commit()
     conn.close()
 
-    woo_sync = maybe_sync_new_product_to_woo(producto_id, sucursal=sucursal)
-    return {"ok": True, "id": producto_id, "woo_sync": woo_sync}
+    invalidate_productos_cache(sucursal)
+    woo_sync = None
+    if bool(getattr(data, "sync_to_woo", True)):
+        woo_sync = maybe_sync_new_product_to_woo(producto_id, sucursal=sucursal)
+    return {"ok": True, "success": True, "id": producto_id, "woo_sync": woo_sync}
+
+
+def _producto_imagen_lista(producto_id, imagen_url="", sucursal: str = DEFAULT_SUCURSAL, lite: bool = True):
+    img = str(imagen_url or "").strip()
+    if not img:
+        return ""
+    if not lite:
+        return img
+    if img.startswith(("http://", "https://")):
+        return img
+    if img.startswith("data:image/"):
+        return f"/productos/{int(producto_id)}/imagen?sucursal={urllib.parse.quote(norm_sucursal(sucursal))}"
+    return img
 
 
 @app.get("/productos")
-def listar_productos(sucursal: str = DEFAULT_SUCURSAL):
+def listar_productos(sucursal: str = DEFAULT_SUCURSAL, lite: bool = True):
+    sucursal_real = norm_sucursal(sucursal)
+    cached = _productos_cache_get(sucursal_real, lite)
+    if cached is not None:
+        return JSONResponse(
+            cached,
+            headers={"Cache-Control": "public, max-age=60", "X-Productos-Cache": "HIT"},
+        )
     conn = get_conn()
     cur = conn.cursor()
-    sucursal_real = norm_sucursal(sucursal)
     sucursal = inventario_sucursal(sucursal_real)
     ensure_producto_web_columns(cur)
     cur.execute("""
-    UPDATE productos p
-    SET stock = (
-        SELECT COUNT(*)
-        FROM producto_series ps
-        WHERE ps.producto_id = p.id
-          AND COALESCE(ps.sucursal,%s)=%s
-          AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
-    )
-    WHERE COALESCE(p.sucursal,%s)=%s
-      AND EXISTS (
-        SELECT 1
-        FROM producto_series ps
-        WHERE ps.producto_id = p.id
-          AND COALESCE(ps.sucursal,%s)=%s
-      )
-    """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
-
-    cur.execute("""
-    SELECT id, nombre, categoria, marca, modelo, precio_compra, precio_venta, stock,
-           COALESCE(imagen_url, '') AS imagen_url,
-           COALESCE(observacion, '') AS observacion,
-           COALESCE(almacen, 'TIENDA') AS almacen,
-           COALESCE(sku_woo, '') AS sku_woo,
-           COALESCE(nombre_web, '') AS nombre_web,
-           COALESCE(categoria_web, '') AS categoria_web,
-           COALESCE(subcategoria_web, '') AS subcategoria_web,
-           COALESCE(woo_categoria_id, 0) AS woo_categoria_id,
-           COALESCE(woo_subcategoria_id, 0) AS woo_subcategoria_id,
-           COALESCE(woo_id, 0) AS woo_id,
+    SELECT p.id, p.nombre, p.categoria, p.marca, p.modelo, p.precio_compra, p.precio_venta,
+           COALESCE((
+               SELECT COUNT(*)
+               FROM producto_series ps
+               WHERE ps.producto_id = p.id
+                 AND COALESCE(ps.sucursal,%s)=%s
+                 AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+           ), p.stock, 0) AS stock,
+           COALESCE(p.imagen_url, '') AS imagen_url,
+           COALESCE(p.observacion, '') AS observacion,
+           COALESCE(p.almacen, 'TIENDA') AS almacen,
+           COALESCE(p.sku_woo, '') AS sku_woo,
+           COALESCE(p.nombre_web, '') AS nombre_web,
+           COALESCE(p.categoria_web, '') AS categoria_web,
+           COALESCE(p.subcategoria_web, '') AS subcategoria_web,
+           COALESCE(p.woo_categoria_id, 0) AS woo_categoria_id,
+           COALESCE(p.woo_subcategoria_id, 0) AS woo_subcategoria_id,
+           COALESCE(p.woo_id, 0) AS woo_id,
            %s AS sucursal,
-           COALESCE(sucursal,%s) AS inventario_sucursal
-    FROM productos
-    WHERE COALESCE(sucursal,%s)=%s
-    ORDER BY nombre
-    """, (sucursal_real, DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
+           COALESCE(p.sucursal,%s) AS inventario_sucursal
+    FROM productos p
+    WHERE COALESCE(p.sucursal,%s)=%s
+    ORDER BY p.nombre
+    """, (DEFAULT_SUCURSAL, sucursal, sucursal_real, DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = dict_fetchall(cur)
-
-    conn.commit()
     conn.close()
-
-    return data
+    if lite:
+        for row in data:
+            row["imagen_url"] = _producto_imagen_lista(
+                row.get("id"),
+                row.get("imagen_url"),
+                sucursal=sucursal_real,
+                lite=True,
+            )
+    _productos_cache_set(sucursal_real, lite, data)
+    return JSONResponse(
+        data,
+        headers={"Cache-Control": "public, max-age=60", "X-Productos-Cache": "MISS"},
+    )
 
 
 @app.put("/productos/{producto_id}")
@@ -4229,6 +4298,15 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         woo_sync = None
         if bool(data.sync_to_woo):
             woo_sync = maybe_sync_updated_product_to_woo(producto_id, sucursal=sucursal)
+            if isinstance(woo_sync, dict) and woo_sync.get("ok") is False:
+                return {
+                    "ok": True,
+                    "success": True,
+                    "id": row[0],
+                    "woo_sync": woo_sync,
+                    "msg": woo_sync.get("msg") or "Producto guardado, pero no se pudo publicar en la pagina.",
+                }
+        invalidate_productos_cache(sucursal)
         return {"ok": True, "success": True, "id": row[0], "woo_sync": woo_sync}
     except Exception as e:
         conn.rollback()
@@ -4270,6 +4348,7 @@ def actualizar_precio_venta_producto(producto_id: int, data: ProductoPrecioVenta
             }, ensure_ascii=False),
         ))
         conn.commit()
+        invalidate_productos_cache(sucursal)
         return {
             "ok": True,
             "success": True,
@@ -4324,6 +4403,7 @@ def eliminar_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
             return {"ok": False, "success": False, "msg": "Producto no encontrado"}
         conn.commit()
         conn.close()
+        invalidate_productos_cache(sucursal)
         return {"ok": True, "success": True, "id": row[0]}
     except Exception as e:
         conn.rollback()
@@ -9430,12 +9510,12 @@ def woo_create_new_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
         return found
     existing = found.get("data") or []
     if existing:
-        return {
-            "ok": True,
-            "skipped": True,
-            "msg": f"El SKU {sku} ya existe en la web. No se actualiza automaticamente.",
-            "woo_id": existing[0].get("id"),
-        }
+        r = woo_request("put", f"products/{existing[0]['id']}", sucursal=sucursal, json=payload)
+        if not r.get("ok"):
+            return r
+        woo_data = r.get("data", {}) or {}
+        woo_save_product_link(p.get("id"), woo_data, sku, sucursal=sucursal)
+        return {"ok": True, "action": "actualizado", "sku": sku, "data": woo_data}
     r = woo_request("post", "products", sucursal=sucursal, json=payload)
     if not r.get("ok"):
         return r
@@ -9468,18 +9548,17 @@ def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCU
     conn.close()
     if not p:
         return {"ok": False, "msg": "Producto ERP no encontrado."}
-    r = woo_create_new_erp_product(p, sucursal=sucursal)
-    if r.get("skipped"):
-        return r
+    r = woo_upsert_erp_product(p, sucursal=sucursal)
     if not r.get("ok"):
         return r
+    action = r.get("action") or "publicado"
     return {
         "ok": True,
         "synced": True,
-        "action": r.get("action"),
+        "action": action,
         "sku": r.get("sku"),
         "woo_id": (r.get("data") or {}).get("id"),
-        "msg": "Producto nuevo publicado en WooCommerce.",
+        "msg": f"Producto {action} en WooCommerce.",
     }
 
 
@@ -11152,11 +11231,20 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
 
 @app.on_event("startup")
 def _erp_run_migrations_at_boot():
-    """Asegura columnas (monto_pagado, sunat_*, etc.) antes de atender /documentos."""
-    result = migrate_schema()
-    if not result.get("ok"):
-        import logging
-        logging.getLogger("uvicorn.error").error("migrate_schema al arranque: %s", result.get("error", result))
+    """Migraciones en segundo plano para no bloquear health checks de Render."""
+    def _run():
+        try:
+            result = migrate_schema()
+            if not result.get("ok"):
+                import logging
+                logging.getLogger("uvicorn.error").error(
+                    "migrate_schema al arranque: %s", result.get("error", result)
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger("uvicorn.error").exception("migrate_schema fallo: %s", exc)
+
+    threading.Thread(target=_run, daemon=True, name="erp-migrate").start()
 
 
 if __name__ == "__main__":
