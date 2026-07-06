@@ -4249,7 +4249,7 @@ def listar_productos(sucursal: str = DEFAULT_SUCURSAL, lite: bool = True):
     WHERE COALESCE(p.sucursal,%s)=%s
     ORDER BY p.nombre
     """, (DEFAULT_SUCURSAL, sucursal, sucursal_real, DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
-    data = dict_fetchall(cur)
+    data = [_jsonable_row(row) for row in dict_fetchall(cur)]
     conn.close()
     if lite:
         for row in data:
