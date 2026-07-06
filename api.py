@@ -9680,18 +9680,155 @@ def woo_create_new_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
     return {"ok": True, "action": "creado", "sku": sku, "data": woo_data}
 
 
+def _erp_stock_select_sql(alias="p"):
+    return f"""COALESCE((
+        SELECT COUNT(*)
+        FROM producto_series ps
+        WHERE ps.producto_id = {alias}.id
+          AND COALESCE(ps.sucursal,%s)=%s
+          AND UPPER(COALESCE(ps.estado,'DISPONIBLE')) IN ('DISPONIBLE','RESERVADO')
+    ), {alias}.stock, 0)"""
+
+
 def _erp_product_for_woo_sync(cur, producto_id: int, sucursal: str):
     ensure_producto_web_columns(cur)
-    cur.execute("""
-        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock,
-               COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo,
-               COALESCE(nombre_web,'') AS nombre_web,
-               COALESCE(categoria_web,'') AS categoria_web, COALESCE(subcategoria_web,'') AS subcategoria_web,
-               COALESCE(woo_categoria_id,0) AS woo_categoria_id, COALESCE(woo_subcategoria_id,0) AS woo_subcategoria_id
-        FROM productos
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    inv = inventario_sucursal(sucursal)
+    stock_sql = _erp_stock_select_sql("p")
+    cur.execute(f"""
+        SELECT p.id, p.nombre, p.categoria, p.marca, p.modelo, p.precio_venta,
+               ({stock_sql}) AS stock,
+               COALESCE(p.imagen_url,'') AS imagen_url, COALESCE(p.sku_woo,'') AS sku_woo,
+               COALESCE(p.nombre_web,'') AS nombre_web,
+               COALESCE(p.categoria_web,'') AS categoria_web, COALESCE(p.subcategoria_web,'') AS subcategoria_web,
+               COALESCE(p.woo_categoria_id,0) AS woo_categoria_id, COALESCE(p.woo_subcategoria_id,0) AS woo_subcategoria_id,
+               COALESCE(p.woo_id,0) AS woo_id
+        FROM productos p
+        WHERE p.id=%s AND COALESCE(p.sucursal,%s)=%s
+    """, (DEFAULT_SUCURSAL, inv, producto_id, DEFAULT_SUCURSAL, inv))
     return dict_fetchone(cur)
+
+
+def _woo_find_product_by_sku(sku, sucursal: str = DEFAULT_SUCURSAL):
+    sku = str(sku or "").strip().upper()
+    if not sku:
+        return {"ok": False, "msg": "SKU vacio."}
+    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+    if not found.get("ok"):
+        return found
+    items = found.get("data") or []
+    if not items:
+        return {"ok": False, "msg": f"No existe producto WooCommerce con SKU {sku}."}
+    item = items[0]
+    return {"ok": True, "sku": sku, "woo_id": int(item.get("id") or 0), "data": item}
+
+
+def _woo_find_product_by_name(nombre, sucursal: str = DEFAULT_SUCURSAL):
+    query = str(nombre or "").strip()
+    if not query:
+        return {"ok": False, "msg": "Nombre vacio."}
+    found = woo_request("get", "products", sucursal=sucursal, params={"search": query[:80], "per_page": 20})
+    if not found.get("ok"):
+        return found
+    items = found.get("data") or []
+    if not items:
+        return {"ok": False, "msg": f"No se encontro producto web parecido a: {query[:60]}"}
+    best = None
+    best_score = 0.0
+    for item in items:
+        score = max(
+            product_name_similarity(query, item.get("name")),
+            product_name_similarity(query, item.get("sku")),
+        )
+        if score > best_score:
+            best_score = score
+            best = item
+    if not best or best_score < 0.45:
+        return {"ok": False, "msg": f"No hay coincidencia clara por nombre para: {query[:60]}"}
+    return {
+        "ok": True,
+        "woo_id": int(best.get("id") or 0),
+        "sku": str(best.get("sku") or "").strip().upper(),
+        "nombre_web": str(best.get("name") or "").strip(),
+        "score": round(best_score, 2),
+        "data": best,
+    }
+
+
+def woo_sync_fields_for_product(
+    p: dict,
+    sucursal: str = DEFAULT_SUCURSAL,
+    sync_stock: bool = True,
+    sync_price: bool = False,
+    sync_name: bool = False,
+    sync_image: bool = False,
+    match_by: str = "sku",
+):
+    sucursal = norm_sucursal(sucursal)
+    if not woo_config(sucursal):
+        return {"ok": False, "msg": "WooCommerce no configurado."}
+    sku = str(p.get("sku_woo") or "").strip().upper()
+    woo_id = int(p.get("woo_id") or 0)
+    match_mode = str(match_by or "sku").strip().lower()
+    web = None
+    if sku:
+        web = _woo_find_product_by_sku(sku, sucursal=sucursal)
+    elif match_mode in ("name", "nombre", "auto") and (p.get("nombre_web") or p.get("nombre")):
+        web = _woo_find_product_by_name(p.get("nombre_web") or p.get("nombre"), sucursal=sucursal)
+        if web.get("ok"):
+            sku = str(web.get("sku") or "").strip().upper()
+            woo_id = int(web.get("woo_id") or 0)
+    elif woo_id > 0:
+        detail = woo_request("get", f"products/{woo_id}", sucursal=sucursal)
+        if detail.get("ok"):
+            item = detail.get("data") or {}
+            sku = str(item.get("sku") or sku).strip().upper()
+            web = {"ok": True, "sku": sku, "woo_id": woo_id, "data": item}
+    if not web or not web.get("ok"):
+        return web or {"ok": False, "msg": "Asigna un SKU web o activa coincidencia por nombre."}
+    woo_id = int(web.get("woo_id") or woo_id or 0)
+    if not woo_id:
+        return {"ok": False, "msg": "Producto web sin ID valido."}
+
+    payload = {"manage_stock": True}
+    updated_fields = []
+    if sync_stock:
+        payload["stock_quantity"] = max(0, int(p.get("stock") or 0))
+        updated_fields.append("stock")
+    if sync_price:
+        try:
+            price_value = float(p.get("precio_venta") or 0)
+        except Exception:
+            price_value = 0
+        if price_value > 0:
+            payload["regular_price"] = f"{price_value:.2f}"
+            updated_fields.append("precio")
+    if sync_name:
+        display_name = str(p.get("nombre_web") or "").strip() or str(p.get("nombre") or "").strip()
+        if display_name:
+            payload["name"] = display_name
+            updated_fields.append("nombre")
+    if sync_image:
+        image_url = woo_resolve_product_image_url(p, sucursal=sucursal)
+        if image_url:
+            payload["images"] = [{"src": image_url}]
+            updated_fields.append("imagen")
+    if not updated_fields:
+        return {"ok": False, "msg": "Selecciona al menos un campo para sincronizar."}
+
+    updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json=payload)
+    if not updated.get("ok"):
+        return updated
+    woo_save_product_link(p.get("id"), updated.get("data") or web.get("data") or {}, sku, sucursal=sucursal)
+    return {
+        "ok": True,
+        "producto_id": p.get("id"),
+        "sku": sku,
+        "woo_id": woo_id,
+        "campos": updated_fields,
+        "stock": payload.get("stock_quantity"),
+        "regular_price": payload.get("regular_price"),
+        "msg": f"Web actualizada ({', '.join(updated_fields)}) para SKU {sku}.",
+    }
 
 
 def maybe_sync_new_product_to_woo(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
@@ -10248,13 +10385,139 @@ def woo_sync_prices(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     return {"ok": True, "success": True, "msg": f"Precios sincronizados: {ok}. Omitidos sin SKU: {omitidos}. Errores: {len(errores)}.", "total": len(productos), "sync_ok": ok, "omitidos": omitidos, "errores": errores[:30]}
 
 
+@app.post("/web/woocommerce/sync-stock/{producto_id}")
+def woo_sync_product_stock(producto_id: int, data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    data = data or {}
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
+    release_conn(conn)
+    if not p:
+        return {"ok": False, "msg": "Producto ERP no encontrado."}
+    r = woo_sync_fields_for_product(
+        p,
+        sucursal=sucursal,
+        sync_stock=True,
+        sync_price=bool(data.get("sync_price", False)),
+        sync_name=bool(data.get("sync_name", False)),
+        sync_image=bool(data.get("sync_image", False)),
+        match_by=str(data.get("match_by") or "sku"),
+    )
+    if not r.get("ok"):
+        return {"ok": False, "success": False, "msg": r.get("msg", "No se pudo sincronizar stock.")}
+    return {"ok": True, "success": True, **r}
+
+
+@app.post("/web/woocommerce/sync-fields")
+def woo_sync_fields_bulk(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    data = data or {}
+    sucursal = norm_sucursal(sucursal)
+    if not woo_config(sucursal):
+        return {"ok": False, "msg": "WooCommerce no configurado."}
+    sync_stock = bool(data.get("sync_stock", True))
+    sync_price = bool(data.get("sync_price", False))
+    sync_name = bool(data.get("sync_name", False))
+    sync_image = bool(data.get("sync_image", False))
+    only_with_sku = bool(data.get("only_with_sku", True))
+    only_with_stock = bool(data.get("only_with_stock", False))
+    match_by = str(data.get("match_by") or "sku")
+    producto_id = int(data.get("producto_id") or data.get("id") or 0)
+    limit = max(1, min(int(data.get("limit") or 500), 2000))
+
+    conn = get_conn()
+    cur = conn.cursor()
+    inv = inventario_sucursal(sucursal)
+    stock_sql = _erp_stock_select_sql("p")
+    if producto_id:
+        p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
+        release_conn(conn)
+        if not p:
+            return {"ok": False, "msg": "Producto ERP no encontrado."}
+        r = woo_sync_fields_for_product(
+            p, sucursal=sucursal,
+            sync_stock=sync_stock, sync_price=sync_price, sync_name=sync_name, sync_image=sync_image,
+            match_by=match_by,
+        )
+        if not r.get("ok"):
+            return {"ok": False, "success": False, "msg": r.get("msg", "No se pudo sincronizar.")}
+        return {"ok": True, "success": True, "total": 1, "sync_ok": 1, "omitidos": 0, "errores": [], "msg": r.get("msg"), "detalle": [r]}
+
+    sql = f"""
+        SELECT p.id, p.nombre, p.precio_venta, ({stock_sql}) AS stock,
+               COALESCE(p.imagen_url,'') AS imagen_url, COALESCE(p.sku_woo,'') AS sku_woo,
+               COALESCE(p.nombre_web,'') AS nombre_web, COALESCE(p.woo_id,0) AS woo_id
+        FROM productos p
+        WHERE COALESCE(p.sucursal,%s)=%s
+    """
+    params = [DEFAULT_SUCURSAL, inv, DEFAULT_SUCURSAL, inv]
+    if only_with_sku and match_by == "sku":
+        sql += " AND TRIM(COALESCE(p.sku_woo,''))<>''"
+    if only_with_stock:
+        sql += f" AND ({stock_sql}) > 0"
+        params.extend([DEFAULT_SUCURSAL, inv])
+    sql += " ORDER BY p.id LIMIT %s"
+    params.append(limit)
+    cur.execute(sql, params)
+    productos = dict_fetchall(cur)
+    release_conn(conn)
+
+    ok = 0
+    omitidos = 0
+    errores = []
+    detalle_ok = []
+    for p in productos:
+        if only_with_sku and match_by == "sku" and not str(p.get("sku_woo") or "").strip():
+            omitidos += 1
+            continue
+        r = woo_sync_fields_for_product(
+            p, sucursal=sucursal,
+            sync_stock=sync_stock, sync_price=sync_price, sync_name=sync_name, sync_image=sync_image,
+            match_by=match_by,
+        )
+        if r.get("ok"):
+            ok += 1
+            if len(detalle_ok) < 15:
+                detalle_ok.append({"id": p.get("id"), "sku": r.get("sku"), "campos": r.get("campos"), "stock": r.get("stock")})
+        else:
+            errores.append({"id": p.get("id"), "nombre": p.get("nombre"), "sku": p.get("sku_woo"), "msg": r.get("msg", "Error")})
+    campos_txt = ", ".join(
+        name for name, flag in (
+            ("stock", sync_stock), ("precio", sync_price), ("nombre", sync_name), ("imagen", sync_image),
+        ) if flag
+    ) or "ninguno"
+    return {
+        "ok": True,
+        "success": True,
+        "total": len(productos),
+        "sync_ok": ok,
+        "omitidos": omitidos,
+        "errores": errores[:40],
+        "detalle_ok": detalle_ok,
+        "msg": f"Web actualizada: {ok}/{len(productos)}. Campos: {campos_txt}. Omitidos: {omitidos}. Errores: {len(errores)}.",
+    }
+
+
+@app.post("/web/woocommerce/sync-images-to-web")
+def woo_sync_images_to_web(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    data = data or {}
+    return woo_sync_fields_bulk({
+        **(data or {}),
+        "sync_stock": False,
+        "sync_price": False,
+        "sync_name": False,
+        "sync_image": True,
+        "only_with_sku": bool((data or {}).get("only_with_sku", True)),
+    }, sucursal=sucursal)
+
+
 @app.post("/web/woocommerce/sync-images")
 def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
     sucursal = norm_sucursal(sucursal)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, nombre, COALESCE(imagen_url,'') AS imagen_url
+        SELECT id, nombre, COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
         FROM productos
         WHERE COALESCE(sucursal,%s)=%s
         ORDER BY id
@@ -10264,7 +10527,7 @@ def woo_sync_images_from_web(sucursal: str = DEFAULT_SUCURSAL):
     updated = 0
     errores = []
     for p in productos:
-        sku = f"ERP-{p['id']}"
+        sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{p['id']}"
         found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
         if not found.get("ok"):
             errores.append({"id": p.get("id"), "msg": found.get("msg", "Error WooCommerce")})
