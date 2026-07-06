@@ -17,6 +17,7 @@ except Exception:
 import base64
 import binascii
 import psycopg2
+from psycopg2 import pool as pg_pool
 import os
 import json
 import re
@@ -554,18 +555,71 @@ def norm_theme_color(value: str = ""):
     return "#304fb8"
 
 
-def get_conn():
+_DB_POOL = None
+_DB_POOL_LOCK = threading.Lock()
+
+
+def _database_url_with_options():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
         raise RuntimeError("DATABASE_URL no configurado")
     connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "12") or "12")
-    if "sslmode=" in database_url.lower():
-        return psycopg2.connect(database_url, connect_timeout=connect_timeout)
-    return psycopg2.connect(
-        database_url,
-        sslmode=os.getenv("DB_SSLMODE", "require"),
-        connect_timeout=connect_timeout,
-    )
+    if "sslmode=" not in database_url.lower():
+        sep = "&" if "?" in database_url else "?"
+        database_url = f"{database_url}{sep}sslmode={os.getenv('DB_SSLMODE', 'require')}"
+    if "connect_timeout=" not in database_url.lower():
+        sep = "&" if "?" in database_url else "?"
+        database_url = f"{database_url}{sep}connect_timeout={connect_timeout}"
+    return database_url
+
+
+def _init_db_pool():
+    global _DB_POOL
+    with _DB_POOL_LOCK:
+        if _DB_POOL is not None:
+            return _DB_POOL
+        min_conn = max(1, int(os.getenv("DB_POOL_MIN", "1") or "1"))
+        max_conn = max(min_conn, int(os.getenv("DB_POOL_MAX", "6") or "6"))
+        _DB_POOL = pg_pool.ThreadedConnectionPool(
+            minconn=min_conn,
+            maxconn=max_conn,
+            dsn=_database_url_with_options(),
+        )
+        return _DB_POOL
+
+
+def get_conn():
+    return _init_db_pool().getconn()
+
+
+def close_db_pool():
+    global _DB_POOL
+    with _DB_POOL_LOCK:
+        pool = _DB_POOL
+        _DB_POOL = None
+    if pool is not None:
+        try:
+            pool.closeall()
+        except Exception:
+            pass
+
+
+def ensure_performance_indexes(cur):
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_ps_producto_sucursal_estado ON producto_series (producto_id, sucursal, estado)",
+        "CREATE INDEX IF NOT EXISTS idx_ps_serie_sucursal ON producto_series (serie, sucursal)",
+        "CREATE INDEX IF NOT EXISTS idx_productos_sucursal_nombre ON productos (sucursal, nombre)",
+        "CREATE INDEX IF NOT EXISTS idx_ventas_sucursal_fecha ON ventas (sucursal, fecha DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_ventas_sucursal_tipo_numero ON ventas (sucursal, tipo, numero)",
+        "CREATE INDEX IF NOT EXISTS idx_ventas_sunat_estado ON ventas (sucursal, sunat_estado)",
+        "CREATE INDEX IF NOT EXISTS idx_ventas_detalle_venta ON ventas_detalle (venta_id)",
+        "CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria (fecha DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_usuarios_online_actividad ON usuarios_online (ultima_actividad DESC)",
+    ):
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
 
 
 def dict_fetchall(cur):
@@ -1895,7 +1949,6 @@ def migrate_schema():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_sucursal_id ON boquitoqui_mensajes (sucursal, id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_boquitoqui_destinatario ON boquitoqui_mensajes (sucursal, destinatario)")
-        cur.execute("DELETE FROM boquitoqui_mensajes")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS usuarios_online (
             usuario TEXT PRIMARY KEY,
@@ -2285,6 +2338,8 @@ def migrate_schema():
 
         if ensure_plataform_tables is not None:
             ensure_plataform_tables(cur)
+
+        ensure_performance_indexes(cur)
 
         conn.commit()
         conn.close()
@@ -11245,6 +11300,11 @@ def _erp_run_migrations_at_boot():
             logging.getLogger("uvicorn.error").exception("migrate_schema fallo: %s", exc)
 
     threading.Thread(target=_run, daemon=True, name="erp-migrate").start()
+
+
+@app.on_event("shutdown")
+def _erp_shutdown_cleanup():
+    close_db_pool()
 
 
 if __name__ == "__main__":
