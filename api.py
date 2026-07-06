@@ -70,8 +70,37 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=900)
 
 _PRODUCTOS_CACHE = {}
-_PRODUCTOS_CACHE_TTL = int(os.getenv("PRODUCTOS_CACHE_TTL", "90") or "90")
+_PRODUCTOS_CACHE_TTL = int(os.getenv("PRODUCTOS_CACHE_TTL", "120") or "120")
 _PRODUCTOS_CACHE_LOCK = threading.Lock()
+
+_API_CACHE = {}
+_API_CACHE_LOCK = threading.Lock()
+
+
+def _api_cache_get(key: str, ttl: int):
+    with _API_CACHE_LOCK:
+        item = _API_CACHE.get(key)
+        if not item:
+            return None
+        if (time.time() - float(item.get("ts") or 0)) > ttl:
+            _API_CACHE.pop(key, None)
+            return None
+        return item.get("data")
+
+
+def _api_cache_set(key: str, data):
+    with _API_CACHE_LOCK:
+        _API_CACHE[key] = {"ts": time.time(), "data": data}
+
+
+def invalidate_api_cache(prefix: str = ""):
+    with _API_CACHE_LOCK:
+        if not prefix:
+            _API_CACHE.clear()
+            return
+        for key in list(_API_CACHE.keys()):
+            if key.startswith(prefix):
+                _API_CACHE.pop(key, None)
 
 
 def _productos_cache_key(sucursal: str, lite: bool = True):
@@ -105,6 +134,8 @@ def invalidate_productos_cache(sucursal: str = ""):
         for key in list(_PRODUCTOS_CACHE.keys()):
             if key.startswith(prefix):
                 _PRODUCTOS_CACHE.pop(key, None)
+    invalidate_api_cache(f"documentos|{norm_sucursal(sucursal)}" if sucursal else "documentos|")
+    invalidate_api_cache(f"dashboard|{norm_sucursal(sucursal)}" if sucursal else "dashboard|")
 
 if plataform_sunat_router is not None:
     app.include_router(plataform_sunat_router, prefix="/api/v1")
@@ -2339,7 +2370,15 @@ def migrate_schema():
         if ensure_plataform_tables is not None:
             ensure_plataform_tables(cur)
 
-        ensure_performance_indexes(cur)
+        cur.execute("SELECT valor FROM app_config WHERE clave='perf_indexes_v2'")
+        idx_row = cur.fetchone()
+        if not idx_row or str(idx_row[0] or "").strip() != "1":
+            ensure_performance_indexes(cur)
+            cur.execute("""
+                INSERT INTO app_config (clave, valor, actualizado)
+                VALUES ('perf_indexes_v2', '1', CURRENT_TIMESTAMP)
+                ON CONFLICT (clave) DO UPDATE SET valor='1', actualizado=CURRENT_TIMESTAMP
+            """)
 
         conn.commit()
         conn.close()
@@ -6162,6 +6201,7 @@ def crear_venta(data: Venta):
 
         conn.commit()
         conn.close()
+        invalidate_productos_cache(sucursal)
 
         sunat_auto = None
         if doc_tipo_upper in ("BOLETA", "FACTURA") and legal_sunat:
@@ -6464,12 +6504,17 @@ def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpda
 def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str = ""):
     conn = None
     try:
-        conn = get_conn()
-        cur = conn.cursor()
         sucursal = norm_sucursal(sucursal)
         filtro_fecha = (fecha or "").strip()
-        texto = f"%{(q or '').strip().lower()}%"
-        cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''")
+        texto_q = (q or "").strip().lower()
+        cache_key = f"documentos|{sucursal}|{filtro_fecha}|{texto_q}"
+        if not texto_q:
+            cached = _api_cache_get(cache_key, 30)
+            if cached is not None:
+                return JSONResponse(cached, headers={"X-Api-Cache": "HIT"})
+        texto = f"%{texto_q}%"
+        conn = get_conn()
+        cur = conn.cursor()
 
         cur.execute("""
         SELECT
@@ -6549,6 +6594,9 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
             row["comprobantes_pago_json"] = ""
             row["pagos_detalle"] = cargar_comprobantes_json(row.get("pagos_detalle_json"))
             rows.append(row)
+        if not texto_q:
+            _api_cache_set(cache_key, rows)
+            return JSONResponse(rows, headers={"X-Api-Cache": "MISS"})
         return rows
     except Exception as e:
         import traceback
@@ -11046,9 +11094,13 @@ def actualizar_garantia(garantia_id: int, data: Garantia):
 
 @app.get("/dashboard")
 def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
+    sucursal = norm_sucursal(sucursal)
+    cache_key = f"dashboard|{sucursal}|{fecha or ''}"
+    cached = _api_cache_get(cache_key, 60)
+    if cached is not None:
+        return cached
     conn = get_conn()
     cur = conn.cursor()
-    sucursal = norm_sucursal(sucursal)
     tipos_venta_sql = "('BOLETA','FACTURA','NOTA DE VENTA')"
     target_date = f"'{fecha}'::date" if fecha else "(timezone('America/Lima', now()))::date"
 
@@ -11257,7 +11309,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
         compras_pendientes = 0
 
     conn.close()
-    return {
+    payload = {
         "clientes": clientes,
         "productos": productos,
         "documentos": documentos,
@@ -11282,6 +11334,8 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
         "compras_pendientes": compras_pendientes,
         "clientes_hoy": clientes_hoy,
     }
+    _api_cache_set(cache_key, payload)
+    return payload
 
 
 @app.on_event("startup")
