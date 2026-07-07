@@ -9263,12 +9263,20 @@ def guardar_compra(data: Compra):
 
             series_texto = item.get("series_texto", "")
             raw_series_list = item.get("series_list")
-            if isinstance(raw_series_list, list):
-                series_list = [str(s).strip().upper() for s in raw_series_list if str(s).strip()]
+            series_list = []
+            if isinstance(raw_series_list, list) and any(str(s).strip() for s in raw_series_list):
+                series_list = [normalize_serie_key(s) or str(s).strip().upper() for s in raw_series_list if str(s).strip()]
             elif series_texto:
-                series_list = [s.strip().upper() for s in series_texto.replace("\n", ",").split(",") if s.strip()]
-            else:
-                series_list = []
+                series_list = split_series_text(series_texto)
+            seen_series = set()
+            deduped_series = []
+            for serie in series_list:
+                if serie in seen_series:
+                    conn.rollback()
+                    return {"ok": False, "msg": f"{nombre or 'Producto'}: la serie {serie} esta repetida en la compra."}
+                seen_series.add(serie)
+                deduped_series.append(serie)
+            series_list = deduped_series
 
             if series_list and len(series_list) != cantidad:
                 conn.rollback()
@@ -9279,6 +9287,37 @@ def guardar_compra(data: Compra):
 
             if series_list:
                 for serie in series_list:
+                    cur.execute("""
+                        SELECT ps.id, ps.producto_id, COALESCE(p.nombre,'') AS producto_nombre,
+                               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado
+                        FROM producto_series ps
+                        LEFT JOIN productos p ON p.id = ps.producto_id
+                        WHERE COALESCE(ps.sucursal,%s)=%s
+                          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s
+                        LIMIT 1
+                    """, (DEFAULT_SUCURSAL, inv_sucursal, serie))
+                    existing = dict_fetchone(cur)
+                    if existing:
+                        exist_pid = int(existing.get("producto_id") or 0)
+                        exist_estado = str(existing.get("estado") or "DISPONIBLE").upper()
+                        if exist_pid != int(prod_id) and exist_estado in ("DISPONIBLE", "RESERVADO"):
+                            conn.rollback()
+                            return {
+                                "ok": False,
+                                "msg": f"{nombre or 'Producto'}: la serie {serie} ya existe en {existing.get('producto_nombre') or 'otro producto'} ({exist_estado}).",
+                            }
+                        if exist_pid == int(prod_id):
+                            cur.execute("""
+                                UPDATE producto_series
+                                SET proveedor=%s,
+                                    estado='DISPONIBLE',
+                                    almacen='TIENDA',
+                                    fecha_ingreso=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),
+                                    fecha_salida=NULL,
+                                    usuario_ingreso=CASE WHEN %s<>'' THEN %s ELSE COALESCE(usuario_ingreso,'') END
+                                WHERE id=%s
+                            """, (proveedor, usuario_op, usuario_op, existing.get("id")))
+                            continue
                     cur.execute("""
                         INSERT INTO producto_series (producto_id, serie, proveedor, estado, almacen, fecha_ingreso, sucursal, usuario_ingreso)
                         VALUES (%s, %s, %s, 'DISPONIBLE', 'TIENDA', TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'), %s, %s)

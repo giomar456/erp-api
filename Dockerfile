@@ -10,6 +10,7 @@ COPY requirements-api.txt /app/requirements-api.txt
 RUN pip install --no-cache-dir -r requirements-api.txt
 
 COPY api.py /app/api.py
+COPY _restaurar_oracle.py /app/_restaurar_oracle.py
 COPY plataform_sunat_client.py /app/plataform_sunat_client.py
 COPY plataform_sunat_server.py /app/plataform_sunat_server.py
 COPY plataform_sunat_panel.html /app/plataform_sunat_panel.html
