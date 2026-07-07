@@ -625,8 +625,8 @@ def _init_db_pool():
     with _DB_POOL_LOCK:
         if _DB_POOL is not None:
             return _DB_POOL
-        min_conn = max(1, int(os.getenv("DB_POOL_MIN", "2") or "2"))
-        max_conn = max(min_conn, int(os.getenv("DB_POOL_MAX", "12") or "12"))
+        min_conn = max(1, int(os.getenv("DB_POOL_MIN", "1") or "1"))
+        max_conn = max(min_conn, int(os.getenv("DB_POOL_MAX", "8") or "8"))
         _DB_POOL = pg_pool.ThreadedConnectionPool(
             minconn=min_conn,
             maxconn=max_conn,
@@ -11769,8 +11769,13 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
 
 @app.on_event("startup")
 def _erp_run_migrations_at_boot():
-    """Migraciones en segundo plano para no bloquear health checks de Render."""
+    """Migraciones y pool DB en segundo plano para no bloquear health checks."""
     def _run():
+        try:
+            _init_db_pool()
+        except Exception as exc:
+            import logging
+            logging.getLogger("uvicorn.error").warning("DB pool warmup: %s", exc)
         try:
             result = migrate_schema()
             if not result.get("ok"):
