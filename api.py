@@ -277,8 +277,8 @@ def lima_today_iso():
     return lima_now().date().isoformat()
 
 
-PROFORMA_VALIDITY_HOURS = 48
-PROFORMA_VALIDITY_NOTE = "Cotizacion valida solo por 48 horas desde la fecha de emision."
+PROFORMA_VALIDITY_HOURS = 24
+PROFORMA_VALIDITY_NOTE = "Cotizacion valida solo por 24 horas desde la fecha de emision."
 
 
 def proforma_fecha_vencimiento(fecha_emision=None):
@@ -1518,17 +1518,111 @@ def _mensaje_error_consulta_documento(last_error, provider_configured, tipo):
     return "No se encontraron datos. Configura APIS_NET_PE_TOKEN en Render para consultas DNI/RUC."
 
 
-def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL):
-    numero = only_digits(numero)
-    tipo = "DNI" if len(numero) == 8 else "RUC" if len(numero) == 11 else ""
-    if not tipo:
-        return {"ok": False, "success": False, "found": False, "msg": "Ingresa 8 digitos para DNI o 11 para RUC."}
+def normalizar_ce(data, numero, source):
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    nombre = first_value(payload, "nombre", "nombres", "nombreCompleto", "nombre_completo", "apellidoNombre", "fullName")
+    paterno = first_value(payload, "apellidoPaterno", "apellido_paterno", "paterno")
+    materno = first_value(payload, "apellidoMaterno", "apellido_materno", "materno")
+    nombres = first_value(payload, "nombres", "primerNombre")
+    if not nombre:
+        nombre = " ".join(x for x in [paterno, materno, nombres] if x).strip()
+    if not nombre:
+        return None
+    return {
+        "ok": True,
+        "success": True,
+        "found": True,
+        "source": source,
+        "tipo_documento": "CE",
+        "numero_documento": str(numero or "").strip().upper(),
+        "nombre": str(nombre).upper(),
+        "direccion": first_value(payload, "direccion", "domicilio", "direccionCompleta"),
+    }
 
-    local = buscar_cliente_db(numero, sucursal)
+
+def consulta_documento_ce_custom(numero):
+    """Lookup opcional de carnet de extranjeria via DOC_LOOKUP_CE_URL."""
+    template = os.getenv("DOC_LOOKUP_CE_URL", "").strip()
+    if not template:
+        return None
+    token = os.getenv("DOC_LOOKUP_TOKEN", "").strip() or os.getenv("DOC_LOOKUP_CE_TOKEN", "").strip()
+    header_name = os.getenv("DOC_LOOKUP_AUTH_HEADER", "Authorization").strip() or "Authorization"
+    header_prefix = os.getenv("DOC_LOOKUP_AUTH_PREFIX", "Bearer ")
+    headers = {"Accept": "application/json"}
+    if token:
+        headers[header_name] = f"{header_prefix}{token}"
+    url = template.format(
+        numero=urllib.parse.quote(str(numero)),
+        documento=urllib.parse.quote(str(numero)),
+        tipo="CE",
+    )
+    data = http_get_json(url, headers=headers, timeout=6)
+    return normalizar_ce(data, numero, "custom_ce")
+
+
+def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL, tipo_preferido: str = ""):
+    raw = str(numero or "").strip().upper()
+    digits = only_digits(raw)
+    prefer = str(tipo_preferido or "").strip().upper()
+    if prefer in ("CE", "CARNET", "CARNET DE EXTRANJERIA", "CARNET EXTRANJERIA"):
+        tipo = "CE"
+        numero = digits or re.sub(r"[^A-Z0-9]", "", raw)
+    elif prefer in ("DNI", "RUC"):
+        tipo = prefer
+        numero = digits
+    else:
+        numero = digits or re.sub(r"[^A-Z0-9]", "", raw)
+        if len(digits) == 8:
+            tipo = "DNI"
+        elif len(digits) == 11:
+            tipo = "RUC"
+        elif 9 <= len(numero) <= 12:
+            # Carnet de extranjeria tipico (9 digitos) u otros
+            tipo = "CE"
+        else:
+            tipo = ""
+
+    if not tipo:
+        return {
+            "ok": False,
+            "success": False,
+            "found": False,
+            "msg": "Ingresa DNI (8), RUC (11) o Carnet de extranjeria (CE).",
+        }
+
+    # Buscar en clientes locales siempre (incluye CE manual ya cargado)
+    local = buscar_cliente_db(digits or numero, sucursal)
+    if not local and tipo == "CE" and numero != digits:
+        local = buscar_cliente_db(numero, sucursal)
     if local:
         local["tipo_documento"] = local.get("tipo_documento") or tipo
-        local["numero_documento"] = local.get("numero_documento") or numero
+        local["numero_documento"] = local.get("numero_documento") or (digits or numero)
         return local
+
+    # CE: no hay API publica gratuita confiable. Solo custom URL opcional.
+    if tipo == "CE":
+        try:
+            result = consulta_documento_ce_custom(numero)
+            if result and result.get("found"):
+                return result
+        except Exception as e:
+            return {
+                "ok": False,
+                "success": False,
+                "found": False,
+                "tipo_documento": "CE",
+                "numero_documento": numero,
+                "msg": f"No se pudo consultar CE: {e}. Ingresa nombre manualmente.",
+            }
+        return {
+            "ok": False,
+            "success": False,
+            "found": False,
+            "tipo_documento": "CE",
+            "numero_documento": numero,
+            "msg": "Carnet de extranjeria: ingresa nombre y direccion manualmente (no hay API publica gratis). Si ya esta en clientes, se autocompleta.",
+            "manual": True,
+        }
 
     last_error = ""
     provider_configured = bool(
@@ -3437,15 +3531,16 @@ def _pdf_series_items(value):
     return out
 
 
-def _pdf_item_row_height(desc_lines_count, series_count, desc_gap, serie_gap, extra_lines=0):
-    base = 4.2
+def _pdf_item_row_height(desc_lines_count, series_count, desc_gap, serie_gap, extra_lines=0, compact=False):
+    # compact=True: filas más bajas para 9+ ítems sin mezclar con el pie
+    base = 2.8 if compact else 4.2
     height = base + max(1, desc_lines_count) * desc_gap
     if series_count:
-        height += 2.0
+        height += (1.0 if compact else 2.0)
         height += series_count * serie_gap
     if extra_lines:
         height += extra_lines * serie_gap
-    return max(6.5, height)
+    return max(5.6 if compact else 6.5, height)
 
 
 def _pdf_money(value):
@@ -3523,7 +3618,7 @@ def _draw_pdf_logo(c, cfg, x, y, w, h, mm_unit, page_h):
 
 
 def public_base_url():
-    return (os.getenv("PUBLIC_BASE_URL") or os.getenv("APP_PUBLIC_URL") or "https://erp-api-7x3d.onrender.com").rstrip("/")
+    return (os.getenv("PUBLIC_BASE_URL") or os.getenv("APP_PUBLIC_URL") or "http://64.181.176.160:8000").rstrip("/")
 
 
 def public_document_url(documento):
@@ -3632,7 +3727,16 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     tx, ty, tw = 7.0, 69.5, 199.0
     header_h = 4.8
     row_h = 6.5
-    th = header_h + (row_h * max_rows)
+    detalle_list = list(detalle or [])
+    item_count = len(detalle_list)
+    # Tope de tabla: dejar espacio para importe/totales/usuario/bancos (evita mezcla en el 9.º ítem)
+    # Con 9 ítems + series se necesita ~95–100 mm de grilla; pie arranca ~172+
+    footer_reserve_top = 172.0 if item_count >= 9 else 168.0
+    max_table_h = max(58.0, footer_reserve_top - ty)
+    th = min(header_h + (row_h * max_rows), max_table_h)
+    # Compactar tipografía con muchos ítems (misma lógica que PC v1.0.74)
+    pack_tight = item_count >= 8
+    pack_hard = item_count >= 11
     rect(tx, ty, tw, th)
     c.setFillGray(0); c.rect(X(tx), Y(ty + header_h), X(tw), X(header_h), fill=1, stroke=0); c.setFillGray(1)
     cols = [tx, tx + 8.5, tx + 28.5, tx + 144.0, tx + 160.0, tx + 180.0, tx + tw]
@@ -3645,64 +3749,110 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         line(cx, ty, cx, ty + th)
 
     row_y = ty + header_h + 4.5
-    for idx, item in enumerate((detalle or [])[:max_rows], start=1):
+    bottom_limit = ty + th - 1.5
+    printed = 0
+    extra_items = []
+    for idx, item in enumerate(detalle_list, start=1):
+        if printed >= max_rows:
+            extra_items.extend(detalle_list[idx - 1:])
+            break
         qty = float(item.get("cantidad") or 0)
         price = float(item.get("precio_unitario") or item.get("precio") or 0)
         total = float(item.get("total") or qty * price)
         desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
         series = str(item.get("series_texto") or item.get("serie") or "").strip()
         series_items = _pdf_series_items(series)
-        desc_max = 2 if series_items else 3
-        desc_font = 6.8 if series_items else (6.25 if len(desc) > 82 else 7.35)
-        desc_gap = 2.35 if series_items else (2.05 if len(desc) > 82 else 2.25)
-        serie_font = 6.4 if len(series_items) >= 4 else 6.6
-        serie_gap = 3.1 if len(series_items) >= 3 else 3.4
+        # Compactar con 8–9+ ítems para que no se corran/mezclen las líneas
+        if pack_hard:
+            desc_max = 1
+            desc_font = 5.9
+            desc_gap = 2.0
+            serie_font = 5.0
+            serie_gap = 2.1
+            max_series_show = 1
+            use_compact_h = True
+        elif pack_tight:
+            desc_max = 1 if series_items else 2
+            desc_font = 6.1 if series_items else 6.4
+            desc_gap = 2.05
+            serie_font = 5.2
+            serie_gap = 2.15
+            max_series_show = 1
+            use_compact_h = True
+        else:
+            desc_max = 2 if series_items else 3
+            desc_font = 6.8 if series_items else (6.25 if len(desc) > 82 else 7.35)
+            desc_gap = 2.35 if series_items else (2.05 if len(desc) > 82 else 2.25)
+            serie_font = 6.4 if len(series_items) >= 4 else 6.6
+            serie_gap = 3.1 if len(series_items) >= 3 else 3.4
+            max_series_show = 4
+            use_compact_h = False
         desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
-        shown = list(series_items)
-        overflow = 0
-        item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, overflow)
-        remaining_h = (ty + th) - (ty + header_h + 4.5) - (row_y - (ty + header_h + 4.5))
+        shown = list(series_items[:max_series_show])
+        overflow = max(0, len(series_items) - len(shown))
+        item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, 1 if overflow else 0, compact=use_compact_h)
+        remaining_h = bottom_limit - row_y
+        if remaining_h < 5.2:
+            extra_items.extend(detalle_list[idx - 1:])
+            break
         if item_h > remaining_h and remaining_h > 0:
-            compact_gap = max(2.6, serie_gap - 0.5)
-            compact_font = max(6.0, serie_font - 0.3)
-            while shown and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, overflow) > remaining_h:
+            compact_gap = max(2.0, serie_gap - 0.4)
+            compact_font = max(4.8, serie_font - 0.3)
+            while shown and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, 1 if overflow else 0, compact=True) > remaining_h:
                 shown = shown[:-1]
                 overflow = len(series_items) - len(shown)
+            while len(desc_lines) > 1 and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, 1 if overflow else 0, compact=True) > remaining_h:
+                desc_lines = desc_lines[:-1]
             serie_gap = compact_gap
             serie_font = compact_font
-            item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, overflow)
-        txt_c(centers[0], row_y, idx, 8.0)
-        txt_c(centers[1], row_y, "UNIDADES", 7.8)
+            item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, 1 if overflow else 0, compact=True)
+            if item_h > remaining_h:
+                extra_items.extend(detalle_list[idx - 1:])
+                break
+        # Separador suave entre filas (evita que se vean “corridas”)
+        if printed > 0:
+            c.setStrokeGray(0.85)
+            line(tx + 0.3, row_y - 0.9, tx + tw - 0.3, row_y - 0.9)
+            c.setStrokeGray(0)
+        num_size = 7.2 if pack_tight else 8.0
+        txt_c(centers[0], row_y, idx, num_size)
+        txt_c(centers[1], row_y, "UNIDADES", 7.0 if pack_tight else 7.8)
         cursor_y = row_y
         for ln in desc_lines:
             txt(cols[2] + 1.6, cursor_y, ln, desc_font, True)
             cursor_y += desc_gap
         if shown:
-            cursor_y += 1.6
+            cursor_y += 0.9 if use_compact_h else 1.2
             for sidx, serie_line in enumerate(shown):
                 prefix = "S/N: " if sidx == 0 else "     "
-                for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 2):
+                for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 1 if use_compact_h else 2):
                     txt(cols[2] + 1.6, cursor_y, ln, serie_font)
                     cursor_y += serie_gap
             if overflow:
-                txt(cols[2] + 1.6, cursor_y, f"     +{overflow} serie(s) mas", 5.8)
-        txt_r(cols[4] - 1.2, row_y, f"{qty:.2f}", 8.0)
-        txt_r(cols[5] - 1.2, row_y, _pdf_money(total), 8.0)
-        txt_r(cols[6] - 1.2, row_y, _pdf_money(price), 8.0)
-        row_y += max(item_h, row_h)
+                txt(cols[2] + 1.6, cursor_y, f"     +{overflow} serie(s) mas", 5.5)
+        txt_r(cols[4] - 1.2, row_y, f"{qty:.2f}", num_size)
+        txt_r(cols[5] - 1.2, row_y, _pdf_money(total), num_size)
+        txt_r(cols[6] - 1.2, row_y, _pdf_money(price), num_size)
+        row_y += max(item_h, 5.8 if use_compact_h else row_h)
+        printed += 1
 
-    total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle or []))
+    if extra_items:
+        txt(tx + 2, min(row_y + 1.5, ty + th - 2), f"Continua pag. 2: {len(extra_items)} item(s)", 5.5, True)
+
+    total_doc = float(documento.get("total") or sum(float(x.get("total") or 0) for x in detalle_list))
     igv_doc = float(documento.get("igv") or 0)
     subtotal_doc = float(documento.get("subtotal") or 0)
     if igv_doc <= 0 or subtotal_doc <= 0 or subtotal_doc >= total_doc:
         subtotal_doc = round(total_doc / 1.18, 2) if total_doc else 0
         igv_doc = round(total_doc - subtotal_doc, 2)
-    line(tx, ty + th, tx + tw, ty + th)
-    words_y = ty + th + 4.0
+    table_bottom = ty + th
+    line(tx, table_bottom, tx + tw, table_bottom)
+    words_y = table_bottom + 4.0
     txt_c(tx + tw / 2, words_y, _pdf_words_soles(total_doc), 6.2)
-    line(tx, ty + th + 7.2, tx + tw, ty + th + 7.2)
+    line(tx, table_bottom + 7.2, tx + tw, table_bottom + 7.2)
 
-    block_y = ty + th + 7.0
+    # Totales e info siempre debajo de la tabla (nunca dentro de la grilla)
+    block_y = table_bottom + 7.0
     totals_x, totals_y = 141, block_y
     rect(totals_x, totals_y, 71, 22)
     line(totals_x, totals_y + 7, totals_x + 71, totals_y + 7)
@@ -3710,21 +3860,42 @@ def generar_pdf_documento_original(documento, detalle, cfg):
     txt(totals_x + 3, totals_y + 4, "GRAVADO", 10.2, True); txt(totals_x + 36, totals_y + 4, "S/", 10.0); txt_r(totals_x + 68, totals_y + 4, _pdf_money(subtotal_doc), 10.0)
     txt(totals_x + 3, totals_y + 11, "I.G.V. 18%", 10.2, True); txt(totals_x + 36, totals_y + 11, "S/", 10.0); txt_r(totals_x + 68, totals_y + 11, _pdf_money(igv_doc), 10.0)
     txt(totals_x + 3, totals_y + 18, "TOTAL", 10.8, True); txt(totals_x + 36, totals_y + 18, "S/", 10.8, True); txt_r(totals_x + 68, totals_y + 18, _pdf_money(total_doc), 10.8, True)
+    totals_bottom = totals_y + 22
 
-    info_y = 176
+    info_y = max(table_bottom + 12.0, block_y)
+    # Si la tabla es corta, mantener look clásico ~176; si no, bajar con la tabla
+    info_y = max(info_y, min(176.0, table_bottom + 12.0))
+    info_y = max(info_y, table_bottom + 12.0)
     txt(7.0, info_y, "USUARIO", 7.0, True); txt(65, info_y, f"{documento.get('usuario_emisor') or 'COMPUTER ARMY'} - {fecha}", 6.6)
     condicion_pago = "COTIZACION" if is_proforma_doc else (documento.get("estado_pago") or "CONTADO")
     txt(7.0, info_y + 4.8, "CONDICION DE PAGO", 7.0, True); txt(65, info_y + 4.8, condicion_pago, 6.8)
     txt(65, info_y + 12.0, "CUENTAS BANCARIAS", 6.8, True)
-    txt(94, info_y + 12.0, f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}", 6.5)
-    txt(65, info_y + 16.0, "Titular:Computer Army Eirl", 6.5)
-    txt(65, info_y + 23.2, f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}", 6.3)
-    txt(65, info_y + 27.2, "Titular: Computer Army eirl", 6.5)
+    bank_max_mm = max(40, totals_x - 65 - 2)
+    # Limitar ancho de bancos para no chocar con el bloque TOTAL
+    for i, bank_line in enumerate([
+        f"Bcp soles :{cfg.get('cuenta_bcp') or '1941066028058'}",
+        "Titular:Computer Army Eirl",
+        f"Interbank soles cuenta corriente : {cfg.get('cuenta_interbank') or '2003005323345'}",
+        "Titular: Computer Army eirl",
+    ]):
+        by = info_y + 12.0 + (i * 4.0 if i < 2 else 4.0 + (i - 1) * 4.0)
+        if i == 0:
+            by = info_y + 12.0
+            txt(94, by, bank_line, 6.5)
+        elif i == 1:
+            txt(65, info_y + 16.0, bank_line, 6.5)
+        elif i == 2:
+            txt(65, info_y + 23.2, bank_line, 6.3)
+        else:
+            txt(65, info_y + 27.2, bank_line, 6.5)
+    banks_bottom = info_y + 31.0
+    qr_y = max(totals_bottom + 2.0, info_y + 27.0)
     qr_url = public_document_url(documento)
-    if not _draw_pdf_qr(c, qr_url, 181, info_y + 27, 20, mm, page_h):
-        rect(181, info_y + 27, 20, 20)
+    if not _draw_pdf_qr(c, qr_url, 181, qr_y, 20, mm, page_h):
+        rect(181, qr_y, 20, 20)
 
-    legal_y = 216
+    legal_y = max(banks_bottom + 4.0, totals_bottom + 4.0, qr_y + 22.0)
+    legal_y = min(legal_y, 248.0)
     if is_proforma_doc:
         txt(5.0, legal_y, "COTIZACION - NO TIENE VALIDEZ TRIBUTARIA", 7.0, True)
         txt(5.0, legal_y + 5, f"VALIDA SOLO POR 48 HORAS HASTA {venc}", 7.0, True)
@@ -3736,7 +3907,9 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         txt(5.0, legal_y + 10, "Para consultar el comprobante visita G&G ERP", 8.6)
         txt(5.0, legal_y + 15, "Resumen", 8.6)
     texts = editor.get("texts") if isinstance(editor.get("texts"), dict) else {}
-    wy = 244
+    wy = max(legal_y + 24.0, 244.0)
+    if wy > 269:
+        wy = 269
     for key in ("garantia_1", "garantia_2", "garantia_3", "garantia_4", "garantia_5", "garantia_6"):
         text = texts.get(key, "")
         if text:
@@ -3744,7 +3917,52 @@ def generar_pdf_documento_original(documento, detalle, cfg):
             wy += 4.3
             if wy > 268:
                 break
-    c.showPage()
+
+    # Página 2 si no cupieron ítems (descripciones largas / muchas series)
+    if extra_items:
+        c.showPage()
+        font("Helvetica-Bold", 12)
+        c.drawString(X(10), Y(14), f"{empresa[:46]} - DETALLE DE PRODUCTOS")
+        font("Helvetica", 9)
+        c.drawString(X(10), Y(21), f"{doc_type} {numero} | Cliente: {cliente[:70]}")
+        c.drawRightString(X(200), Y(21), "Pagina 2")
+        ex, ey, ew, eh = 8.0, 31.0, 194.0, 230.0
+        rect(ex, ey, ew, eh)
+        c.setFillGray(0)
+        c.rect(X(ex), Y(ey + 7), X(ew), X(7), fill=1, stroke=0)
+        c.setFillGray(1)
+        txt_c(ex + 5, ey + 5, "Nro", 7, True)
+        txt_c(ex + 20, ey + 5, "UNIDAD", 7, True)
+        txt(ex + 37, ey + 5, "DESCRIPCION", 7, True)
+        txt_c(ex + ew - 45, ey + 5, "CANT.", 7, True)
+        txt_c(ex + ew - 25, ey + 5, "TOTAL", 7, True)
+        txt_c(ex + ew - 8, ey + 5, "P.U.", 7, True)
+        c.setFillGray(0)
+        ry = ey + 12
+        for j, item in enumerate(extra_items, start=printed + 1):
+            if ry > ey + eh - 8:
+                break
+            qty = float(item.get("cantidad") or 0)
+            price = float(item.get("precio_unitario") or item.get("precio") or 0)
+            total = float(item.get("total") or qty * price)
+            desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
+            series = str(item.get("series_texto") or item.get("serie") or "").strip()
+            txt_c(ex + 5, ry, j, 7)
+            txt_c(ex + 20, ry, "UNIDADES", 6)
+            dlines = fit(desc, 110, "Helvetica-Bold", 7, 2)
+            cy = ry
+            for ln in dlines:
+                txt(ex + 37, cy, ln, 7, True)
+                cy += 3.2
+            if series:
+                for ln in fit(f"S/N: {series}", 110, "Helvetica", 6, 2):
+                    txt(ex + 37, cy, ln, 6)
+                    cy += 2.8
+            txt_r(ex + ew - 38, ry, f"{qty:.2f}", 7)
+            txt_r(ex + ew - 18, ry, _pdf_money(total), 7)
+            txt_r(ex + ew - 2, ry, _pdf_money(price), 7)
+            ry = max(cy + 2.5, ry + 9)
+
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
@@ -3752,14 +3970,23 @@ def generar_pdf_documento_original(documento, detalle, cfg):
 
 # ================= CLIENTES =================
 @app.get("/consulta/documento/{numero}")
-def consulta_documento(numero: str, sucursal: str = DEFAULT_SUCURSAL):
-    return consulta_documento_impl(numero, sucursal)
+def consulta_documento(numero: str, sucursal: str = DEFAULT_SUCURSAL, tipo: str = ""):
+    return consulta_documento_impl(numero, sucursal, tipo_preferido=tipo)
 
 
 @app.get("/consulta/documento")
-def consulta_documento_query(numero: str = "", documento: str = "", dni: str = "", ruc: str = "", sucursal: str = DEFAULT_SUCURSAL):
-    value = numero or documento or dni or ruc
-    return consulta_documento_impl(value, sucursal)
+def consulta_documento_query(
+    numero: str = "",
+    documento: str = "",
+    dni: str = "",
+    ruc: str = "",
+    ce: str = "",
+    tipo: str = "",
+    sucursal: str = DEFAULT_SUCURSAL,
+):
+    value = numero or documento or dni or ruc or ce
+    prefer = tipo or ("DNI" if dni else "RUC" if ruc else "CE" if ce else "")
+    return consulta_documento_impl(value, sucursal, tipo_preferido=prefer)
 
 
 @app.get("/consulta/dni/{dni}")
@@ -5086,15 +5313,50 @@ def limpiar_duplicados_web(data: dict = None):
 
 
 @app.get("/series")
-def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
+def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL, exact: bool = False):
+    """Busqueda de series. exact=1 hace match exacto (mucho mas rapido para validar en ventas)."""
     conn = get_conn()
     cur = conn.cursor()
     sucursal = inventario_sucursal(sucursal)
-    texto = f"%{(q or '').lower()}%"
-    serie_norm = re.sub(r"[^A-Z0-9]", "", str(q or "").upper())
-    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
-    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
-    cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    q_raw = str(q or "").strip()
+    texto = f"%{q_raw.lower()}%"
+    serie_norm = re.sub(r"[^A-Z0-9]", "", q_raw.upper())
+    cache_key = f"series|{sucursal}|{serie_norm or q_raw.lower()}|{'e' if exact else 'f'}"
+    if serie_norm and len(serie_norm) >= 4:
+        cached = _api_cache_get(cache_key, 45)
+        if cached is not None:
+            release_conn(conn)
+            return JSONResponse(cached, headers={"X-Api-Cache": "HIT"})
+    # exact: solo serie normalizada (escaneo / validacion ventas)
+    if exact and serie_norm:
+        cur.execute("""
+        SELECT
+            ps.id,
+            ps.producto_id,
+            p.nombre AS producto_nombre,
+            p.marca,
+            p.modelo,
+            ps.serie,
+            ps.proveedor,
+            ps.estado,
+            COALESCE(ps.almacen, 'TIENDA') AS almacen,
+            COALESCE(ps.usuario_ingreso, '') AS usuario_ingreso,
+            ps.fecha_ingreso,
+            ps.fecha_salida,
+            ps.creado_en
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id = ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g') = %s
+        ORDER BY ps.id DESC
+        LIMIT 20
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, serie_norm))
+        data = [_jsonable_row(r) for r in dict_fetchall(cur)]
+        release_conn(conn)
+        if serie_norm and len(serie_norm) >= 4:
+            _api_cache_set(cache_key, data)
+        return JSONResponse(data, headers={"X-Api-Cache": "MISS"})
+
     cur.execute("""
     SELECT
         ps.id,
@@ -5123,10 +5385,13 @@ def listar_series(q: str = "", sucursal: str = DEFAULT_SUCURSAL):
        OR LOWER(COALESCE(p.marca,'')) LIKE %s
        OR LOWER(COALESCE(p.modelo,'')) LIKE %s)
     ORDER BY ps.id DESC
+    LIMIT 80
     """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, texto, texto, serie_norm, serie_norm, texto, texto, texto, texto, texto, texto))
-    data = dict_fetchall(cur)
+    data = [_jsonable_row(r) for r in dict_fetchall(cur)]
     release_conn(conn)
-    return data
+    if serie_norm and len(serie_norm) >= 4:
+        _api_cache_set(cache_key, data)
+    return JSONResponse(data, headers={"X-Api-Cache": "MISS"})
 
 
 @app.get("/series/duplicadas")
@@ -6329,6 +6594,8 @@ def crear_venta(data: Venta):
         conn.commit()
         release_conn(conn)
         invalidate_productos_cache(sucursal)
+        invalidate_api_cache("documentos|")
+        invalidate_api_cache("caja|")
 
         sunat_auto = None
         if doc_tipo_upper in ("BOLETA", "FACTURA") and legal_sunat:
@@ -6629,20 +6896,24 @@ def convertir_proforma_documento(documento_id: int, data: DocumentoConvertirUpda
 
 @app.get("/documentos")
 def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str = ""):
+    """Lista liviana de documentos (caja/boletas). Sin base64 de comprobantes ni detalle completo."""
     conn = None
     try:
         sucursal = norm_sucursal(sucursal)
         filtro_fecha = (fecha or "").strip()
         texto_q = (q or "").strip().lower()
-        cache_key = f"documentos|{sucursal}|{filtro_fecha}|{texto_q}"
+        cache_key = f"documentos|lite|{sucursal}|{filtro_fecha}|{texto_q}"
+        # Cache un poco mas largo: listados se revalidan al abrir modulo
         if not texto_q:
-            cached = _api_cache_get(cache_key, 30)
+            cached = _api_cache_get(cache_key, 90)
             if cached is not None:
-                return JSONResponse(cached, headers={"X-Api-Cache": "HIT"})
+                return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=30"})
         texto = f"%{texto_q}%"
         conn = get_conn()
         cur = conn.cursor()
 
+        # Query liviana: NO trae comprobante_pago (base64) ni string_agg de detalle.
+        # Busqueda por detalle solo con EXISTS (sin materializar el texto).
         cur.execute("""
         SELECT
             v.id,
@@ -6666,26 +6937,18 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
             COALESCE(v.pagos_detalle_json, '') AS pagos_detalle_json,
             COALESCE(v.saldo_pago, GREATEST(COALESCE(v.total,0) - COALESCE(v.monto_pagado,0), 0)) AS saldo_pago,
             COALESCE(v.observacion_pago, '') AS observacion_pago,
-            COALESCE(v.comprobante_pago, '') AS comprobante_pago,
             COALESCE(v.comprobante_pago_nombre, '') AS comprobante_pago_nombre,
             COALESCE(v.comprobante_pago_mime, '') AS comprobante_pago_mime,
             COALESCE(v.comprobante_pago_tamano, 0) AS comprobante_pago_tamano,
-            COALESCE(v.comprobantes_pago_json, '') AS comprobantes_pago_json,
+            CASE
+              WHEN COALESCE(v.comprobantes_pago_json, '') <> '' AND COALESCE(v.comprobantes_pago_json, '') NOT IN ('[]','null')
+                THEN 1
+              WHEN COALESCE(v.comprobante_pago, '') <> '' THEN 1
+              ELSE 0
+            END AS comprobantes_pago_count,
             COALESCE(v.sunat_estado, 'PENDIENTE') AS sunat_estado,
             COALESCE(v.sunat_modo, 'MANUAL') AS sunat_modo,
-            v.sunat_fecha,
-            COALESCE((
-                SELECT string_agg(
-                    COALESCE(vd.descripcion,'') || ' ' ||
-                    COALESCE(vd.marca,'') || ' ' ||
-                    COALESCE(vd.modelo,'') || ' ' ||
-                    COALESCE(vd.series_texto,''),
-                    ' '
-                )
-                FROM ventas_detalle vd
-                WHERE vd.venta_id = v.id
-                  AND COALESCE(vd.sucursal,%s)=%s
-            ), '') AS detalle_busqueda
+            v.sunat_fecha
         FROM ventas v
         WHERE COALESCE(v.sucursal,%s)=%s
           AND (%s='' OR TO_CHAR(v.fecha, 'YYYY-MM-DD')=%s)
@@ -6706,8 +6969,8 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
                            OR LOWER(COALESCE(vd.series_texto,'')) LIKE %s)
                ))
         ORDER BY v.id DESC
+        LIMIT 800
         """, (
-            DEFAULT_SUCURSAL, sucursal,
             DEFAULT_SUCURSAL, sucursal, filtro_fecha, filtro_fecha,
             texto, texto, texto, texto, texto, texto,
             DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto,
@@ -6716,14 +6979,34 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
         rows = []
         for r in data:
             row = _jsonable_row(r)
-            row["comprobantes_pago"] = comprobantes_metadata_liviana(row.get("comprobantes_pago_json"))
-            row["comprobantes_pago_count"] = len(row["comprobantes_pago"])
+            # pagos_detalle sin blobs pesados
+            try:
+                pagos = cargar_comprobantes_json(row.get("pagos_detalle_json"))
+            except Exception:
+                pagos = []
+            if isinstance(pagos, list):
+                clean_pagos = []
+                for p in pagos:
+                    if not isinstance(p, dict):
+                        continue
+                    clean_pagos.append({
+                        "metodo": p.get("metodo") or p.get("metodo_pago") or "",
+                        "metodo_pago": p.get("metodo_pago") or p.get("metodo") or "",
+                        "monto": p.get("monto") or p.get("monto_pagado") or 0,
+                        "monto_pagado": p.get("monto_pagado") or p.get("monto") or 0,
+                    })
+                row["pagos_detalle"] = clean_pagos
+            else:
+                row["pagos_detalle"] = []
+            row["pagos_detalle_json"] = ""
+            row["comprobante_pago"] = ""
             row["comprobantes_pago_json"] = ""
-            row["pagos_detalle"] = cargar_comprobantes_json(row.get("pagos_detalle_json"))
+            row["comprobantes_pago"] = []
+            row["tiene_comprobante"] = int(row.get("comprobantes_pago_count") or 0) > 0
             rows.append(row)
         if not texto_q:
             _api_cache_set(cache_key, rows)
-            return JSONResponse(rows, headers={"X-Api-Cache": "MISS"})
+            return JSONResponse(rows, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=30"})
         return rows
     except Exception as e:
         import traceback
@@ -8985,6 +9268,11 @@ def listar_caja(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    cache_key = f"caja|{sucursal}"
+    cached = _api_cache_get(cache_key, 45)
+    if cached is not None:
+        release_conn(conn)
+        return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=15"})
     cur.execute("""
     SELECT id, fecha, tipo, detalle, monto, usuario,
            COALESCE(documento_tipo, '') AS documento_tipo,
@@ -8996,10 +9284,12 @@ def listar_caja(sucursal: str = DEFAULT_SUCURSAL):
     FROM caja_movimientos
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY id DESC
+    LIMIT 500
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
-    data = dict_fetchall(cur)
+    data = [_jsonable_row(r) for r in dict_fetchall(cur)]
     release_conn(conn)
-    return data
+    _api_cache_set(cache_key, data)
+    return JSONResponse(data, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=15"})
 
 
 @app.post("/caja")
@@ -9024,6 +9314,7 @@ def registrar_caja(data: CajaMovimiento):
     movimiento_id = cur.fetchone()[0]
     conn.commit()
     release_conn(conn)
+    invalidate_api_cache("caja|")
     return {"ok": True, "id": movimiento_id}
 
 
@@ -9117,9 +9408,15 @@ def _parse_compra_items(raw):
 
 @app.get("/compras")
 def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
+    """Lista liviana: sin items_json completo (va en GET /compras/{id})."""
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    cache_key = f"compras|lite|{sucursal}"
+    cached = _api_cache_get(cache_key, 60)
+    if cached is not None:
+        release_conn(conn)
+        return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=20"})
     cur.execute("""
     SELECT id, fecha, COALESCE(proveedor_nombre,'') AS proveedor_nombre,
            COALESCE(comprobante,'') AS comprobante, COALESCE(total,0) AS total,
@@ -9129,7 +9426,7 @@ def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
     FROM compras
     WHERE COALESCE(sucursal,%s)=%s
     ORDER BY fecha DESC, id DESC
-    LIMIT 500
+    LIMIT 300
     """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
     data = []
     for row in dict_fetchall(cur):
@@ -9143,9 +9440,12 @@ def listar_compras(sucursal: str = DEFAULT_SUCURSAL):
             )
             for it in items
         )
+        # No devolver el JSON completo en el listado (acelera la respuesta)
+        item["items_json"] = ""
         data.append(item)
     release_conn(conn)
-    return data
+    _api_cache_set(cache_key, data)
+    return JSONResponse(data, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=20"})
 
 
 @app.get("/compras/{compra_id}")
@@ -9368,6 +9668,8 @@ def guardar_compra(data: Compra):
             commit=False,
         )
         conn.commit()
+        invalidate_productos_cache(sucursal)
+        invalidate_api_cache("compras|")
         return {"ok": True, "success": True, "id": compra_id}
     except Exception as exc:
         conn.rollback()
