@@ -1,23 +1,79 @@
 name: Render Keep Alive
 
+# Mantiene despierto el free tier de Render.
+# Cold start puede tardar 30-90s; por eso hay reintentos largos.
+# Si el servicio esta SUSPENDED en Render, este workflow NO puede reactivarlo
+# (hay que Resume en el dashboard o con la API).
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # Cada 8 min (GitHub puede retrasar un poco los cron)
+    - cron: "*/8 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  RENDER_URL: https://erp-api-7x3d.onrender.com
+
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Ping ERP health
-        run: curl -fsS --max-time 60 "https://erp-api-7x3d.onrender.com/health"
+      - name: Wake + health (reintentos cold-start)
+        id: health
+        run: |
+          set -uo pipefail
+          URL="${RENDER_URL}/health"
+          ok=0
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "=== Intento $i/8: $URL ==="
+            code=$(curl -sS -o /tmp/ping_body.txt -w "%{http_code}" --connect-timeout 20 --max-time 100 "$URL" || echo "000")
+            body=$(head -c 300 /tmp/ping_body.txt 2>/dev/null || true)
+            echo "HTTP $code"
+            echo "body: $body"
+
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              ok=1
+              break
+            fi
+
+            if echo "$body" | grep -qi "suspended"; then
+              echo "::error::Servicio Render SUSPENDED. Ve a dashboard.render.com y dale Resume al servicio erp-api. El keep-alive no puede despertar un servicio suspendido."
+              exit 1
+            fi
+
+            # 502/503/000 típicos de cold start o sleep
+            sleep 12
+          done
+
+          if [ "$ok" != "1" ]; then
+            echo "::error::Health fallo despues de reintentos. Revisa Render logs y que el servicio no este suspendido."
+            exit 1
+          fi
+          echo "Health OK"
 
       - name: Warm productos lite
-        run: curl -fsS --max-time 90 "https://erp-api-7x3d.onrender.com/productos?lite=1&sucursal=computer_army" -o /dev/null
+        if: success()
+        continue-on-error: true
+        run: |
+          curl -sS --connect-timeout 20 --max-time 100 \
+            "${RENDER_URL}/productos?lite=1&sucursal=computer_army" \
+            -o /dev/null -w "productos HTTP %{http_code} time %{time_total}\n"
 
       - name: Warm ERP web shell
-        run: curl -fsS --max-time 60 "https://erp-api-7x3d.onrender.com/erp/" -o /dev/null
+        if: success()
+        continue-on-error: true
+        run: |
+          curl -sS --connect-timeout 20 --max-time 80 \
+            "${RENDER_URL}/erp/" \
+            -o /dev/null -w "erp shell HTTP %{http_code} time %{time_total}\n"
+
+      - name: Warm root
+        if: success()
+        continue-on-error: true
+        run: |
+          curl -sS --connect-timeout 15 --max-time 60 \
+            "${RENDER_URL}/" \
+            -o /dev/null -w "root HTTP %{http_code} time %{time_total}\n"
