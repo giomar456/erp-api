@@ -235,6 +235,26 @@ def erp_favicon():
     return FileResponse(target) if os.path.exists(target) else {"ok": False}
 
 
+@app.get("/favicon.ico")
+@app.get("/icono.ico")
+def erp_favicon_ico():
+    for name in ("favicon.ico", "icono.ico"):
+        target = os.path.join(WEBAPP_DIR, name)
+        if os.path.exists(target):
+            return FileResponse(target, media_type="image/x-icon")
+    return {"ok": False}
+
+
+@app.get("/favicon.png")
+@app.get("/logo-sistema.png")
+def erp_logo_sistema():
+    for name in ("logo-sistema.png", "favicon.png", "app-logo.png", "army-logo-doc.png"):
+        target = os.path.join(WEBAPP_DIR, name)
+        if os.path.exists(target):
+            return FileResponse(target, media_type="image/png")
+    return {"ok": False}
+
+
 @app.get("/icons.svg")
 def erp_icons():
     target = os.path.join(WEBAPP_DIR, "icons.svg")
