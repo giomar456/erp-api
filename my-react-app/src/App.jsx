@@ -3139,6 +3139,7 @@ function VentasView({ user, sound, soundEnabled, setView }) {
         usuario_emisor: user,
       };
       clearProcessedSaleTab();
+      try { window.dispatchEvent(new CustomEvent('gg-erp-documentos-changed', { detail: { source: 'venta' } })); } catch {}
       setView?.(isProforma ? 'documentos' : 'caja');
       if (issuedDoc.id) {
         setViewer(await buildDocumentViewer(issuedDoc));
@@ -3847,22 +3848,48 @@ function CajaView({ sound, soundEnabled, user, setView }) {
   const [movement, setMovement] = useState({ tipo: 'INGRESO', detalle: '', monto: '' });
   const [receiptFiles, setReceiptFiles] = useState([]);
   const [saving, setSaving] = useState(false);
+  const [loadingDocs, setLoadingDocs] = useState(false);
+  const [lastRefreshAt, setLastRefreshAt] = useState('');
+  const [liveStatus, setLiveStatus] = useState('en vivo');
+  const selectedIdRef = useRef('');
+  const cashDateRef = useRef(cashDate);
+  const cashSearchRef = useRef(cashSearch);
+  const lastSeenDocKeyRef = useRef('');
   const selected = docs.find((doc) => String(doc.id) === String(selectedId));
   const canEditDocuments = canEditProcessedDocuments(user);
+  useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
+  useEffect(() => { cashDateRef.current = cashDate; }, [cashDate]);
+  useEffect(() => { cashSearchRef.current = cashSearch; }, [cashSearch]);
 
-  const load = async (date = cashDate, query = cashSearch) => {
-    const params = {};
-    const cleanQuery = String(query || '').trim();
-    if (date && !cleanQuery) params.fecha = date;
-    if (cleanQuery) params.q = cleanQuery;
-    const [docRes, cajaRes] = await Promise.all([
-      apiFetch('/documentos', { params }),
-      apiFetch('/caja'),
-    ]);
-    const cleanDocs = asArray(docRes).filter((doc) => DOCS_CAJA.has(String(doc.tipo || '').toUpperCase()));
-    setDocs(cleanDocs);
-    setMovs(asArray(cajaRes));
-    if (!cleanDocs.some((doc) => String(doc.id) === String(selectedId))) setSelectedId(cleanDocs[0] ? String(cleanDocs[0].id) : '');
+  const load = async (date = cashDateRef.current, query = cashSearchRef.current, opts = {}) => {
+    const silent = !!opts.silent;
+    if (!silent) setLoadingDocs(true);
+    try {
+      const params = {};
+      const cleanQuery = String(query || '').trim();
+      if (date && !cleanQuery) params.fecha = date;
+      if (cleanQuery) params.q = cleanQuery;
+      const [docRes, cajaRes] = await Promise.all([
+        apiFetch('/documentos', { params }),
+        apiFetch('/caja'),
+      ]);
+      const cleanDocs = asArray(docRes).filter((doc) => DOCS_CAJA.has(String(doc.tipo || '').toUpperCase()) || !!doc.es_pase);
+      setDocs(cleanDocs);
+      setMovs(asArray(cajaRes));
+      const keepId = selectedIdRef.current;
+      if (!cleanDocs.some((doc) => String(doc.id) === String(keepId))) {
+        setSelectedId(cleanDocs[0] ? String(cleanDocs[0].id) : '');
+      }
+      if (cleanDocs[0]) {
+        lastSeenDocKeyRef.current = `${cleanDocs[0].id}-${cleanDocs[0].numero}-${cleanDocs[0].total}-${cleanDocs[0].estado_pago || ''}`;
+      }
+      setLastRefreshAt(new Date().toLocaleTimeString());
+      setLiveStatus('en vivo');
+    } catch (error) {
+      setLiveStatus('reconectando...');
+    } finally {
+      if (!silent) setLoadingDocs(false);
+    }
   };
   const shiftCashDate = (days) => {
     const base = cashDate ? new Date(`${cashDate}T12:00:00`) : new Date();
@@ -3872,6 +3899,49 @@ function CajaView({ sound, soundEnabled, user, setView }) {
     load(next, '');
   };
   useEffect(() => { load(cashDate); }, []);
+  // Auto-refresh: boletas nuevas y cambios de pago sin F5
+  useEffect(() => {
+    let active = true;
+    const tick = async () => {
+      if (!active || document.hidden) return;
+      try {
+        const res = await apiFetch('/documentos/ultimo');
+        const newest = res?.data || null;
+        if (!newest?.id) return;
+        const key = `${newest.id}-${newest.numero}-${newest.total}-${newest.estado_pago || ''}`;
+        if (!lastSeenDocKeyRef.current) {
+          lastSeenDocKeyRef.current = key;
+          return;
+        }
+        if (key !== lastSeenDocKeyRef.current) {
+          lastSeenDocKeyRef.current = key;
+          await load(cashDateRef.current, cashSearchRef.current, { silent: true });
+          if (soundEnabled) {
+            try { await sound?.play?.(); } catch {}
+          }
+        }
+      } catch {
+        setLiveStatus('reconectando...');
+      }
+    };
+    const timer = window.setInterval(tick, 3000);
+    const fullTimer = window.setInterval(() => {
+      if (!document.hidden) load(cashDateRef.current, cashSearchRef.current, { silent: true });
+    }, 10000);
+    const onChanged = () => load(cashDateRef.current, cashSearchRef.current, { silent: true });
+    const onFocus = () => load(cashDateRef.current, cashSearchRef.current, { silent: true });
+    window.addEventListener('gg-erp-documentos-changed', onChanged);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.clearInterval(fullTimer);
+      window.removeEventListener('gg-erp-documentos-changed', onChanged);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [soundEnabled]);
   useEffect(() => {
     if (!selected) return;
     const total = Number(selected.total || 0);
@@ -4057,7 +4127,7 @@ function CajaView({ sound, soundEnabled, user, setView }) {
         <Stat label="Documentos" value={docs.length} tone="blue" />
       </div>
       <div className="grid gap-4 xl:grid-cols-[1fr_430px]">
-        <Card title="Caja / Boletas y facturas" actions={<><TextInput placeholder="Buscar producto en todas las fechas..." value={cashSearch} onChange={(e) => setCashSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load(cashDate, e.currentTarget.value)} className="w-72" /><ActionButton tone="blue" onClick={() => load(cashDate, cashSearch)}>Buscar</ActionButton><ActionButton tone="neutral" onClick={() => shiftCashDate(-1)}>‹</ActionButton><TextInput type="date" value={cashDate} onChange={(e) => { setCashDate(e.target.value); load(e.target.value, ''); }} className="w-36" /><ActionButton tone="neutral" onClick={() => shiftCashDate(1)}>›</ActionButton><SelectInput value={filter} onChange={(e) => setFilter(e.target.value)} className="w-36"><option>TODOS</option>{PAY_STATES.map((s) => <option key={s}>{s}</option>)}</SelectInput><label className="flex items-center gap-1 text-xs font-black"><input type="checkbox" checked={soloPases} onChange={(e) => setSoloPases(e.target.checked)} /> Solo PASEs</label><ActionButton tone="blue" onClick={() => { const today = localDateForApi(); setCashDate(today); load(today, ''); }}>Hoy</ActionButton><ActionButton tone="neutral" onClick={() => { setCashSearch(''); load(cashDate, ''); }}>Limpiar</ActionButton><ActionButton tone="neutral" onClick={() => load(cashDate, cashSearch)}>Actualizar</ActionButton></>}>
+        <Card title={`Caja / Boletas Â· ${liveStatus}${lastRefreshAt ? ` Â· ${lastRefreshAt}` : ""}${loadingDocs ? " Â· cargando..." : ""}`} actions={<><TextInput placeholder="Buscar producto en todas las fechas..." value={cashSearch} onChange={(e) => setCashSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load(cashDate, e.currentTarget.value)} className="w-72" /><ActionButton tone="blue" onClick={() => load(cashDate, cashSearch)}>Buscar</ActionButton><ActionButton tone="neutral" onClick={() => shiftCashDate(-1)}>‹</ActionButton><TextInput type="date" value={cashDate} onChange={(e) => { setCashDate(e.target.value); load(e.target.value, ''); }} className="w-36" /><ActionButton tone="neutral" onClick={() => shiftCashDate(1)}>›</ActionButton><SelectInput value={filter} onChange={(e) => setFilter(e.target.value)} className="w-36"><option>TODOS</option>{PAY_STATES.map((s) => <option key={s}>{s}</option>)}</SelectInput><label className="flex items-center gap-1 text-xs font-black"><input type="checkbox" checked={soloPases} onChange={(e) => setSoloPases(e.target.checked)} /> Solo PASEs</label><ActionButton tone="blue" onClick={() => { const today = localDateForApi(); setCashDate(today); load(today, ''); }}>Hoy</ActionButton><ActionButton tone="neutral" onClick={() => { setCashSearch(''); load(cashDate, ''); }}>Limpiar</ActionButton><ActionButton tone="neutral" onClick={() => load(cashDate, cashSearch)}>Actualizar</ActionButton></>}>
           <div className="max-h-[560px] overflow-auto">
             {filteredDocs.map((doc) => {
               const estado = String(doc.estado_pago || 'DEUDA').toUpperCase();
@@ -6129,6 +6199,12 @@ function DocumentosView({ sound, soundEnabled, user }) {
     setDocs(asArray(await apiFetch('/documentos', { params })));
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    const refresh = () => load();
+    const timer = window.setInterval(() => { if (!document.hidden) refresh(); }, 8000);
+    window.addEventListener('gg-erp-documentos-changed', refresh);
+    return () => { window.clearInterval(timer); window.removeEventListener('gg-erp-documentos-changed', refresh); };
+  }, [docDate, docSearch, filter]);
   const shiftDocDate = (days) => {
     const base = docDate ? new Date(`${docDate}T12:00:00`) : new Date();
     base.setDate(base.getDate() + days);
@@ -8103,13 +8179,14 @@ export default function App() {
         if (lastDocKey && key !== lastDocKey) {
           setLastDocKey(key);
           if (soundEnabled) await sound.play();
+          try { window.dispatchEvent(new CustomEvent('gg-erp-documentos-changed', { detail: { source: 'watch', key } })); } catch {}
         }
       } catch {
         // Retry on next tick.
       }
     };
     checkDocuments();
-    const timer = window.setInterval(checkDocuments, 15000);
+    const timer = window.setInterval(checkDocuments, 4000);
     return () => {
       active = false;
       window.clearInterval(timer);

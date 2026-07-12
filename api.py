@@ -129,13 +129,15 @@ def invalidate_productos_cache(sucursal: str = ""):
     with _PRODUCTOS_CACHE_LOCK:
         if not sucursal:
             _PRODUCTOS_CACHE.clear()
-            return
-        prefix = f"{norm_sucursal(sucursal)}|"
-        for key in list(_PRODUCTOS_CACHE.keys()):
-            if key.startswith(prefix):
-                _PRODUCTOS_CACHE.pop(key, None)
-    invalidate_api_cache(f"documentos|{norm_sucursal(sucursal)}" if sucursal else "documentos|")
-    invalidate_api_cache(f"dashboard|{norm_sucursal(sucursal)}" if sucursal else "dashboard|")
+        else:
+            prefix = f"{norm_sucursal(sucursal)}|"
+            for key in list(_PRODUCTOS_CACHE.keys()):
+                if key.startswith(prefix):
+                    _PRODUCTOS_CACHE.pop(key, None)
+    # Keys reales: "documentos|lite|sucursal|fecha|q" — usar prefijo "documentos|"
+    invalidate_api_cache("documentos|")
+    invalidate_api_cache("caja|")
+    invalidate_api_cache("dashboard|")
 
 if plataform_sunat_router is not None:
     app.include_router(plataform_sunat_router, prefix="/api/v1")
@@ -6950,11 +6952,11 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
         filtro_fecha = (fecha or "").strip()
         texto_q = (q or "").strip().lower()
         cache_key = f"documentos|lite|{sucursal}|{filtro_fecha}|{texto_q}"
-        # Cache un poco mas largo: listados se revalidan al abrir modulo
+        # Caja: ver boletas al instante (cache muy corto si no hay busqueda)
         if not texto_q:
-            cached = _api_cache_get(cache_key, 90)
+            cached = _api_cache_get(cache_key, 6)
             if cached is not None:
-                return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=30"})
+                return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=3", "X-Caja-Fresh": "1"})
         texto = f"%{texto_q}%"
         conn = get_conn()
         cur = conn.cursor()
@@ -6965,6 +6967,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
         SELECT
             v.id,
             v.tipo,
+            COALESCE(v.es_pase, FALSE) AS es_pase,
             v.numero,
             v.cliente AS cliente_nombre,
             COALESCE(documento_cliente, '') AS documento_cliente,
@@ -7053,7 +7056,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
             rows.append(row)
         if not texto_q:
             _api_cache_set(cache_key, rows)
-            return JSONResponse(rows, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=30"})
+            return JSONResponse(rows, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=3", "X-Caja-Fresh": "1"})
         return rows
     except Exception as e:
         import traceback
@@ -7078,16 +7081,18 @@ def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
         SELECT
             id,
             tipo,
+            COALESCE(es_pase, FALSE) AS es_pase,
             numero,
             cliente AS cliente_nombre,
             fecha AS fecha_emision,
             COALESCE(total, 0) AS total,
             COALESCE(usuario_emisor, '') AS usuario_emisor,
             COALESCE(estado_pago, 'PAGADO') AS estado_pago,
-            COALESCE(metodo_pago, '') AS metodo_pago
+            COALESCE(metodo_pago, '') AS metodo_pago,
+            COALESCE(estado, 'EMITIDO') AS estado
         FROM ventas
         WHERE COALESCE(sucursal,%s)=%s
-          AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA','NOTA DE VENTA')
+          AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA','NOTA DE VENTA','PASE')
         ORDER BY id DESC
         LIMIT 1
         """, (DEFAULT_SUCURSAL, sucursal))
@@ -7265,6 +7270,7 @@ def actualizar_observacion_interna_documento(documento_id: int, data: DocumentoO
         VALUES (%s,%s,%s,%s,%s)
         """, (data.usuario or "", "", sucursal, "OBSERVACION INTERNA DOCUMENTO", f"{row.get('tipo')} {row.get('numero')} - {observacion}"))
         conn.commit()
+        invalidate_api_cache("documentos|")
         release_conn(conn)
         return {"ok": True, "success": True, **row}
     except Exception as e:
@@ -7726,6 +7732,9 @@ def anular_documento(documento_id: int, data: dict = None, sucursal: str = DEFAU
         VALUES (%s,'',%s,'DOCUMENTO ANULADO',%s)
         """, (usuario, sucursal, f"{tipo} {numero} - {motivo}"))
         conn.commit()
+        invalidate_api_cache("documentos|")
+        invalidate_api_cache("caja|")
+        invalidate_productos_cache()
         release_conn(conn)
         return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero, "msg": f"{tipo} {numero} anulado. Stock restaurado."}
     except Exception as e:
@@ -7758,6 +7767,9 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         cur.execute("DELETE FROM ventas WHERE id=%s", (documento_id,))
 
         conn.commit()
+        invalidate_api_cache("documentos|")
+        invalidate_api_cache("caja|")
+        invalidate_productos_cache()
         release_conn(conn)
         return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero}
     except Exception as e:
@@ -7983,6 +7995,8 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             ))
 
         conn.commit()
+        invalidate_api_cache("documentos|")
+        invalidate_api_cache("caja|")
         release_conn(conn)
         return {
             "ok": True,
