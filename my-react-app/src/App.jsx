@@ -7,6 +7,26 @@ const ORACLE_API_URL = 'http://64.181.176.160:8000';
 const BASE_URL = TEST_API_URL || (typeof window !== 'undefined' && window.location && /^https?:\/\/64\.181\.176\.160(?::\d+)?$/i.test(window.location.origin) ? window.location.origin : ORACLE_API_URL);
 const EMPRESA = 'computer_army';
 const APP_VERSION = '1.80';
+
+function getErpSessionId() {
+  try {
+    let id = sessionStorage.getItem('gg_erp_session_id') || '';
+    if (!id) {
+      id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID().replace(/-/g, '')
+        : `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+      sessionStorage.setItem('gg_erp_session_id', id);
+    }
+    return id;
+  } catch {
+    return `s${Date.now().toString(36)}`;
+  }
+}
+
+function clearErpSessionId() {
+  try { sessionStorage.removeItem('gg_erp_session_id'); } catch {}
+}
+
 const IS_NATIVE_APP = !!(Capacitor?.isNativePlatform && Capacitor.isNativePlatform());
 const IS_PC_TESTER = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('tester') === 'pc';
 const IS_PC_DESKTOP = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('desktop') === 'pc';
@@ -2253,12 +2273,148 @@ function Login({ onLogin, sound, deviceMode }) {
   );
 }
 
+
+function SessionsModal({ userName, isMaster, currentSessionId, open, onClose, onForceLogout }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [filterUser, setFilterUser] = useState('');
+  const [msg, setMsg] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    setMsg('');
+    try {
+      const params = { solicitante: userName };
+      if (isMaster) params.todas = true;
+      if (filterUser.trim()) params.usuario = filterUser.trim();
+      const res = await apiFetch('/usuarios/sesiones', { params });
+      setRows(asArray(res?.data || res));
+      if (!okResponse(res) && res?.msg) setMsg(res.msg);
+    } catch (e) {
+      setMsg(e?.message || 'No se pudieron cargar sesiones');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return undefined;
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, [open, userName, isMaster, filterUser]);
+
+  const closeOne = async (sessionId) => {
+    if (!confirm('Cerrar esta sesion? El PC quedara fuera al instante.')) return;
+    const res = await apiFetch('/usuarios/sesiones/cerrar', {
+      method: 'POST',
+      json: { session_id: sessionId, solicitante: userName },
+    });
+    if (okResponse(res)) {
+      if (sessionId === currentSessionId) {
+        onForceLogout?.(res.msg || 'Sesion cerrada');
+        return;
+      }
+      await load();
+      setMsg(res.msg || 'Sesion cerrada');
+    } else alert(res.msg || 'No se pudo cerrar');
+  };
+
+  const closeOthers = async () => {
+    if (!confirm('Cerrar TODAS tus otras sesiones (dejar solo este PC)?')) return;
+    const res = await apiFetch('/usuarios/sesiones/cerrar-otras', {
+      method: 'POST',
+      json: { solicitante: userName, usuario: userName, session_id_actual: currentSessionId },
+    });
+    if (okResponse(res)) {
+      await load();
+      setMsg(res.msg || 'Otras sesiones cerradas');
+    } else alert(res.msg || 'No se pudo cerrar');
+  };
+
+  const closeAllUser = async (usuario) => {
+    if (!isMaster) return;
+    if (!confirm(`CONTROL MAESTRO GIOMAR\n\nCerrar TODAS las sesiones de ${usuario}?`)) return;
+    const res = await apiFetch('/usuarios/sesiones/cerrar-todas', {
+      method: 'POST',
+      json: { solicitante: userName, usuario },
+    });
+    if (okResponse(res)) {
+      if (String(usuario).toLowerCase() === String(userName).toLowerCase()) {
+        onForceLogout?.(res.msg || 'Sesiones cerradas');
+        return;
+      }
+      await load();
+      setMsg(res.msg || 'Sesiones cerradas');
+    } else alert(res.msg || 'No se pudo cerrar');
+  };
+
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={onClose}>
+      <div className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-xl bg-white p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div className="text-lg font-black text-slate-900">Sesiones activas</div>
+            <div className="text-xs font-semibold text-slate-500">
+              {isMaster ? 'Control maestro Giomar: ves y cierras cualquier PC' : 'Ves y cierras solo tus sesiones'}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <ActionButton tone="neutral" onClick={load}>{loading ? 'Cargando...' : 'Actualizar'}</ActionButton>
+            <ActionButton tone="amber" onClick={closeOthers}>Cerrar otras (dejar este PC)</ActionButton>
+            <ActionButton tone="neutral" onClick={onClose}>Cerrar panel</ActionButton>
+          </div>
+        </div>
+        {isMaster && (
+          <div className="mb-3 flex flex-wrap items-end gap-2">
+            <Field label="Filtrar usuario (maestro)">
+              <TextInput value={filterUser} onChange={(e) => setFilterUser(e.target.value)} placeholder="Ej: Mily (vacio = todos)" className="w-56" />
+            </Field>
+            <ActionButton tone="blue" onClick={load}>Buscar</ActionButton>
+          </div>
+        )}
+        {msg && <div className="mb-2 rounded-md bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-800">{msg}</div>}
+        <div className="max-h-[55vh] overflow-auto rounded-lg border border-slate-200">
+          {rows.map((s) => {
+            const mine = s.session_id === currentSessionId;
+            return (
+              <div key={s.session_id} className={`grid gap-2 border-b border-slate-100 p-3 text-sm md:grid-cols-[1fr_1fr_auto] ${mine ? 'bg-blue-50' : 'bg-white'}`}>
+                <div>
+                  <div className="font-black text-slate-900">{s.usuario} {mine ? <span className="text-blue-700">(ESTE PC)</span> : null}</div>
+                  <div className="text-xs text-slate-500">Vista: {s.vista || '-'} / Disp: {s.dispositivo || '-'}</div>
+                  <div className="text-[10px] font-mono text-slate-400">{String(s.session_id || '').slice(0, 12)}…</div>
+                </div>
+                <div className="text-xs font-semibold text-slate-600">
+                  <div>Actividad: {s.ultima_actividad || '-'}</div>
+                  <div>Desde: {s.creado_en || '-'}</div>
+                  <div className={s.activa ? 'font-black text-emerald-700' : 'text-slate-400'}>{s.activa ? 'EN LINEA' : 'INACTIVA'}</div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <ActionButton tone="danger" onClick={() => closeOne(s.session_id)}>{mine ? 'Cerrar este PC' : 'Cerrar sesion'}</ActionButton>
+                  {isMaster && !mine && (
+                    <ActionButton tone="violet" onClick={() => closeAllUser(s.usuario)}>Cerrar TODAS de {s.usuario}</ActionButton>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {!rows.length && !loading && <Empty text="No hay sesiones activas." />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AppShell({ user, view, setView, onLogout, sound, soundEnabled, setSoundEnabled, deviceMode, updateInfo, onCheckUpdate, radioEnabled, onUserUpdate, children }) {
   const isDex = deviceMode === 'dex';
   const userName = user && typeof user === 'object' ? (user.usuario || '') : String(user || '');
   const userRole = String(user && typeof user === 'object' ? user.rol || '' : '').toUpperCase();
   const userPermissions = user && typeof user === 'object' && user.permisos && typeof user.permisos === 'object' ? user.permisos : {};
   const isMaster = userName.trim().toLowerCase() === 'giomar' || userRole === 'ADMIN';
+  const isSessionMaster = userName.trim().toLowerCase() === 'giomar';
+  const [sessionsOpen, setSessionsOpen] = useState(false);
+  const currentSessionId = getErpSessionId();
   const visibleModules = modules.filter((m) => (m.id !== 'radio' || radioEnabled) && (m.id === 'sunat' || isMaster || userPermissions[m.id] !== false));
   const active = visibleModules.find((m) => m.id === view) || visibleModules[0] || modules[0];
   useEffect(() => {
@@ -2364,7 +2520,8 @@ function AppShell({ user, view, setView, onLogout, sound, soundEnabled, setSound
           {backgroundUrl && <button onClick={() => saveBackground('')} className="h-10 rounded-md bg-slate-100 px-3 text-xs font-black text-slate-600">Quitar fondo</button>}
           <button onClick={() => openView('sunat')} className="h-10 rounded-md bg-amber-100 px-3 text-xs font-black text-amber-800">SUNAT</button>
           <button onClick={() => onCheckUpdate?.({ manual: true })} className="h-10 rounded-md bg-blue-100 px-3 text-xs font-black text-blue-700">{IS_PC_TESTER ? 'Tester' : 'Actualizar'}</button>
-          <button onClick={onLogout} className="h-10 rounded-md bg-slate-100 px-3 text-xs font-black text-slate-600">Salir</button>
+          <button onClick={() => setSessionsOpen(true)} className="h-10 rounded-md bg-violet-100 px-3 text-xs font-black text-violet-800">{isSessionMaster ? "Sesiones (maestro)" : "Mis sesiones"}</button>
+          <button onClick={() => { try { apiFetch('/usuarios/sesiones/cerrar', { method: 'POST', json: { session_id: currentSessionId, solicitante: userName } }); } catch {} clearErpSessionId(); onLogout?.(); }} className="h-10 rounded-md bg-slate-100 px-3 text-xs font-black text-slate-600">Salir</button>
         </div>
         {updateInfo && (
           <div className="mx-auto mt-3 flex max-w-7xl flex-wrap items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900">
@@ -2406,7 +2563,19 @@ function AppShell({ user, view, setView, onLogout, sound, soundEnabled, setSound
           ))}
           </div>
         </nav>
-        <section>{children}</section>
+        <section>      <SessionsModal
+        userName={userName}
+        isMaster={isSessionMaster}
+        currentSessionId={currentSessionId}
+        open={sessionsOpen}
+        onClose={() => setSessionsOpen(false)}
+        onForceLogout={(message) => {
+          try { clearErpSessionId(); } catch {}
+          alert(message || 'Sesion cerrada');
+          onLogout?.();
+        }}
+      />
+{children}</section>
       </main>
     </div>
   );
@@ -8208,18 +8377,30 @@ export default function App() {
 
   useEffect(() => {
     if (!userName) return undefined;
-    const beat = () => {
-      apiFetch('/usuarios/online', {
-        method: 'POST',
-        json: {
-          usuario: userName,
-          vista: view,
-          dispositivo: IS_PC_TESTER ? 'PC TESTER' : deviceMode,
-        },
-      }).catch(() => {});
+    const beat = async () => {
+      try {
+        const res = await apiFetch('/usuarios/online', {
+          method: 'POST',
+          json: {
+            usuario: userName,
+            vista: view,
+            dispositivo: IS_PC_TESTER ? 'PC TESTER' : (IS_PC_DESKTOP ? 'PC' : deviceMode),
+            session_id: getErpSessionId(),
+          },
+        });
+        if (res?.session_id) {
+          try { sessionStorage.setItem('gg_erp_session_id', res.session_id); } catch {}
+        }
+        if (res?.force_logout) {
+          clearErpSessionId();
+          sessionStorage.setItem('gg_erp_skip_auto_login', '1');
+          alert(res.msg || 'Tu sesion fue cerrada desde otro equipo (control maestro).');
+          setUser(null);
+        }
+      } catch {}
     };
     beat();
-    const timer = window.setInterval(beat, 30000);
+    const timer = window.setInterval(beat, 12000);
     return () => window.clearInterval(timer);
   }, [userName, view, deviceMode]);
 

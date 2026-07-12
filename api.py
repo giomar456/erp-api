@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -1824,6 +1824,14 @@ class UsuarioOnlineHeartbeat(BaseModel):
     vista: str = ""
     dispositivo: str = ""
     sucursal: str = DEFAULT_SUCURSAL
+    session_id: str = ""
+
+
+class CerrarSesionRequest(BaseModel):
+    session_id: str = ""
+    solicitante: str = ""
+    usuario: str = ""  # objetivo (cerrar todas de un usuario)
+    session_id_actual: str = ""  # no cerrar esta (cerrar otras)
 
 
 class BoquitoquiMensaje(BaseModel):
@@ -2133,6 +2141,20 @@ def migrate_schema():
             ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuario_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT NOT NULL,
+            sucursal TEXT DEFAULT 'computer_army',
+            vista TEXT DEFAULT '',
+            dispositivo TEXT DEFAULT '',
+            ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            revocada BOOLEAN DEFAULT FALSE,
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_usuario_sesiones_user ON usuario_sesiones (usuario, revocada, ultima_actividad DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_usuario_sesiones_act ON usuario_sesiones (ultima_actividad DESC)")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS usuario_ventas_borradores (
             usuario TEXT NOT NULL,
@@ -3094,13 +3116,29 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
                COALESCE(u.boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(u.color_tema,'#304fb8') AS color_tema,
                CASE
-                   WHEN o.ultima_actividad IS NOT NULL
-                    AND o.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+                   WHEN EXISTS (
+                        SELECT 1 FROM usuario_sesiones s
+                        WHERE lower(s.usuario)=lower(u.usuario)
+                          AND COALESCE(s.revocada,FALSE)=FALSE
+                          AND s.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
+                   ) OR (
+                        o.ultima_actividad IS NOT NULL
+                        AND o.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
+                   )
                    THEN TRUE ELSE FALSE
                END AS online,
+               COALESCE((
+                   SELECT COUNT(*) FROM usuario_sesiones s
+                   WHERE lower(s.usuario)=lower(u.usuario)
+                     AND COALESCE(s.revocada,FALSE)=FALSE
+                     AND s.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
+               ), 0) AS sesiones_activas,
                COALESCE(o.vista,'') AS vista,
                COALESCE(o.dispositivo,'') AS dispositivo,
-               TO_CHAR(o.ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad
+               TO_CHAR(COALESCE((
+                   SELECT MAX(s.ultima_actividad) FROM usuario_sesiones s
+                   WHERE lower(s.usuario)=lower(u.usuario) AND COALESCE(s.revocada,FALSE)=FALSE
+               ), o.ultima_actividad), 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad
         FROM usuarios u
         LEFT JOIN usuarios_online o ON lower(o.usuario)=lower(u.usuario)
         ORDER BY online DESC, u.usuario
@@ -3108,30 +3146,268 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
     data = dict_fetchall(cur)
     for item in data:
         item["permisos"] = permisos_usuario(cur, item.get("id"), item.get("usuario"), item.get("rol"))
+        item["online"] = bool(item.get("online"))
+        try:
+            item["sesiones_activas"] = int(item.get("sesiones_activas") or 0)
+        except Exception:
+            item["sesiones_activas"] = 0
     release_conn(conn)
     return {"ok": True, "success": True, "data": data}
 
 
+def _es_maestro(usuario: str) -> bool:
+    return str(usuario or "").strip().lower() == "giomar"
+
+
 @app.post("/usuarios/online")
 def registrar_usuario_online(data: UsuarioOnlineHeartbeat):
+    import uuid
     usuario = (data.usuario or "").strip()
     if not usuario:
-        return {"ok": False, "success": False, "msg": "Usuario obligatorio"}
+        return {"ok": False, "success": False, "msg": "Usuario obligatorio", "force_logout": False}
     sucursal = norm_sucursal(data.sucursal)
+    session_id = str(getattr(data, "session_id", "") or "").strip()
+    if not session_id:
+        session_id = uuid.uuid4().hex
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO usuarios_online (usuario, sucursal, vista, dispositivo, ultima_actividad)
-        VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
-        ON CONFLICT (usuario)
-        DO UPDATE SET sucursal=EXCLUDED.sucursal,
-                      vista=EXCLUDED.vista,
-                      dispositivo=EXCLUDED.dispositivo,
-                      ultima_actividad=CURRENT_TIMESTAMP
-    """, (usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:80]))
-    conn.commit()
-    release_conn(conn)
-    return {"ok": True, "success": True}
+    try:
+        cur.execute(
+            """
+            SELECT COALESCE(revocada,FALSE) AS revocada
+            FROM usuario_sesiones
+            WHERE session_id=%s
+            LIMIT 1
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+        if row and bool(row[0]):
+            conn.commit()
+            return {
+                "ok": False,
+                "success": False,
+                "force_logout": True,
+                "msg": "Sesion cerrada remotamente. Vuelve a iniciar sesion.",
+            }
+
+        cur.execute(
+            """
+            INSERT INTO usuario_sesiones (session_id, usuario, sucursal, vista, dispositivo, ultima_actividad, revocada, creado_en)
+            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,FALSE,CURRENT_TIMESTAMP)
+            ON CONFLICT (session_id)
+            DO UPDATE SET usuario=EXCLUDED.usuario,
+                          sucursal=EXCLUDED.sucursal,
+                          vista=EXCLUDED.vista,
+                          dispositivo=EXCLUDED.dispositivo,
+                          ultima_actividad=CURRENT_TIMESTAMP,
+                          revocada=FALSE
+            """,
+            (session_id, usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:120]),
+        )
+        cur.execute(
+            """
+            INSERT INTO usuarios_online (usuario, sucursal, vista, dispositivo, ultima_actividad)
+            VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT (usuario)
+            DO UPDATE SET sucursal=EXCLUDED.sucursal,
+                          vista=EXCLUDED.vista,
+                          dispositivo=EXCLUDED.dispositivo,
+                          ultima_actividad=CURRENT_TIMESTAMP
+            """,
+            (usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:120]),
+        )
+        cur.execute("DELETE FROM usuario_sesiones WHERE ultima_actividad < CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        conn.commit()
+        return {
+            "ok": True,
+            "success": True,
+            "force_logout": False,
+            "session_id": session_id,
+            "maestro": _es_maestro(usuario),
+        }
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "success": False, "msg": str(e), "force_logout": False}
+    finally:
+        release_conn(conn)
+
+
+@app.get("/usuarios/sesiones")
+def listar_sesiones_activas(solicitante: str = "", usuario: str = "", todas: bool = False):
+    solicitante = (solicitante or "").strip()
+    usuario = (usuario or "").strip()
+    if not solicitante:
+        return {"ok": False, "success": False, "msg": "solicitante obligatorio", "data": []}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        es_master = _es_maestro(solicitante)
+        if es_master and (todas or not usuario):
+            cur.execute(
+                """
+                SELECT session_id, usuario, COALESCE(sucursal,'') AS sucursal,
+                       COALESCE(vista,'') AS vista, COALESCE(dispositivo,'') AS dispositivo,
+                       TO_CHAR(ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad,
+                       TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en,
+                       COALESCE(revocada,FALSE) AS revocada,
+                       CASE WHEN ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
+                                 AND COALESCE(revocada,FALSE)=FALSE THEN TRUE ELSE FALSE END AS activa
+                FROM usuario_sesiones
+                WHERE COALESCE(revocada,FALSE)=FALSE
+                  AND ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '30 minutes'
+                ORDER BY ultima_actividad DESC
+                LIMIT 200
+                """
+            )
+        else:
+            target = usuario if (es_master and usuario) else solicitante
+            cur.execute(
+                """
+                SELECT session_id, usuario, COALESCE(sucursal,'') AS sucursal,
+                       COALESCE(vista,'') AS vista, COALESCE(dispositivo,'') AS dispositivo,
+                       TO_CHAR(ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad,
+                       TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en,
+                       COALESCE(revocada,FALSE) AS revocada,
+                       CASE WHEN ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
+                                 AND COALESCE(revocada,FALSE)=FALSE THEN TRUE ELSE FALSE END AS activa
+                FROM usuario_sesiones
+                WHERE lower(usuario)=lower(%s)
+                  AND COALESCE(revocada,FALSE)=FALSE
+                  AND ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '30 minutes'
+                ORDER BY ultima_actividad DESC
+                LIMIT 100
+                """,
+                (target,),
+            )
+        rows = [_jsonable_row(r) for r in dict_fetchall(cur)]
+        for r in rows:
+            r["activa"] = bool(r.get("activa"))
+            r["revocada"] = bool(r.get("revocada"))
+        return {"ok": True, "success": True, "data": rows, "maestro": es_master}
+    except Exception as e:
+        return {"ok": False, "success": False, "msg": str(e), "data": []}
+    finally:
+        release_conn(conn)
+
+
+@app.post("/usuarios/sesiones/cerrar")
+def cerrar_sesion(data: CerrarSesionRequest):
+    solicitante = (data.solicitante or "").strip()
+    session_id = (data.session_id or "").strip()
+    if not solicitante or not session_id:
+        return {"ok": False, "success": False, "msg": "solicitante y session_id obligatorios"}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT usuario FROM usuario_sesiones WHERE session_id=%s LIMIT 1", (session_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "success": False, "msg": "Sesion no encontrada"}
+        dueno = str(row[0] or "")
+        if not _es_maestro(solicitante) and dueno.strip().lower() != solicitante.strip().lower():
+            return {"ok": False, "success": False, "msg": "Solo puedes cerrar tus sesiones (maestro: Giomar)"}
+        cur.execute(
+            """
+            UPDATE usuario_sesiones
+            SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
+            WHERE session_id=%s
+            """,
+            (session_id,),
+        )
+        conn.commit()
+        return {"ok": True, "success": True, "msg": f"Sesion cerrada ({dueno})", "session_id": session_id}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        release_conn(conn)
+
+
+@app.post("/usuarios/sesiones/cerrar-otras")
+def cerrar_otras_sesiones(data: CerrarSesionRequest):
+    solicitante = (data.solicitante or "").strip()
+    session_id_actual = (data.session_id_actual or data.session_id or "").strip()
+    usuario = (data.usuario or solicitante or "").strip()
+    if not solicitante or not usuario:
+        return {"ok": False, "success": False, "msg": "solicitante y usuario obligatorios"}
+    if not _es_maestro(solicitante) and usuario.strip().lower() != solicitante.strip().lower():
+        return {"ok": False, "success": False, "msg": "Solo Giomar puede cerrar sesiones de otros usuarios"}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        if session_id_actual:
+            cur.execute(
+                """
+                UPDATE usuario_sesiones
+                SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
+                WHERE lower(usuario)=lower(%s)
+                  AND session_id <> %s
+                  AND COALESCE(revocada,FALSE)=FALSE
+                """,
+                (usuario, session_id_actual),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE usuario_sesiones
+                SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
+                WHERE lower(usuario)=lower(%s)
+                  AND COALESCE(revocada,FALSE)=FALSE
+                """,
+                (usuario,),
+            )
+        n = cur.rowcount or 0
+        conn.commit()
+        return {"ok": True, "success": True, "msg": f"Se cerraron {n} sesion(es) de {usuario}", "cerradas": n}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        release_conn(conn)
+
+
+@app.post("/usuarios/sesiones/cerrar-todas")
+def cerrar_todas_sesiones_usuario(data: CerrarSesionRequest):
+    solicitante = (data.solicitante or "").strip()
+    usuario = (data.usuario or "").strip()
+    if not _es_maestro(solicitante):
+        return {"ok": False, "success": False, "msg": "Solo Giomar (control maestro) puede cerrar todas las sesiones de un usuario"}
+    if not usuario:
+        return {"ok": False, "success": False, "msg": "usuario objetivo obligatorio"}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE usuario_sesiones
+            SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
+            WHERE lower(usuario)=lower(%s)
+              AND COALESCE(revocada,FALSE)=FALSE
+            """,
+            (usuario,),
+        )
+        n = cur.rowcount or 0
+        cur.execute("DELETE FROM usuarios_online WHERE lower(usuario)=lower(%s)", (usuario,))
+        conn.commit()
+        return {"ok": True, "success": True, "msg": f"Control maestro: {n} sesion(es) de {usuario} cerradas", "cerradas": n}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        release_conn(conn)
 
 
 @app.delete("/usuarios/{usuario_id}")
