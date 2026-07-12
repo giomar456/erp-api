@@ -3532,15 +3532,19 @@ def _pdf_series_items(value):
 
 
 def _pdf_item_row_height(desc_lines_count, series_count, desc_gap, serie_gap, extra_lines=0, compact=False):
-    # compact=True: filas más bajas para 9+ ítems sin mezclar con el pie
-    base = 2.8 if compact else 4.2
-    height = base + max(1, desc_lines_count) * desc_gap
+    # compact=True: filas más bajas para 9+ ítems sin mezclar con el pie.
+    # No sumar "base" grande: eso dejaba una línea en blanco bajo el nombre.
+    lines = max(1, int(desc_lines_count or 1))
+    height = lines * desc_gap
     if series_count:
-        height += (1.0 if compact else 2.0)
-        height += series_count * serie_gap
+        # Solo un pequeño respiro entre nombre y S/N (antes ~0.9–2.0 mm de vacío)
+        height += (0.35 if compact else 0.8)
+        height += int(series_count) * serie_gap
     if extra_lines:
-        height += extra_lines * serie_gap
-    return max(5.6 if compact else 6.5, height)
+        height += int(extra_lines) * serie_gap
+    # Padding inferior de fila
+    height += 1.1 if compact else 1.8
+    return max(4.8 if compact else 6.0, height)
 
 
 def _pdf_money(value):
@@ -3682,18 +3686,51 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         "NOTA DE VENTA": "NOTA DE VENTA",
     }.get(doc_type, doc_type)
     editor = cfg.get("doc_editor") if isinstance(cfg.get("doc_editor"), dict) else {}
-    # Formato fijo restaurado del respaldo 20260609_123145. No usar medidas guardadas
-    # en app_config para evitar que la boleta se mueva entre actualizaciones.
+    layout = editor.get("layout") if isinstance(editor.get("layout"), dict) else {}
+    # Layout base fijo (Computer Army). Solo logo (posicion/tamano) es editable desde Ajustes.
     max_rows = 12
+    try:
+        logo_w = float(layout.get("logo_ancho_mm") or editor.get("logo_w") or 24)
+    except Exception:
+        logo_w = 24.0
+    try:
+        logo_h = float(layout.get("logo_alto_mm") or editor.get("logo_h") or 15)
+    except Exception:
+        logo_h = 15.0
+    try:
+        logo_x = float(layout.get("logo_x_mm") or editor.get("logo_x") or 16)
+    except Exception:
+        logo_x = 16.0
+    try:
+        logo_y = float(layout.get("logo_bajar_mm") or layout.get("logo_y_mm") or editor.get("logo_y") or 25)
+    except Exception:
+        logo_y = 25.0
+    # Limites seguros para no romper la plantilla A4
+    logo_w = max(10.0, min(55.0, logo_w))
+    logo_h = max(8.0, min(40.0, logo_h))
+    logo_x = max(4.0, min(90.0, logo_x))
+    logo_y = max(4.0, min(50.0, logo_y))
+    show_logo = editor.get("show_logo", True)
+    if show_logo is not False:
+        _draw_pdf_logo(c, cfg, logo_x, logo_y, logo_w, logo_h, mm, page_h)
 
-    # Plantilla fija A4 alineada al formato Computer Army usado en PC/Android.
-    logo_w = 24
-    logo_h = 15
-    _draw_pdf_logo(c, cfg, 16, 25, logo_w, logo_h, mm, page_h)
-
-    empresa = str(cfg.get("company_name") or cfg.get("empresa") or "CORPORACION COMPUTER ARMY EIRL").upper()
-    direccion = str(cfg.get("address") or cfg.get("direccion") or "").upper()
-    slogan = str(cfg.get("mensaje") or "MEJORES PRECIOS EN TARJETAS DE VIDEOS").upper()
+    empresa = str(
+        (editor.get("texts") or {}).get("empresa")
+        or cfg.get("company_name")
+        or cfg.get("empresa")
+        or "CORPORACION COMPUTER ARMY EIRL"
+    ).upper()
+    direccion = str(
+        (editor.get("texts") or {}).get("direccion")
+        or cfg.get("address")
+        or cfg.get("direccion")
+        or ""
+    ).upper()
+    slogan = str(
+        (editor.get("texts") or {}).get("slogan")
+        or cfg.get("mensaje")
+        or "MEJORES PRECIOS EN TARJETAS DE VIDEOS"
+    ).upper()
 
     for i, ln in enumerate(fit(empresa, 78, "Helvetica-Bold", 15.8, 2)):
         txt(44, 14.6 + i * 5.2, ln, 15.8, True)
@@ -3759,35 +3796,39 @@ def generar_pdf_documento_original(documento, detalle, cfg):
         qty = float(item.get("cantidad") or 0)
         price = float(item.get("precio_unitario") or item.get("precio") or 0)
         total = float(item.get("total") or qty * price)
-        desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
+        # Una sola linea de nombre: quitar saltos/espacios basura que generaban linea en blanco
+        desc = re.sub(r"\s+", " ", str(item.get("descripcion") or item.get("nombre") or "")).strip().upper()
         series = str(item.get("series_texto") or item.get("serie") or "").strip()
         series_items = _pdf_series_items(series)
-        # Compactar con 8–9+ ítems para que no se corran/mezclen las líneas
+        # Compactar con 8–9+ ítems, pero NUNCA ocultar series (qty 2 => 2 S/N visibles)
+        # Antes max_series_show=1 en modo compacto escondía la 2.ª serie del producto.
         if pack_hard:
             desc_max = 1
             desc_font = 5.9
             desc_gap = 2.0
             serie_font = 5.0
-            serie_gap = 2.1
-            max_series_show = 1
+            serie_gap = 2.0
+            max_series_show = max(6, len(series_items) or 0)
             use_compact_h = True
         elif pack_tight:
             desc_max = 1 if series_items else 2
             desc_font = 6.1 if series_items else 6.4
-            desc_gap = 2.05
+            desc_gap = 2.0
             serie_font = 5.2
-            serie_gap = 2.15
-            max_series_show = 1
+            serie_gap = 2.05
+            max_series_show = max(6, len(series_items) or 0)
             use_compact_h = True
         else:
             desc_max = 2 if series_items else 3
             desc_font = 6.8 if series_items else (6.25 if len(desc) > 82 else 7.35)
-            desc_gap = 2.35 if series_items else (2.05 if len(desc) > 82 else 2.25)
+            desc_gap = 2.25 if series_items else (2.05 if len(desc) > 82 else 2.25)
             serie_font = 6.4 if len(series_items) >= 4 else 6.6
-            serie_gap = 3.1 if len(series_items) >= 3 else 3.4
-            max_series_show = 4
+            serie_gap = 2.9 if len(series_items) >= 3 else 3.2
+            max_series_show = max(8, len(series_items) or 0)
             use_compact_h = False
-        desc_lines = fit(desc, 108, "Helvetica-Bold", desc_font, desc_max)
+        desc_lines = [ln for ln in fit(desc, 108, "Helvetica-Bold", desc_font, desc_max) if str(ln or "").strip()]
+        if not desc_lines:
+            desc_lines = [""]
         shown = list(series_items[:max_series_show])
         overflow = max(0, len(series_items) - len(shown))
         item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, 1 if overflow else 0, compact=use_compact_h)
@@ -3796,44 +3837,51 @@ def generar_pdf_documento_original(documento, detalle, cfg):
             extra_items.extend(detalle_list[idx - 1:])
             break
         if item_h > remaining_h and remaining_h > 0:
-            compact_gap = max(2.0, serie_gap - 0.4)
-            compact_font = max(4.8, serie_font - 0.3)
-            while shown and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, 1 if overflow else 0, compact=True) > remaining_h:
-                shown = shown[:-1]
-                overflow = len(series_items) - len(shown)
-            while len(desc_lines) > 1 and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, 1 if overflow else 0, compact=True) > remaining_h:
+            # Compactar tipografía/gaps, pero SIEMPRE conservar todas las series del ítem.
+            # Si no caben todas, el ítem entero va a página 2 (no se corta la 2.ª S/N).
+            compact_gap = max(1.85, serie_gap - 0.5)
+            compact_font = max(4.8, serie_font - 0.4)
+            while len(desc_lines) > 1 and _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, compact_gap, 0, compact=True) > remaining_h:
                 desc_lines = desc_lines[:-1]
             serie_gap = compact_gap
             serie_font = compact_font
-            item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, 1 if overflow else 0, compact=True)
+            use_compact_h = True
+            shown = list(series_items)
+            overflow = 0
+            item_h = _pdf_item_row_height(len(desc_lines), len(shown), desc_gap, serie_gap, 0, compact=True)
             if item_h > remaining_h:
                 extra_items.extend(detalle_list[idx - 1:])
                 break
-        # Separador suave entre filas (evita que se vean “corridas”)
-        if printed > 0:
-            c.setStrokeGray(0.85)
-            line(tx + 0.3, row_y - 0.9, tx + tw - 0.3, row_y - 0.9)
-            c.setStrokeGray(0)
+        # Sin lineas horizontales entre filas: se veian como "tachado" de Nro a P.UNIT.
         num_size = 7.2 if pack_tight else 8.0
         txt_c(centers[0], row_y, idx, num_size)
         txt_c(centers[1], row_y, "UNIDADES", 7.0 if pack_tight else 7.8)
         cursor_y = row_y
-        for ln in desc_lines:
+        for i_ln, ln in enumerate(desc_lines):
             txt(cols[2] + 1.6, cursor_y, ln, desc_font, True)
-            cursor_y += desc_gap
+            # Solo avanza entre lineas de nombre (no despues de la ultima: eso creaba linea vacia)
+            if i_ln < len(desc_lines) - 1:
+                cursor_y += desc_gap
         if shown:
-            cursor_y += 0.9 if use_compact_h else 1.2
             for sidx, serie_line in enumerate(shown):
-                prefix = "S/N: " if sidx == 0 else "     "
-                for ln in fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 1 if use_compact_h else 2):
+                # Primera serie: respiro minimo bajo el nombre; siguientes: serie_gap
+                cursor_y += (0.45 if use_compact_h else 0.75) if sidx == 0 else 0
+                cursor_y += serie_gap
+                prefix = "S/N: " if sidx == 0 else "S/N: "
+                serie_lines = fit(f"{prefix}{serie_line}", 108, "Helvetica", serie_font, 1)
+                for li, ln in enumerate(serie_lines):
+                    if li > 0:
+                        cursor_y += serie_gap
                     txt(cols[2] + 1.6, cursor_y, ln, serie_font)
-                    cursor_y += serie_gap
             if overflow:
-                txt(cols[2] + 1.6, cursor_y, f"     +{overflow} serie(s) mas", 5.5)
+                cursor_y += serie_gap
+                txt(cols[2] + 1.6, cursor_y, f"S/N: +{overflow} serie(s) mas", 5.5)
         txt_r(cols[4] - 1.2, row_y, f"{qty:.2f}", num_size)
         txt_r(cols[5] - 1.2, row_y, _pdf_money(total), num_size)
         txt_r(cols[6] - 1.2, row_y, _pdf_money(price), num_size)
-        row_y += max(item_h, 5.8 if use_compact_h else row_h)
+        # Avanzar por altura real dibujada (sin hueco fantasma bajo el nombre)
+        drawn_h = max(item_h, (cursor_y - row_y) + (1.15 if use_compact_h else 1.7))
+        row_y += max(drawn_h, 4.9 if use_compact_h else row_h)
         printed += 1
 
     if extra_items:
@@ -3945,8 +3993,8 @@ def generar_pdf_documento_original(documento, detalle, cfg):
             qty = float(item.get("cantidad") or 0)
             price = float(item.get("precio_unitario") or item.get("precio") or 0)
             total = float(item.get("total") or qty * price)
-            desc = str(item.get("descripcion") or item.get("nombre") or "").upper()
-            series = str(item.get("series_texto") or item.get("serie") or "").strip()
+            desc = re.sub(r"\s+", " ", str(item.get("descripcion") or item.get("nombre") or "")).strip().upper()
+            series_items_p2 = _pdf_series_items(item.get("series_texto") or item.get("serie") or "")
             txt_c(ex + 5, ry, j, 7)
             txt_c(ex + 20, ry, "UNIDADES", 6)
             dlines = fit(desc, 110, "Helvetica-Bold", 7, 2)
@@ -3954,10 +4002,9 @@ def generar_pdf_documento_original(documento, detalle, cfg):
             for ln in dlines:
                 txt(ex + 37, cy, ln, 7, True)
                 cy += 3.2
-            if series:
-                for ln in fit(f"S/N: {series}", 110, "Helvetica", 6, 2):
-                    txt(ex + 37, cy, ln, 6)
-                    cy += 2.8
+            for sidx, serie_line in enumerate(series_items_p2):
+                txt(ex + 37, cy, f"S/N: {serie_line}", 6)
+                cy += 2.8
             txt_r(ex + ew - 38, ry, f"{qty:.2f}", 7)
             txt_r(ex + ew - 18, ry, _pdf_money(total), 7)
             txt_r(ex + ew - 2, ry, _pdf_money(price), 7)
