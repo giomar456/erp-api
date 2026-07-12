@@ -1,0 +1,29 @@
+name: Oracle ERP Health
+
+# Solo Oracle Cloud. Cero Render.
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ORACLE_URL: http://64.181.176.160:8000
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Health Oracle + DB
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -o /tmp/body.txt -w "%{http_code}" --connect-timeout 15 --max-time 40 "${ORACLE_URL}/health?db=1" || echo "000")
+          body=$(head -c 400 /tmp/body.txt || true)
+          echo "HTTP $code"
+          echo "$body"
+          test "$code" = "200"
+          echo "$body" | grep -q '"ok":true'
+          echo "Oracle produccion OK"

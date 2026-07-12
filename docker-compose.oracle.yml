@@ -1,0 +1,102 @@
+# G&G ERP — SOLO Oracle Cloud Always Free (VM.Standard.E2.1.Micro ~1GB RAM)
+# Nunca Render. Produccion: http://64.181.176.160:8000
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: erp_db
+      POSTGRES_USER: erp_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_oracle_2026}
+      # Optimizado para 1GB RAM
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=40
+      - -c
+      - wal_buffers=4MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=2000
+    volumes:
+      - erp_pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_user -d erp_db"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    mem_limit: 320m
+    memswap_limit: 320m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://erp_user:${POSTGRES_PASSWORD:-erp_oracle_2026}@db:5432/erp_db?sslmode=disable
+      DB_SSLMODE: "disable"
+      PORT: "8000"
+      DB_POOL_MIN: "1"
+      DB_POOL_MAX: "5"
+      PRODUCTOS_CACHE_TTL: "300"
+      DB_CONNECT_TIMEOUT: "8"
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://64.181.176.160:8000}
+      APP_PUBLIC_URL: ${PUBLIC_BASE_URL:-http://64.181.176.160:8000}
+    env_file:
+      - .env.oracle
+    deploy:
+      resources:
+        limits:
+          memory: 420M
+    mem_limit: 420m
+    memswap_limit: 420m
+    logging:
+      driver: json-file
+      options:
+        max-size: "8m"
+        max-file: "2"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=6)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 50s
+
+volumes:
+  erp_pgdata:

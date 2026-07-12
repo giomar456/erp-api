@@ -1,12 +1,13 @@
+﻿# SOLO ORACLE - no usa Render
 param(
     [string]$Owner = "giomar456",
     [string]$Repo = "erp-api",
     [string]$Branch = "main",
     [string]$AndroidVersion = "1.77",
     [string]$ReleaseTag = "v1.0.72",
-    [string]$RenderServiceId = "srv-d7p6tn58nd3s73e49bf0",
+    [string]$OracleHost = "ubuntu@64.181.176.160",
     [string]$GitHubToken = "",
-    [string]$RenderToken = "",
+    [string]$SshKeyUnused = "",
     [switch]$SkipRender
 )
 
@@ -90,15 +91,15 @@ $phoneUrl = "https://github.com/$Owner/$Repo/releases/download/$ReleaseTag/$Phon
 $dexUrl = "https://github.com/$Owner/$Repo/releases/download/$ReleaseTag/$DexName"
 
 if (-not $SkipRender) {
-    $script:RenderToken = Read-PlainSecret "Render token" "RENDER_API_KEY" $RenderToken
-    if (-not [string]::IsNullOrWhiteSpace($script:RenderToken)) {
-        $headers = @{ Authorization = "Bearer $script:RenderToken"; Accept = "application/json" }
-        Invoke-RestMethod -Method Put -Headers $headers -Uri "https://api.render.com/v1/services/$RenderServiceId/env-vars/ANDROID_APP_VERSION" -Body (@{ value = $AndroidVersion } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-        Invoke-RestMethod -Method Put -Headers $headers -Uri "https://api.render.com/v1/services/$RenderServiceId/env-vars/ANDROID_APP_DOWNLOAD_URL" -Body (@{ value = $phoneUrl } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-        Invoke-RestMethod -Method Put -Headers $headers -Uri "https://api.render.com/v1/services/$RenderServiceId/env-vars/ANDROID_APP_APK_NAME" -Body (@{ value = $PhoneName } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-        Invoke-RestMethod -Method Put -Headers $headers -Uri "https://api.render.com/v1/services/$RenderServiceId/env-vars/ANDROID_APP_DEX_DOWNLOAD_URL" -Body (@{ value = $dexUrl } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-        Invoke-RestMethod -Method Put -Headers $headers -Uri "https://api.render.com/v1/services/$RenderServiceId/env-vars/ANDROID_APP_DEX_APK_NAME" -Body (@{ value = $DexName } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-        Invoke-RestMethod -Method Put -Headers $headers -Uri "https://api.render.com/v1/services/$RenderServiceId/env-vars/ANDROID_APP_UPDATE_NOTES" -Body (@{ value = $Notes } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+    $script:SshKeyUnused = Read-PlainSecret "Render token" "RENDER_API_KEY" $SshKeyUnused
+    if (-not [string]::IsNullOrWhiteSpace($script:SshKeyUnused)) {
+        $headers = @{ Authorization = "Bearer $script:SshKeyUnused"; Accept = "application/json" }
+        Invoke-RestMethod -Method Put -Headers $headers -Uri "# REMOVED_RENDER_ENV /ANDROID_APP_VERSION" -Body (@{ value = $AndroidVersion } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+        Invoke-RestMethod -Method Put -Headers $headers -Uri "# REMOVED_RENDER_ENV /ANDROID_APP_DOWNLOAD_URL" -Body (@{ value = $phoneUrl } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+        Invoke-RestMethod -Method Put -Headers $headers -Uri "# REMOVED_RENDER_ENV /ANDROID_APP_APK_NAME" -Body (@{ value = $PhoneName } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+        Invoke-RestMethod -Method Put -Headers $headers -Uri "# REMOVED_RENDER_ENV /ANDROID_APP_DEX_DOWNLOAD_URL" -Body (@{ value = $dexUrl } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+        Invoke-RestMethod -Method Put -Headers $headers -Uri "# REMOVED_RENDER_ENV /ANDROID_APP_DEX_APK_NAME" -Body (@{ value = $DexName } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+        Invoke-RestMethod -Method Put -Headers $headers -Uri "# REMOVED_RENDER_ENV /ANDROID_APP_UPDATE_NOTES" -Body (@{ value = $Notes } | ConvertTo-Json) -ContentType "application/json" | Out-Null
         Write-Host "Render env Android actualizado." -ForegroundColor Green
     }
 }

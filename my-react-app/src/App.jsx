@@ -2,9 +2,9 @@ import { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
 import { Capacitor, registerPlugin } from '@capacitor/core';
 
 const TEST_API_URL = new URLSearchParams(window.location.search).get('api');
-const DEFAULT_API_URL = 'http://64.181.176.160:8000';
-// Produccion Oracle: misma origen en /erp/, si no IP Oracle. Nunca Render.
-const BASE_URL = TEST_API_URL || (typeof window !== 'undefined' && window.location && window.location.origin && !/onrender\.com$/i.test(window.location.hostname) ? window.location.origin : DEFAULT_API_URL);
+const ORACLE_API_URL = 'http://64.181.176.160:8000';
+// Produccion: Oracle Cloud. Si abres /erp/ en la misma IP, usa misma origen.
+const BASE_URL = TEST_API_URL || (typeof window !== 'undefined' && window.location && /^https?:\/\/64\.181\.176\.160(?::\d+)?$/i.test(window.location.origin) ? window.location.origin : ORACLE_API_URL);
 const EMPRESA = 'computer_army';
 const APP_VERSION = '1.80';
 const IS_NATIVE_APP = !!(Capacitor?.isNativePlatform && Capacitor.isNativePlatform());

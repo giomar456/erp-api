@@ -1,6 +1,6 @@
 """
 Servidor compatible con plataform-api-sunat / Kodevo (flujo video Postman).
-En Render: https://erp-api-7x3d.onrender.com/api/v1/...
+Produccion Oracle Cloud: http://64.181.176.160:8000/api/v1/...
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ PUBLIC_BASE = (
     os.getenv("PLATAFORM_SUNAT_PUBLIC_URL")
     or os.getenv("PUBLIC_BASE_URL")
     or os.getenv("APP_PUBLIC_URL")
-    or "https://erp-api-7x3d.onrender.com"
+    or "http://64.181.176.160:8000"
 ).rstrip("/")
 
 
