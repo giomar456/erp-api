@@ -598,10 +598,8 @@ function shortSaleTabLabelFromLine(item) {
 }
 
 function saleTabInternalLabel(items, fallback = 'Cotizacion') {
-  const list = asArray(items);
-  if (!list.length) return fallback;
-  const source = list.find(isProcessorSaleLine) || list[0];
-  return shortSaleTabLabelFromLine(source) || fallback;
+  // Nombre manual de la pestaña (doble clic para editar). No renombra por producto.
+  return fallback || 'Cotizacion';
 }
 
 function fieldSearchSimilarity(queryTokens, fieldText, product = null) {
@@ -2635,6 +2633,8 @@ function VentasView({ user, sound, soundEnabled, setView }) {
   const [saleTabs, setSaleTabs] = useState(storedSaleState.saleTabs);
   const [activeTabId, setActiveTabId] = useState(storedSaleState.activeTabId);
   const [saleDrafts, setSaleDrafts] = useState(storedSaleState.saleDrafts);
+  const [editingTabId, setEditingTabId] = useState(null);
+  const [editingTabLabel, setEditingTabLabel] = useState('');
   const hydratingSaleRef = useRef(false);
 
   const load = async () => setProducts(asArray(await apiFetch('/productos')));
@@ -2786,6 +2786,10 @@ function VentasView({ user, sound, soundEnabled, setView }) {
     applySaleDraft(draft);
   };
   const closeSaleTab = (id) => {
+    if (editingTabId === id) {
+      setEditingTabId(null);
+      setEditingTabLabel('');
+    }
     if (saleTabs.length === 1) {
       resetSaleForm();
       return;
@@ -2803,6 +2807,28 @@ function VentasView({ user, sound, soundEnabled, setView }) {
       applySaleDraft(saleDrafts[next.id] || blankSaleDraft());
     }
   };
+
+  const beginRenameSaleTab = (tab) => {
+    setEditingTabId(tab.id);
+    setEditingTabLabel(String(tab.label || '').trim() || 'Cotizacion');
+  };
+
+  const commitRenameSaleTab = () => {
+    if (!editingTabId) return;
+    const clean = String(editingTabLabel || '').trim().slice(0, 40);
+    const finalLabel = clean || 'Cotizacion';
+    setSaleTabs((current) => current.map((tab) => (
+      tab.id === editingTabId ? { ...tab, label: finalLabel } : tab
+    )));
+    setEditingTabId(null);
+    setEditingTabLabel('');
+  };
+
+  const cancelRenameSaleTab = () => {
+    setEditingTabId(null);
+    setEditingTabLabel('');
+  };
+
   useEffect(() => {
     if (hydratingSaleRef.current) {
       hydratingSaleRef.current = false;
@@ -3166,11 +3192,46 @@ function VentasView({ user, sound, soundEnabled, setView }) {
         {saleTabs.map((tab) => {
           const draft = tab.id === activeTabId ? currentSaleDraft() : (saleDrafts[tab.id] || {});
           const count = asArray(draft.cart).length;
-          const tabLabel = saleTabInternalLabel(draft.cart, tab.label);
+          const tabLabel = String(tab.label || 'Cotizacion').trim() || 'Cotizacion';
+          const isEditing = editingTabId === tab.id;
+          if (isEditing) {
+            return (
+              <div
+                key={tab.id}
+                className={`flex items-center gap-1 rounded-md px-1.5 py-0.5 ${tab.id === activeTabId ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-700'}`}
+              >
+                <input
+                  autoFocus
+                  value={editingTabLabel}
+                  onChange={(e) => setEditingTabLabel(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitRenameSaleTab();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      cancelRenameSaleTab();
+                    }
+                  }}
+                  onBlur={() => commitRenameSaleTab()}
+                  className={`h-7 w-28 rounded border px-1.5 text-xs font-black outline-none ${tab.id === activeTabId ? 'border-white/40 bg-white text-slate-900' : 'border-slate-300 bg-white text-slate-900'}`}
+                  title="Escribe el nombre y Enter para guardar"
+                />
+                <span className={tab.id === activeTabId ? 'text-blue-100' : 'text-slate-500'}>{count}</span>
+              </div>
+            );
+          }
           return (
             <button
               key={tab.id}
+              type="button"
               onClick={() => switchSaleTab(tab.id)}
+              onDoubleClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                beginRenameSaleTab(tab);
+              }}
+              title="Doble clic para renombrar pestaña"
               className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-black ${tab.id === activeTabId ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-700'}`}
             >
               <span>{tabLabel}</span>
