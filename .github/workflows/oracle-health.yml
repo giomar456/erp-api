@@ -1,9 +1,11 @@
-name: Oracle ERP Health
+name: Oracle Keep Alive
 
-# Solo Oracle Cloud. Cero Render.
+# Pings frecuentes a Oracle Cloud para no perder conectividad / detectar caidas.
+# Oracle Always Free NO se duerme como Render, pero red/Docker si pueden fallar.
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    # Cada 5 minutos (GitHub puede retrasar un poco)
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,15 +17,34 @@ env:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
-      - name: Health Oracle + DB
+      - name: Ping Oracle (reintentos)
         run: |
           set -uo pipefail
-          code=$(curl -sS -o /tmp/body.txt -w "%{http_code}" --connect-timeout 15 --max-time 40 "${ORACLE_URL}/health?db=1" || echo "000")
-          body=$(head -c 400 /tmp/body.txt || true)
-          echo "HTTP $code"
-          echo "$body"
-          test "$code" = "200"
-          echo "$body" | grep -q '"ok":true'
-          echo "Oracle produccion OK"
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "=== Intento $i/5 ==="
+            code=$(curl -sS -o /tmp/body.txt -w "%{http_code}" \
+              --connect-timeout 12 --max-time 45 \
+              "${ORACLE_URL}/health?db=1" || echo "000")
+            body=$(head -c 400 /tmp/body.txt || true)
+            echo "HTTP $code"
+            echo "$body"
+            if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":true'; then
+              ok=1
+              break
+            fi
+            sleep 8
+          done
+
+          # Warm rutas livianas (best effort)
+          curl -sS --connect-timeout 10 --max-time 30 "${ORACLE_URL}/health" -o /dev/null || true
+          curl -sS --connect-timeout 10 --max-time 30 "${ORACLE_URL}/" -o /dev/null || true
+          curl -sS --connect-timeout 10 --max-time 40 "${ORACLE_URL}/erp/" -o /dev/null || true
+
+          if [ "$ok" != "1" ]; then
+            echo "::error::Oracle no respondio health+db. Revisa VM 64.181.176.160 y docker."
+            exit 1
+          fi
+          echo "Oracle Keep Alive OK"

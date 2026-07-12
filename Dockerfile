@@ -24,4 +24,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=50s --retries=4 \
   CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.getenv('PORT','8000'), timeout=6)"
 
 # 1 worker: VM Oracle free ~1GB. Concurrency baja para no OOM.
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --timeout-keep-alive 25 --limit-concurrency 15 --limit-max-requests 800 --proxy-headers --forwarded-allow-ips='*'"]
+# timeout-keep-alive alto: no corta clientes/caja que dejan la conexion abierta.
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --timeout-keep-alive 75 --limit-concurrency 15 --limit-max-requests 1200 --proxy-headers --forwarded-allow-ips='*'"]
