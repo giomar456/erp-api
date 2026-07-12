@@ -11039,16 +11039,164 @@ def woo_upload_product_image(producto_id: int, sucursal: str = DEFAULT_SUCURSAL)
         if found.get("ok") and (found.get("data") or []):
             woo_id = int(found["data"][0].get("id") or 0)
     if not woo_id:
-        return {"ok": False, "msg": "Primero sincroniza el producto con WooCommerce."}
+        return {"ok": False, "msg": "Primero sincroniza el producto con WooCommerce (SKU/web)."}
     updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"images": [{"src": image_url}]})
     if not updated.get("ok"):
         return updated
     return {
         "ok": True,
-        "msg": "Imagen enviada a WooCommerce.",
+        "success": True,
+        "msg": "Solo imagen actualizada en la web (SKU y demas sin cambios).",
         "image_url": image_url,
         "woo_id": woo_id,
+        "sku": sku,
         "data": updated.get("data", {}),
+    }
+
+
+@app.post("/web/woocommerce/sync-sku/{producto_id}")
+def woo_sync_product_sku(producto_id: int, data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    """Actualiza/guarda SKU en ERP y lo empuja a WooCommerce. Opcional: body {sku_woo}."""
+    sucursal = norm_sucursal(sucursal)
+    data = data or {}
+    sku_new = str(data.get("sku_woo") or data.get("sku") or "").strip().upper()
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+    cur.execute("""
+        SELECT id, nombre, COALESCE(sku_woo,'') AS sku_woo, COALESCE(woo_id,0) AS woo_id,
+               COALESCE(imagen_url,'') AS imagen_url, COALESCE(nombre_web,'') AS nombre_web,
+               COALESCE(precio_venta,0) AS precio_venta, COALESCE(stock,0) AS stock
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    p = dict_fetchone(cur)
+    if not p:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "Producto ERP no encontrado."}
+    sku_old = str(p.get("sku_woo") or "").strip().upper()
+    sku = sku_new or sku_old or f"ERP-{producto_id}"
+    if sku != sku_old:
+        cur.execute("""
+            UPDATE productos SET sku_woo=%s
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (sku, producto_id, DEFAULT_SUCURSAL, sucursal))
+        conn.commit()
+        p["sku_woo"] = sku
+    release_conn(conn)
+
+    if not woo_config(sucursal):
+        return {"ok": False, "success": False, "msg": "WooCommerce no configurado para esta sucursal.", "sku": sku}
+
+    woo_id = int(p.get("woo_id") or 0)
+    # Buscar producto web por woo_id, SKU nuevo o SKU viejo
+    if not woo_id and sku:
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+        if found.get("ok") and (found.get("data") or []):
+            woo_id = int(found["data"][0].get("id") or 0)
+    if not woo_id and sku_old and sku_old != sku:
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku_old, "per_page": 1})
+        if found.get("ok") and (found.get("data") or []):
+            woo_id = int(found["data"][0].get("id") or 0)
+
+    if woo_id:
+        updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"sku": sku})
+        if not updated.get("ok"):
+            return {
+                "ok": False,
+                "success": False,
+                "msg": updated.get("msg") or "No se pudo actualizar el SKU en la web.",
+                "sku": sku,
+                "woo_id": woo_id,
+            }
+        woo_save_product_link(producto_id, updated.get("data") or {}, sku, sucursal=sucursal)
+        return {
+            "ok": True,
+            "success": True,
+            "msg": f"SKU actualizado en la web: {sku} (producto web #{woo_id}).",
+            "sku": sku,
+            "woo_id": woo_id,
+            "action": "updated",
+        }
+
+    # Si no existe en web, crear/vincular completo
+    r = woo_upsert_erp_product(p, sucursal=sucursal)
+    if not r.get("ok"):
+        return {
+            "ok": False,
+            "success": False,
+            "msg": r.get("msg") or "No se encontro producto web y no se pudo crear.",
+            "sku": sku,
+        }
+    return {
+        "ok": True,
+        "success": True,
+        "msg": f"SKU {sku} publicado/vinculado en la web ({r.get('action') or 'ok'}).",
+        "sku": sku,
+        "woo_id": int((r.get("data") or {}).get("id") or 0),
+        "action": r.get("action") or "upsert",
+        "data": r.get("data"),
+    }
+
+
+@app.post("/web/woocommerce/pull-image/{producto_id}")
+def woo_pull_product_image(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    """Trae la imagen de la web (Woo) hacia el ERP por SKU o woo_id."""
+    sucursal = norm_sucursal(sucursal)
+    conn = get_conn()
+    cur = conn.cursor()
+    ensure_producto_web_columns(cur)
+    cur.execute("""
+        SELECT id, nombre, COALESCE(sku_woo,'') AS sku_woo, COALESCE(woo_id,0) AS woo_id,
+               COALESCE(imagen_url,'') AS imagen_url
+        FROM productos
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+    p = dict_fetchone(cur)
+    if not p:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "Producto ERP no encontrado."}
+    sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{producto_id}"
+    woo_id = int(p.get("woo_id") or 0)
+    item = None
+    if woo_id > 0:
+        detail = woo_request("get", f"products/{woo_id}", sucursal=sucursal)
+        if detail.get("ok"):
+            item = detail.get("data") or {}
+    if not item:
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+        if not found.get("ok"):
+            release_conn(conn)
+            return {"ok": False, "success": False, "msg": found.get("msg") or "Error consultando la web."}
+        items = found.get("data") or []
+        if not items:
+            release_conn(conn)
+            return {"ok": False, "success": False, "msg": f"No hay producto web con SKU {sku}."}
+        item = items[0]
+        woo_id = int(item.get("id") or 0)
+    images = item.get("images") or []
+    image_url = images[0].get("src", "") if images and isinstance(images[0], dict) else ""
+    if not image_url:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "El producto web no tiene imagen."}
+    cur.execute("""
+        UPDATE productos
+        SET imagen_url=%s,
+            woo_id=CASE WHEN %s > 0 THEN %s ELSE woo_id END,
+            sku_woo=CASE WHEN COALESCE(sku_woo,'')='' THEN %s ELSE sku_woo END
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+    """, (image_url, woo_id, woo_id, sku, producto_id, DEFAULT_SUCURSAL, sucursal))
+    conn.commit()
+    release_conn(conn)
+    return {
+        "ok": True,
+        "success": True,
+        "msg": "Imagen traida de la web al ERP.",
+        "image_url": image_url,
+        "sku": sku,
+        "woo_id": woo_id,
+        "producto_id": producto_id,
     }
 
 

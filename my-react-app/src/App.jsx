@@ -5167,6 +5167,76 @@ function ProductosView({ user }) {
     const res = await apiFetch(`/web/woocommerce/sync-price/${selected.id}`, { method: 'POST' });
     alert(res.msg || (okResponse(res) ? 'Precio sincronizado.' : 'No se pudo sincronizar precio.'));
   };
+  const syncSelectedSku = async () => {
+    if (!selected) return;
+    setSaving(true);
+    try {
+      const skuFromForm = form?.id && String(form.id) === String(selected.id) ? form.sku_woo : '';
+      const sku = String(skuFromForm || selected.sku_woo || `ERP-${selected.id}`).trim().toUpperCase();
+      if (!sku) {
+        alert('Escribe un Codigo web / SKU primero (en Editar producto).');
+        return;
+      }
+      const res = await apiFetch(`/web/woocommerce/sync-sku/${selected.id}`, {
+        method: 'POST',
+        json: { sku_woo: sku },
+      });
+      alert(res.msg || (okResponse(res) ? 'SKU actualizado en la web.' : 'No se pudo actualizar el SKU.'));
+      if (okResponse(res)) {
+        await load();
+        if (form.id && String(form.id) === String(selected.id)) {
+          setForm((current) => ({ ...current, sku_woo: res.sku || sku }));
+        }
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+  const syncSelectedImageOnly = async () => {
+    if (!selected) return;
+    setSaving(true);
+    try {
+      if (form.id && String(form.id) === String(selected.id) && form.imagen_url && form.imagen_url !== selected.imagen_url) {
+        const saveRes = await apiFetch(`/productos/${selected.id}`, {
+          method: 'PUT',
+          json: {
+            ...selected,
+            ...form,
+            precio_compra: Number(form.precio_compra ?? selected.precio_compra ?? 0),
+            precio_venta: Number(form.precio_venta ?? selected.precio_venta ?? selected.precio ?? 0),
+            stock: Number(form.stock ?? selected.stock ?? 0),
+            imagen_url: form.imagen_url,
+            sync_to_woo: false,
+          },
+        });
+        if (!okResponse(saveRes)) {
+          alert(saveRes.msg || 'No se pudo guardar la imagen en ERP.');
+          return;
+        }
+      }
+      const res = await apiFetch(`/web/woocommerce/upload-image/${selected.id}`, { method: 'POST' });
+      alert(res.msg || (okResponse(res) ? 'Imagen actualizada en la web.' : 'No se pudo actualizar la imagen.'));
+      if (okResponse(res)) await load();
+    } finally {
+      setSaving(false);
+    }
+  };
+  const pullSelectedImageFromWeb = async () => {
+    if (!selected) return;
+    setSaving(true);
+    try {
+      const res = await apiFetch(`/web/woocommerce/pull-image/${selected.id}`, { method: 'POST' });
+      alert(res.msg || (okResponse(res) ? 'Imagen traida de la web.' : 'No se pudo traer la imagen.'));
+      if (okResponse(res)) {
+        await load();
+        if (form.id && String(form.id) === String(selected.id) && res.image_url) {
+          setForm((current) => ({ ...current, imagen_url: res.image_url }));
+        }
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_390px]">
       <Card title="Productos" actions={<><SelectInput value={category} onChange={(e) => setCategory(e.target.value)} className="w-44">{categories.map((c) => <option key={c}>{c}</option>)}</SelectInput><TextInput placeholder="Buscar producto..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-60" /><ActionButton tone="neutral" onClick={load}>Actualizar</ActionButton></>}>
@@ -5207,7 +5277,10 @@ function ProductosView({ user }) {
       </Card>
       <aside className="grid gap-4">
         <Card title={selected ? selected.nombre : 'Producto seleccionado'}>
-          {selected ? <div className="grid gap-3 text-sm"><div className="rounded-md bg-slate-50 p-3"><b>{selected.nombre}</b><div className="text-xs text-slate-500">{selected.categoria || 'Sin categorÃ­a'} / {selected.marca} {selected.modelo} / {selected.almacen || 'TIENDA'}</div><div className="text-xs font-black text-indigo-700">SKU web: {selected.sku_woo || `ERP-${selected.id}`}</div><div className="mt-1 font-black">{money(selected.precio_venta || selected.precio)} / Stock {selected.stock || 0}</div></div><ActionButton tone="blue" onClick={() => edit(selected)}>Editar seleccionado</ActionButton><ActionButton tone="violet" onClick={syncSelectedPrice}>Sincronizar precio web</ActionButton>{canSeries ? <ActionButton tone="violet" onClick={() => { resetSerie(); setSeriesEditorOpen(true); }}>Agregar / administrar series</ActionButton> : <div className="rounded-md bg-amber-50 p-2 text-xs font-bold text-amber-800">Solo giomar y mily pueden ingresar, editar o eliminar series.</div>}</div> : <Empty text="Selecciona un producto." />}
+          {selected ? <div className="grid gap-3 text-sm"><div className="rounded-md bg-slate-50 p-3"><b>{selected.nombre}</b><div className="text-xs text-slate-500">{selected.categoria || 'Sin categorÃ­a'} / {selected.marca} {selected.modelo} / {selected.almacen || 'TIENDA'}</div><div className="text-xs font-black text-indigo-700">SKU web: {selected.sku_woo || `ERP-${selected.id}`}</div><div className="mt-1 font-black">{money(selected.precio_venta || selected.precio)} / Stock {selected.stock || 0}</div></div><ActionButton tone="blue" onClick={() => edit(selected)}>Editar seleccionado</ActionButton><ActionButton tone="violet" onClick={syncSelectedPrice}>Sincronizar precio web</ActionButton>
+            <ActionButton tone="indigo" disabled={saving} onClick={syncSelectedSku}>{saving ? '...' : 'Actualizar SKU en la web'}</ActionButton>
+            <ActionButton tone="blue" disabled={saving} onClick={syncSelectedImageOnly}>{saving ? '...' : 'Solo actualizar imagen en la web'}</ActionButton>
+            <ActionButton tone="neutral" disabled={saving} onClick={pullSelectedImageFromWeb}>Traer imagen de la web</ActionButton>{canSeries ? <ActionButton tone="violet" onClick={() => { resetSerie(); setSeriesEditorOpen(true); }}>Agregar / administrar series</ActionButton> : <div className="rounded-md bg-amber-50 p-2 text-xs font-bold text-amber-800">Solo giomar y mily pueden ingresar, editar o eliminar series.</div>}</div> : <Empty text="Selecciona un producto." />}
         </Card>
         <Card title="Rastreador de series"><SeriesQuickSearch compact /></Card>
         <Card title="Series del producto">
@@ -5360,6 +5433,13 @@ function ProductosView({ user }) {
                   </div>
                   <div className="grid gap-2">
                     <ActionButton tone="blue" onClick={() => imageInputRef.current?.click()}>Subir / actualizar foto</ActionButton>
+                    {form.id ? (
+                      <div className="grid gap-1 sm:grid-cols-2">
+                        <ActionButton tone="violet" disabled={saving} onClick={syncSelectedImageOnly}>{saving ? '...' : 'Solo imagen a la web'}</ActionButton>
+                        <ActionButton tone="indigo" disabled={saving} onClick={syncSelectedSku}>{saving ? '...' : 'Actualizar SKU a la web'}</ActionButton>
+                        <ActionButton tone="neutral" disabled={saving} onClick={pullSelectedImageFromWeb}>Traer imagen de la web</ActionButton>
+                      </div>
+                    ) : null}
                     {form.imagen_url?.startsWith('data:image/')
                       ? <TextInput value="Imagen subida desde archivo" readOnly />
                       : <TextInput placeholder="O pega una URL de imagen" value={form.imagen_url} onChange={(e) => setForm({ ...form, imagen_url: e.target.value })} />}
@@ -5373,6 +5453,8 @@ function ProductosView({ user }) {
               {form.id && <ActionButton tone="danger" onClick={remove}>Eliminar</ActionButton>}
               <ActionButton tone="neutral" onClick={() => setForm(emptyProduct)}>Limpiar</ActionButton>
               <ActionButton disabled={saving} onClick={() => save(false)}>{form.id ? 'Actualizar' : 'Guardar'}</ActionButton>
+              {form.id && <ActionButton tone="blue" disabled={saving} onClick={syncSelectedImageOnly}>{saving ? '...' : 'Solo imagen a la web'}</ActionButton>}
+              {form.id && <ActionButton tone="indigo" disabled={saving} onClick={syncSelectedSku}>{saving ? '...' : 'Actualizar SKU a la web'}</ActionButton>}
               {form.id && <ActionButton tone="violet" disabled={saving} onClick={() => save(true)}>{saving ? 'Subiendo...' : 'Guardar y subir a la pagina'}</ActionButton>}
             </footer>
           </section>
