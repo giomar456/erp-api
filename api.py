@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
@@ -49,6 +49,11 @@ except Exception:
     plataform_sunat = None
 
 try:
+    import whatsapp_bridge as whatsapp_bridge
+except Exception:
+    whatsapp_bridge = None
+
+try:
     from plataform_sunat_server import router as plataform_sunat_router
     from plataform_sunat_server import ensure_plataform_tables
 except Exception as _plataform_import_exc:
@@ -67,7 +72,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=900)
+
+
+class _SkipPdfGZipMiddleware:
+    """GZip solo para JSON/HTML. PDF ya va comprimido: gzip lo demora y no ayuda."""
+
+    def __init__(self, app, minimum_size: int = 900):
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path") or ""
+            if "/pdf" in path or path.endswith(".pdf"):
+                await self.app(scope, receive, send)
+                return
+        await self.gzip(scope, receive, send)
+
+
+app.add_middleware(_SkipPdfGZipMiddleware, minimum_size=900)
 
 _PRODUCTOS_CACHE = {}
 _PRODUCTOS_CACHE_TTL = int(os.getenv("PRODUCTOS_CACHE_TTL", "120") or "120")
@@ -129,15 +152,13 @@ def invalidate_productos_cache(sucursal: str = ""):
     with _PRODUCTOS_CACHE_LOCK:
         if not sucursal:
             _PRODUCTOS_CACHE.clear()
-        else:
-            prefix = f"{norm_sucursal(sucursal)}|"
-            for key in list(_PRODUCTOS_CACHE.keys()):
-                if key.startswith(prefix):
-                    _PRODUCTOS_CACHE.pop(key, None)
-    # Keys reales: "documentos|lite|sucursal|fecha|q" — usar prefijo "documentos|"
-    invalidate_api_cache("documentos|")
-    invalidate_api_cache("caja|")
-    invalidate_api_cache("dashboard|")
+            return
+        prefix = f"{norm_sucursal(sucursal)}|"
+        for key in list(_PRODUCTOS_CACHE.keys()):
+            if key.startswith(prefix):
+                _PRODUCTOS_CACHE.pop(key, None)
+    invalidate_api_cache(f"documentos|{norm_sucursal(sucursal)}" if sucursal else "documentos|")
+    invalidate_api_cache(f"dashboard|{norm_sucursal(sucursal)}" if sucursal else "dashboard|")
 
 if plataform_sunat_router is not None:
     app.include_router(plataform_sunat_router, prefix="/api/v1")
@@ -233,26 +254,6 @@ def erp_web_index():
 def erp_favicon():
     target = os.path.join(WEBAPP_DIR, "favicon.svg")
     return FileResponse(target) if os.path.exists(target) else {"ok": False}
-
-
-@app.get("/favicon.ico")
-@app.get("/icono.ico")
-def erp_favicon_ico():
-    for name in ("favicon.ico", "icono.ico"):
-        target = os.path.join(WEBAPP_DIR, name)
-        if os.path.exists(target):
-            return FileResponse(target, media_type="image/x-icon")
-    return {"ok": False}
-
-
-@app.get("/favicon.png")
-@app.get("/logo-sistema.png")
-def erp_logo_sistema():
-    for name in ("logo-sistema.png", "favicon.png", "app-logo.png", "army-logo-doc.png"):
-        target = os.path.join(WEBAPP_DIR, name)
-        if os.path.exists(target):
-            return FileResponse(target, media_type="image/png")
-    return {"ok": False}
 
 
 @app.get("/icons.svg")
@@ -374,6 +375,7 @@ DEFAULT_FEATURES = {
     "ajustes": True,
     "contabilidad": True,
     "pagina_web": True,
+    "whatsapp": True,
 }
 
 
@@ -384,9 +386,6 @@ def norm_sucursal(value: str = ""):
 
 DOCUMENT_EDIT_USERS = {"giomar"}
 SERIES_EDIT_USERS = {"giomar", "mily"}
-COMPRAS_SERIES_EDIT_USERS = {"giomar", "mily", "tiffco"}
-
-
 def norm_usuario_permiso(value=""):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
@@ -422,7 +421,7 @@ def usuario_puede_editar_series_compras(data):
     if not isinstance(data, dict):
         return False
     for key in ("usuario", "usuario_ingreso", "usuario_emisor", "usuario_registro", "usuario_edicion", "editor", "user"):
-        if norm_usuario_permiso(data.get(key)) in COMPRAS_SERIES_EDIT_USERS:
+        if norm_usuario_permiso(data.get(key)):
             return True
     return False
 
@@ -599,6 +598,8 @@ def normalize_feature_permissions(value=None):
         for k, v in value.items():
             if k in permisos:
                 permisos[k] = bool(v)
+    # Caja es operativa esencial: no debe quedar oculta por permisos viejos/incompletos
+    permisos["caja"] = True
     return permisos
 
 
@@ -792,13 +793,14 @@ def normalizar_comprobante_pago(data):
             "comprobante_pago_data_url": None,
         }
 
+    raw_b64 = re.sub(r"\s+", "", raw_b64)
     try:
-        decoded = base64.b64decode(raw_b64, validate=True)
+        decoded = base64.b64decode(raw_b64, validate=False)
     except (binascii.Error, ValueError):
-        raise ValueError("Comprobante de pago invalido o corrupto.")
+        raise ValueError("Comprobante de pago invalido o corrupto. Prueba con JPG/PNG.")
 
     if len(decoded) > MAX_COMPROBANTE_PAGO_BYTES:
-        raise ValueError("Comprobante de pago mayor a 15 MB.")
+        raise ValueError("Comprobante de pago mayor a 15 MB. Comprime la foto o usa JPG.")
 
     if not nombre and referencia:
         nombre = os.path.basename(referencia.replace("\\", "/"))
@@ -844,11 +846,32 @@ def normalizar_un_comprobante(item):
             mime = header[5:].split(";", 1)[0].strip() or mime
     if not raw_b64:
         return None
-    decoded = base64.b64decode(raw_b64, validate=True)
+    # Quitar espacios/saltos que a veces meten moviles al copiar base64
+    raw_b64 = re.sub(r"\s+", "", raw_b64)
+    try:
+        decoded = base64.b64decode(raw_b64, validate=False)
+    except Exception as exc:
+        raise ValueError(f"Comprobante invalido o corrupto: {exc}") from exc
+    if not decoded:
+        return None
     if len(decoded) > MAX_COMPROBANTE_PAGO_BYTES:
-        raise ValueError("Cada comprobante de pago debe pesar maximo 15 MB.")
+        raise ValueError("Cada comprobante de pago debe pesar maximo 15 MB. Comprime la foto o usa JPG.")
     if not nombre:
         nombre = os.path.basename(referencia.replace("\\", "/")) or "comprobante_pago"
+    # Normalizar mime de fotos de celular (heic/webp)
+    mime_l = (mime or "").lower()
+    if not mime_l or mime_l == "application/octet-stream":
+        lower_name = nombre.lower()
+        if lower_name.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif lower_name.endswith(".png"):
+            mime = "image/png"
+        elif lower_name.endswith(".webp"):
+            mime = "image/webp"
+        elif lower_name.endswith(".pdf"):
+            mime = "application/pdf"
+        elif lower_name.endswith((".heic", ".heif")):
+            mime = "image/heic"
     tamano = int(tamano or len(decoded))
     data_url = f"data:{mime};base64,{raw_b64}"
     return {
@@ -1139,6 +1162,142 @@ def es_ram_kingston(nombre):
     return "KINGSTON" in text and ("RAM" in text or "MEM" in text or "MEMORIA" in text)
 
 
+def item_es_compra_externa(item):
+    """Producto comprado al momento (no catalogado / sin stock interno).
+    Tipico en facturacion BANANA: item con serie que no esta en inventario.
+    """
+    if item is None:
+        return False
+    if isinstance(item, dict):
+        flag = (
+            item.get("compra_externa")
+            or item.get("es_compra_externa")
+            or item.get("external_purchase")
+            or item.get("permite_serie_manual")
+        )
+        producto_id = item.get("producto_id") or item.get("id")
+        series_texto = item.get("series_texto") or item.get("serie") or ""
+    else:
+        flag = bool(
+            getattr(item, "compra_externa", False)
+            or getattr(item, "es_compra_externa", False)
+            or getattr(item, "permite_serie_manual", False)
+        )
+        producto_id = getattr(item, "producto_id", None) or getattr(item, "id", None)
+        series_texto = getattr(item, "series_texto", None) or getattr(item, "serie", None) or ""
+    try:
+        pid = int(producto_id) if str(producto_id or "").strip() not in ("", "0", "None") else 0
+    except Exception:
+        pid = 0
+    if flag:
+        return True
+    # Sin producto de catalogo + con series = compra externa / venta libre
+    return (not pid) and bool(str(series_texto or "").strip())
+
+
+def procesar_compra_externa_venta(cur, producto_id, nombre_doc, marca_doc, modelo_doc, cantidad, series_texto, sucursal, usuario=""):
+    """
+    Compra externa / producto al momento:
+    - Permite series que no existen en inventario.
+    - Si la serie ya esta disponible en el sistema, la marca vendida.
+    - Si no existe, la registra como VENDIDO con proveedor COMPRA EXTERNA
+      (crea el producto si no hay producto_id).
+    """
+    sucursal = inventario_sucursal(sucursal)
+    cantidad = max(0, int(float(cantidad or 0)))
+    selected = split_series_text(series_texto)
+    nombre = str(nombre_doc or "").strip() or "PRODUCTO COMPRA EXTERNA"
+    marca = str(marca_doc or "").strip()
+    modelo = str(modelo_doc or "").strip()
+    usuario = str(usuario or "SISTEMA").strip() or "SISTEMA"
+
+    try:
+        producto_id = int(producto_id) if str(producto_id or "").strip() not in ("", "0", "None") else None
+    except Exception:
+        producto_id = None
+
+    if selected:
+        if len(selected) != cantidad:
+            return None, f"{nombre}: ingresa {cantidad} serie(s) para la compra externa (detectadas {len(selected)})."
+        if len(set(selected)) != len(selected):
+            return None, f"{nombre}: hay series repetidas en la compra externa."
+
+    # Crear producto de catalogo si no existe, para que la serie quede trazable.
+    if not producto_id and selected:
+        cur.execute("""
+        SELECT id FROM productos
+        WHERE UPPER(COALESCE(nombre,''))=UPPER(%s) AND COALESCE(sucursal,%s)=%s
+        ORDER BY id DESC
+        LIMIT 1
+        """, (nombre, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if row and row[0]:
+            producto_id = int(row[0])
+        else:
+            cur.execute("""
+            INSERT INTO productos (
+                nombre, categoria, marca, modelo, precio_compra, precio_venta, stock, almacen, sucursal, observacion
+            )
+            VALUES (%s,'COMPRA EXTERNA',%s,%s,0,0,0,'TIENDA',%s,%s)
+            RETURNING id
+            """, (
+                nombre, marca, modelo, sucursal,
+                "Creado automaticamente por venta de compra externa / producto al momento",
+            ))
+            producto_id = int(cur.fetchone()[0])
+
+    for serie in selected:
+        cur.execute("""
+        SELECT ps.id,
+               ps.producto_id,
+               UPPER(COALESCE(ps.estado,'DISPONIBLE')) AS estado,
+               COALESCE(p.nombre,'') AS producto_nombre
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+          AND regexp_replace(UPPER(COALESCE(ps.serie,'')), '[^A-Z0-9]', '', 'g')=%s
+        LIMIT 5
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal, serie))
+        matches = dict_fetchall(cur)
+        disponibles = [r for r in matches if str(r.get("estado") or "").upper() in ("DISPONIBLE", "RESERVADO")]
+        vendidos = [r for r in matches if str(r.get("estado") or "").upper() == "VENDIDO"]
+
+        if disponibles:
+            row = disponibles[0]
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='VENDIDO',
+                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+            WHERE id=%s
+            """, (row.get("id"),))
+            if row.get("producto_id"):
+                sync_producto_stock_from_series(cur, row.get("producto_id"), sucursal)
+            if not producto_id and row.get("producto_id"):
+                producto_id = row.get("producto_id")
+            continue
+
+        if vendidos and not disponibles:
+            # Si ya esta vendida y no hay disponible, no reutilizar.
+            return None, f"{nombre}: la serie {serie} ya esta vendida en el sistema."
+
+        if not producto_id:
+            return None, f"{nombre}: no se pudo registrar la serie {serie} (sin producto)."
+
+        cur.execute("""
+        INSERT INTO producto_series (
+            producto_id, serie, proveedor, estado, almacen, fecha_ingreso, fecha_salida, sucursal, usuario_ingreso
+        )
+        VALUES (%s,%s,'COMPRA EXTERNA','VENDIDO','VENTA',
+                TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),
+                TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'),
+                %s,%s)
+        """, (producto_id, serie, sucursal, usuario))
+
+    if producto_id:
+        sync_producto_stock_from_series(cur, producto_id, sucursal)
+    return producto_id, None
+
+
 def resolver_producto_por_series_venta(cur, producto_id, nombre_doc, cantidad, series_texto, sucursal):
     sucursal = inventario_sucursal(sucursal)
     selected = split_series_text(series_texto)
@@ -1350,17 +1509,31 @@ def normalizar_comprobantes_pago(data, existentes=None):
             recibidos.append(normalizado)
     legacy = normalizar_comprobante_pago(data)
     if legacy.get("comprobante_pago_base64") or legacy.get("comprobante_pago_data_url"):
-        recibidos.append(legacy)
+        # Evitar duplicar el mismo archivo si ya viene en comprobantes_pago
+        leg_key = str(legacy.get("comprobante_pago_data_url") or legacy.get("comprobante_pago_base64") or "")
+        if not any(str(x.get("comprobante_pago_data_url") or x.get("comprobante_pago_base64") or "") == leg_key for x in recibidos):
+            recibidos.append(legacy)
     if not recibidos:
+        # Sin archivos nuevos: conservar los existentes
         return cargar_comprobantes_json(existentes), comprobante_payload_vacio(), None
-    combinados = cargar_comprobantes_json(existentes)
-    vistos = {str(x.get("comprobante_pago_data_url") or x.get("comprobante_pago_base64") or x.get("comprobante_pago_nombre") or "") for x in combinados}
-    for item in recibidos:
-        key = str(item.get("comprobante_pago_data_url") or item.get("comprobante_pago_base64") or item.get("comprobante_pago_nombre") or "")
-        if key and key in vistos:
-            continue
-        combinados.append(item)
-        vistos.add(key)
+    # Si el usuario sube comprobantes nuevos = ACTUALIZAR (reemplazar), no acumular viejos
+    replace_flag = get_value("reemplazar_comprobantes", None)
+    if replace_flag is None:
+        replace_flag = True
+    if replace_flag:
+        combinados = list(recibidos)
+    else:
+        combinados = cargar_comprobantes_json(existentes)
+        vistos = {
+            str(x.get("comprobante_pago_data_url") or x.get("comprobante_pago_base64") or x.get("comprobante_pago_nombre") or "")
+            for x in combinados
+        }
+        for item in recibidos:
+            key = str(item.get("comprobante_pago_data_url") or item.get("comprobante_pago_base64") or item.get("comprobante_pago_nombre") or "")
+            if key and key in vistos:
+                continue
+            combinados.append(item)
+            vistos.add(key)
     principal = combinados[0] if combinados else comprobante_payload_vacio()
     return combinados, principal, json.dumps(combinados, ensure_ascii=False)
 
@@ -1672,7 +1845,7 @@ def consulta_documento_impl(numero, sucursal=DEFAULT_SUCURSAL, tipo_preferido: s
 
 # ================= MODELOS =================
 class ItemVenta(BaseModel):
-    id: int
+    id: Optional[int] = 0
     cantidad: int
     precio: float
     total: float
@@ -1682,6 +1855,10 @@ class ItemVenta(BaseModel):
     modelo: str = ""
     serie: str = ""
     series_texto: str = ""
+    compra_externa: bool = False
+    es_compra_externa: bool = False
+    permite_serie_manual: bool = False
+    detalle_adicional: str = ""
 
 
 class Venta(BaseModel):
@@ -1702,6 +1879,7 @@ class Venta(BaseModel):
     emitir_legal_sunat: bool = False
     modo_prueba: bool = False
     proforma_origen_id: Optional[int] = None
+    reserva_origen_id: Optional[int] = None
 
 
 class Cliente(BaseModel):
@@ -1721,10 +1899,13 @@ class ReservaCliente(BaseModel):
     producto_nombre: str = ""
     cantidad: int = 1
     monto_total: float = 0
-    monto_reserva: float = 0
+    monto_reserva: float = 0  # adelanto / separado
+    fecha_retiro: str = ""  # YYYY-MM-DD cuando viene el cliente
     estado: str = "RESERVADO"
     observacion: str = ""
     usuario: str = ""
+    cotizacion_id: Optional[int] = None  # PROFORMA vinculada como documento de la separacion
+    cotizacion_numero: str = ""
     comprobante_pago: Optional[str] = ""
     comprobante_pago_nombre: Optional[str] = ""
     comprobante_pago_mime: Optional[str] = ""
@@ -1758,6 +1939,10 @@ class DocumentoManualSeries(BaseModel):
     tipo: str = "BOLETA"
     numero: str = ""
     cliente_nombre: str = "CLIENTE MANUAL"
+    tipo_documento_cliente: str = ""
+    numero_documento_cliente: str = ""
+    documento_cliente: str = ""
+    direccion_cliente: str = ""
     fecha_emision: str = ""
     series_texto: str = ""
     usuario_emisor: str = ""
@@ -1847,11 +2032,12 @@ class UsuarioOnlineHeartbeat(BaseModel):
     session_id: str = ""
 
 
-class CerrarSesionRequest(BaseModel):
+class UsuarioCerrarSesion(BaseModel):
+    usuario: str = ""
+    motivo: str = ""
     session_id: str = ""
-    solicitante: str = ""
-    usuario: str = ""  # objetivo (cerrar todas de un usuario)
-    session_id_actual: str = ""  # no cerrar esta (cerrar otras)
+    target_usuario: str = ""
+    keep_session_id: str = ""
 
 
 class BoquitoquiMensaje(BaseModel):
@@ -1862,6 +2048,15 @@ class BoquitoquiMensaje(BaseModel):
     audio_base64: str
     duracion_ms: int = 0
     sucursal: str = DEFAULT_SUCURSAL
+
+
+class WhatsAppEnviar(BaseModel):
+    telefono: str
+    mensaje: str = ""
+    usuario: str = ""
+    sucursal: str = DEFAULT_SUCURSAL
+    documento_id: Optional[int] = None
+    adjuntar_pdf: bool = True
 
 
 class CajaMovimiento(BaseModel):
@@ -1910,6 +2105,22 @@ class EstadoPagoUpdate(BaseModel):
     comprobante_pago_base64: Optional[str] = ""
     comprobante_pago_data_url: Optional[str] = ""
     comprobantes_pago: Optional[List[dict]] = None
+    reemplazar_comprobantes: Optional[bool] = True
+    usuario: Optional[str] = ""
+
+
+class ComprobantesPagoUpdate(BaseModel):
+    """Solo subir/adjuntar comprobantes de pago (todos los asesores)."""
+    comprobante_pago: Optional[str] = ""
+    comprobante_pago_nombre: Optional[str] = ""
+    comprobante_pago_mime: Optional[str] = ""
+    comprobante_pago_tamano: Optional[int] = None
+    comprobante_pago_base64: Optional[str] = ""
+    comprobante_pago_data_url: Optional[str] = ""
+    comprobantes_pago: Optional[List[dict]] = None
+    reemplazar_comprobantes: Optional[bool] = False  # por defecto AGREGA a los existentes
+    usuario: Optional[str] = ""
+    sucursal: str = DEFAULT_SUCURSAL
 
 
 class EstadoSunatUpdate(BaseModel):
@@ -2115,6 +2326,29 @@ def migrate_schema():
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS boquitoqui_enabled BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS color_tema TEXT DEFAULT '#304fb8'")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS whatsapp_mensajes (
+            id SERIAL PRIMARY KEY,
+            sucursal TEXT DEFAULT 'computer_army',
+            usuario TEXT DEFAULT '',
+            telefono TEXT DEFAULT '',
+            tipo TEXT DEFAULT 'TEXTO',
+            documento_id INTEGER,
+            documento_tipo TEXT DEFAULT '',
+            documento_numero TEXT DEFAULT '',
+            mensaje TEXT DEFAULT '',
+            estado TEXT DEFAULT 'ENVIADO',
+            error_msg TEXT DEFAULT '',
+            message_id TEXT DEFAULT '',
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_whatsapp_mensajes_creado ON whatsapp_mensajes (creado_en DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_whatsapp_mensajes_sucursal ON whatsapp_mensajes (sucursal, id DESC)"
+        )
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS sucursales (
             codigo TEXT PRIMARY KEY,
             nombre TEXT,
@@ -2162,19 +2396,33 @@ def migrate_schema():
         );
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS usuario_sesiones (
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesion (
+            usuario TEXT PRIMARY KEY,
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_sesiones (
             session_id TEXT PRIMARY KEY,
-            usuario TEXT NOT NULL,
+            usuario TEXT,
             sucursal TEXT DEFAULT 'computer_army',
             vista TEXT DEFAULT '',
             dispositivo TEXT DEFAULT '',
-            ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            revocada BOOLEAN DEFAULT FALSE,
-            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            primera_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_usuario_sesiones_user ON usuario_sesiones (usuario, revocada, ultima_actividad DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_usuario_sesiones_act ON usuario_sesiones (ultima_actividad DESC)")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT DEFAULT '',
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS usuario_ventas_borradores (
             usuario TEXT NOT NULL,
@@ -2252,9 +2500,39 @@ def migrate_schema():
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobante_pago_data_url TEXT DEFAULT ''",
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS comprobantes_pago_json TEXT DEFAULT ''",
             "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS sucursal TEXT DEFAULT 'computer_army'",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS fecha_retiro DATE",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS venta_id INT",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS cotizacion_id INT",
+            "ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS cotizacion_numero TEXT DEFAULT ''",
         ]:
             cur.execute(column_sql)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_reservas_clientes_doc ON reservas_clientes (sucursal, numero_documento, estado)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reservas_clientes_retiro ON reservas_clientes (sucursal, fecha_retiro, estado)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reservas_clientes_venta ON reservas_clientes (sucursal, venta_id)")
+        try:
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reservas_clientes_cotizacion ON reservas_clientes (sucursal, cotizacion_id)"
+            )
+        except Exception:
+            pass
+        # Abonos parciales de separaciones (pagos por partes)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS reservas_pagos (
+            id SERIAL PRIMARY KEY,
+            reserva_id INT NOT NULL,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            monto NUMERIC DEFAULT 0,
+            metodo_pago TEXT DEFAULT '',
+            observacion TEXT DEFAULT '',
+            usuario TEXT DEFAULT '',
+            sucursal TEXT DEFAULT 'computer_army',
+            comprobante_pago_nombre TEXT DEFAULT '',
+            comprobante_pago_mime TEXT DEFAULT '',
+            comprobante_pago_base64 TEXT DEFAULT '',
+            comprobante_pago_data_url TEXT DEFAULT ''
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reservas_pagos_reserva ON reservas_pagos (reserva_id, fecha)")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS productos (
@@ -3130,304 +3408,315 @@ def listar_usuarios_online(sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesion (
+            usuario TEXT PRIMARY KEY,
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
         SELECT u.id, u.usuario, u.rol, COALESCE(u.foto_url,'') AS foto_url,
                COALESCE(u.fondo_url,'') AS fondo_url,
                COALESCE(u.sucursal,%s) AS sucursal,
                COALESCE(u.boquitoqui_enabled,FALSE) AS boquitoqui_enabled,
                COALESCE(u.color_tema,'#304fb8') AS color_tema,
                CASE
-                   WHEN EXISTS (
-                        SELECT 1 FROM usuario_sesiones s
-                        WHERE lower(s.usuario)=lower(u.usuario)
-                          AND COALESCE(s.revocada,FALSE)=FALSE
-                          AND s.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
-                   ) OR (
-                        o.ultima_actividad IS NOT NULL
-                        AND o.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
-                   )
+                   WHEN o.ultima_actividad IS NOT NULL
+                    AND o.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
                    THEN TRUE ELSE FALSE
                END AS online,
-               COALESCE((
-                   SELECT COUNT(*) FROM usuario_sesiones s
-                   WHERE lower(s.usuario)=lower(u.usuario)
-                     AND COALESCE(s.revocada,FALSE)=FALSE
-                     AND s.ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
-               ), 0) AS sesiones_activas,
                COALESCE(o.vista,'') AS vista,
                COALESCE(o.dispositivo,'') AS dispositivo,
-               TO_CHAR(COALESCE((
-                   SELECT MAX(s.ultima_actividad) FROM usuario_sesiones s
-                   WHERE lower(s.usuario)=lower(u.usuario) AND COALESCE(s.revocada,FALSE)=FALSE
-               ), o.ultima_actividad), 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad
+               TO_CHAR(o.ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad,
+               CASE WHEN c.usuario IS NULL THEN FALSE ELSE TRUE END AS cierre_pendiente,
+               COALESCE(c.solicitado_por,'') AS cierre_solicitado_por,
+               TO_CHAR(c.solicitado_en, 'YYYY-MM-DD HH24:MI:SS') AS cierre_solicitado_en
         FROM usuarios u
         LEFT JOIN usuarios_online o ON lower(o.usuario)=lower(u.usuario)
+        LEFT JOIN usuarios_cierre_sesion c ON lower(c.usuario)=lower(u.usuario)
         ORDER BY online DESC, u.usuario
     """, (DEFAULT_SUCURSAL,))
     data = dict_fetchall(cur)
     for item in data:
         item["permisos"] = permisos_usuario(cur, item.get("id"), item.get("usuario"), item.get("rol"))
-        item["online"] = bool(item.get("online"))
-        try:
-            item["sesiones_activas"] = int(item.get("sesiones_activas") or 0)
-        except Exception:
-            item["sesiones_activas"] = 0
+    conn.commit()
     release_conn(conn)
     return {"ok": True, "success": True, "data": data}
 
 
-def _es_maestro(usuario: str) -> bool:
-    return str(usuario or "").strip().lower() == "giomar"
-
-
 @app.post("/usuarios/online")
 def registrar_usuario_online(data: UsuarioOnlineHeartbeat):
-    import uuid
     usuario = (data.usuario or "").strip()
     if not usuario:
-        return {"ok": False, "success": False, "msg": "Usuario obligatorio", "force_logout": False}
+        return {"ok": False, "success": False, "msg": "Usuario obligatorio"}
     sucursal = norm_sucursal(data.sucursal)
-    session_id = str(getattr(data, "session_id", "") or "").strip()
-    if not session_id:
-        session_id = uuid.uuid4().hex
+    session_id = re.sub(r"[^A-Za-z0-9_-]+", "", str(data.session_id or "").strip())[:80]
     conn = get_conn()
     cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT COALESCE(revocada,FALSE) AS revocada
-            FROM usuario_sesiones
-            WHERE session_id=%s
-            LIMIT 1
-            """,
-            (session_id,),
-        )
-        row = cur.fetchone()
-        if row and bool(row[0]):
-            conn.commit()
-            return {
-                "ok": False,
-                "success": False,
-                "force_logout": True,
-                "msg": "Sesion cerrada remotamente. Vuelve a iniciar sesion.",
-            }
-
-        cur.execute(
-            """
-            INSERT INTO usuario_sesiones (session_id, usuario, sucursal, vista, dispositivo, ultima_actividad, revocada, creado_en)
-            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,FALSE,CURRENT_TIMESTAMP)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesion (
+            usuario TEXT PRIMARY KEY,
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT,
+            sucursal TEXT DEFAULT 'computer_army',
+            vista TEXT DEFAULT '',
+            dispositivo TEXT DEFAULT '',
+            primera_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT DEFAULT '',
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
+        INSERT INTO usuarios_online (usuario, sucursal, vista, dispositivo, ultima_actividad)
+        VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (usuario)
+        DO UPDATE SET sucursal=EXCLUDED.sucursal,
+                      vista=EXCLUDED.vista,
+                      dispositivo=EXCLUDED.dispositivo,
+                      ultima_actividad=CURRENT_TIMESTAMP
+    """, (usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:80]))
+    if session_id:
+        cur.execute("""
+            INSERT INTO usuarios_sesiones (session_id, usuario, sucursal, vista, dispositivo, primera_actividad, ultima_actividad)
+            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
             ON CONFLICT (session_id)
             DO UPDATE SET usuario=EXCLUDED.usuario,
                           sucursal=EXCLUDED.sucursal,
                           vista=EXCLUDED.vista,
                           dispositivo=EXCLUDED.dispositivo,
-                          ultima_actividad=CURRENT_TIMESTAMP,
-                          revocada=FALSE
-            """,
-            (session_id, usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:120]),
-        )
-        cur.execute(
-            """
-            INSERT INTO usuarios_online (usuario, sucursal, vista, dispositivo, ultima_actividad)
-            VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
-            ON CONFLICT (usuario)
-            DO UPDATE SET sucursal=EXCLUDED.sucursal,
-                          vista=EXCLUDED.vista,
-                          dispositivo=EXCLUDED.dispositivo,
                           ultima_actividad=CURRENT_TIMESTAMP
-            """,
-            (usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:120]),
-        )
-        cur.execute("DELETE FROM usuario_sesiones WHERE ultima_actividad < CURRENT_TIMESTAMP - INTERVAL '24 hours'")
-        conn.commit()
+        """, (session_id, usuario, sucursal, (data.vista or "")[:80], (data.dispositivo or "")[:80]))
+    cierre = None
+    if session_id:
+        cur.execute("""
+            SELECT solicitado_por, motivo
+            FROM usuarios_cierre_sesiones
+            WHERE session_id=%s
+        """, (session_id,))
+        cierre = dict_fetchone(cur)
+    if not cierre:
+        cur.execute("""
+            SELECT solicitado_por, motivo
+            FROM usuarios_cierre_sesion
+            WHERE lower(usuario)=lower(%s)
+        """, (usuario,))
+        cierre = dict_fetchone(cur)
+    if cierre:
+        cur.execute("DELETE FROM usuarios_cierre_sesion WHERE lower(usuario)=lower(%s)", (usuario,))
+        if session_id:
+            cur.execute("DELETE FROM usuarios_cierre_sesiones WHERE session_id=%s", (session_id,))
+        cur.execute("DELETE FROM usuarios_online WHERE lower(usuario)=lower(%s)", (usuario,))
+        if session_id:
+            cur.execute("DELETE FROM usuarios_sesiones WHERE session_id=%s", (session_id,))
+    conn.commit()
+    release_conn(conn)
+    if cierre:
         return {
             "ok": True,
             "success": True,
-            "force_logout": False,
-            "session_id": session_id,
-            "maestro": _es_maestro(usuario),
+            "force_logout": True,
+            "msg": "Sesion cerrada por administrador.",
+            "solicitado_por": cierre.get("solicitado_por") or "",
+            "motivo": cierre.get("motivo") or "",
         }
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "success": False, "msg": str(e), "force_logout": False}
-    finally:
-        release_conn(conn)
+    return {"ok": True, "success": True}
 
 
-@app.get("/usuarios/sesiones")
-def listar_sesiones_activas(solicitante: str = "", usuario: str = "", todas: bool = False):
-    solicitante = (solicitante or "").strip()
-    usuario = (usuario or "").strip()
-    if not solicitante:
-        return {"ok": False, "success": False, "msg": "solicitante obligatorio", "data": []}
+@app.get("/sesiones/activas")
+def listar_sesiones_activas(usuario: str = "", sucursal: str = DEFAULT_SUCURSAL):
+    filtro = str(usuario or "").strip().lower()
     conn = get_conn()
     cur = conn.cursor()
-    try:
-        es_master = _es_maestro(solicitante)
-        if es_master and (todas or not usuario):
-            cur.execute(
-                """
-                SELECT session_id, usuario, COALESCE(sucursal,'') AS sucursal,
-                       COALESCE(vista,'') AS vista, COALESCE(dispositivo,'') AS dispositivo,
-                       TO_CHAR(ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad,
-                       TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en,
-                       COALESCE(revocada,FALSE) AS revocada,
-                       CASE WHEN ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
-                                 AND COALESCE(revocada,FALSE)=FALSE THEN TRUE ELSE FALSE END AS activa
-                FROM usuario_sesiones
-                WHERE COALESCE(revocada,FALSE)=FALSE
-                  AND ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '30 minutes'
-                ORDER BY ultima_actividad DESC
-                LIMIT 200
-                """
-            )
-        else:
-            target = usuario if (es_master and usuario) else solicitante
-            cur.execute(
-                """
-                SELECT session_id, usuario, COALESCE(sucursal,'') AS sucursal,
-                       COALESCE(vista,'') AS vista, COALESCE(dispositivo,'') AS dispositivo,
-                       TO_CHAR(ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS ultima_actividad,
-                       TO_CHAR(creado_en, 'YYYY-MM-DD HH24:MI:SS') AS creado_en,
-                       COALESCE(revocada,FALSE) AS revocada,
-                       CASE WHEN ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '120 seconds'
-                                 AND COALESCE(revocada,FALSE)=FALSE THEN TRUE ELSE FALSE END AS activa
-                FROM usuario_sesiones
-                WHERE lower(usuario)=lower(%s)
-                  AND COALESCE(revocada,FALSE)=FALSE
-                  AND ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '30 minutes'
-                ORDER BY ultima_actividad DESC
-                LIMIT 100
-                """,
-                (target,),
-            )
-        rows = [_jsonable_row(r) for r in dict_fetchall(cur)]
-        for r in rows:
-            r["activa"] = bool(r.get("activa"))
-            r["revocada"] = bool(r.get("revocada"))
-        return {"ok": True, "success": True, "data": rows, "maestro": es_master}
-    except Exception as e:
-        return {"ok": False, "success": False, "msg": str(e), "data": []}
-    finally:
-        release_conn(conn)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT,
+            sucursal TEXT DEFAULT 'computer_army',
+            vista TEXT DEFAULT '',
+            dispositivo TEXT DEFAULT '',
+            primera_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ultima_actividad TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    params = []
+    where = "WHERE ultima_actividad >= CURRENT_TIMESTAMP - INTERVAL '3 minutes'"
+    if filtro:
+        where += " AND lower(usuario) LIKE %s"
+        params.append(f"%{filtro}%")
+    cur.execute(f"""
+        SELECT session_id, usuario, sucursal, vista, dispositivo,
+               TO_CHAR(primera_actividad, 'YYYY-MM-DD HH24:MI:SS') AS desde,
+               TO_CHAR(ultima_actividad, 'YYYY-MM-DD HH24:MI:SS') AS actividad,
+               TRUE AS online
+        FROM usuarios_sesiones
+        {where}
+        ORDER BY lower(usuario), ultima_actividad DESC
+    """, tuple(params))
+    data = dict_fetchall(cur)
+    release_conn(conn)
+    return {"ok": True, "success": True, "data": data}
 
 
-@app.post("/usuarios/sesiones/cerrar")
-def cerrar_sesion(data: CerrarSesionRequest):
-    solicitante = (data.solicitante or "").strip()
-    session_id = (data.session_id or "").strip()
-    if not solicitante or not session_id:
-        return {"ok": False, "success": False, "msg": "solicitante y session_id obligatorios"}
+@app.post("/usuarios/{usuario_id}/cerrar-sesion")
+def cerrar_sesion_usuario(usuario_id: int, data: UsuarioCerrarSesion):
+    admin = str(data.usuario or "").strip().lower()
+    if admin != "giomar":
+        return {"ok": False, "success": False, "msg": "Solo Giomar maestro puede cerrar sesiones."}
     conn = get_conn()
     cur = conn.cursor()
-    try:
-        cur.execute("SELECT usuario FROM usuario_sesiones WHERE session_id=%s LIMIT 1", (session_id,))
-        row = cur.fetchone()
-        if not row:
-            return {"ok": False, "success": False, "msg": "Sesion no encontrada"}
-        dueno = str(row[0] or "")
-        if not _es_maestro(solicitante) and dueno.strip().lower() != solicitante.strip().lower():
-            return {"ok": False, "success": False, "msg": "Solo puedes cerrar tus sesiones (maestro: Giomar)"}
-        cur.execute(
-            """
-            UPDATE usuario_sesiones
-            SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
-            WHERE session_id=%s
-            """,
-            (session_id,),
-        )
-        conn.commit()
-        return {"ok": True, "success": True, "msg": f"Sesion cerrada ({dueno})", "session_id": session_id}
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "success": False, "msg": str(e)}
-    finally:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesion (
+            usuario TEXT PRIMARY KEY,
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("SELECT usuario FROM usuarios WHERE id=%s", (usuario_id,))
+    row = cur.fetchone()
+    if not row:
         release_conn(conn)
+        return {"ok": False, "success": False, "msg": "Usuario no encontrado"}
+    target = str(row[0] or "").strip()
+    if target.lower() == "giomar":
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "No se puede cerrar la sesion del maestro."}
+    cur.execute("""
+        INSERT INTO usuarios_cierre_sesion (usuario, solicitado_por, motivo, solicitado_en)
+        VALUES (%s,%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (usuario)
+        DO UPDATE SET solicitado_por=EXCLUDED.solicitado_por,
+                      motivo=EXCLUDED.motivo,
+                      solicitado_en=CURRENT_TIMESTAMP
+    """, (target, data.usuario or "", (data.motivo or "")[:200]))
+    cur.execute("DELETE FROM usuarios_online WHERE lower(usuario)=lower(%s)", (target,))
+    conn.commit()
+    release_conn(conn)
+    return {"ok": True, "success": True, "usuario": target}
 
 
-@app.post("/usuarios/sesiones/cerrar-otras")
-def cerrar_otras_sesiones(data: CerrarSesionRequest):
-    solicitante = (data.solicitante or "").strip()
-    session_id_actual = (data.session_id_actual or data.session_id or "").strip()
-    usuario = (data.usuario or solicitante or "").strip()
-    if not solicitante or not usuario:
-        return {"ok": False, "success": False, "msg": "solicitante y usuario obligatorios"}
-    if not _es_maestro(solicitante) and usuario.strip().lower() != solicitante.strip().lower():
-        return {"ok": False, "success": False, "msg": "Solo Giomar puede cerrar sesiones de otros usuarios"}
+@app.post("/sesiones/cerrar")
+def cerrar_sesion_activa(data: UsuarioCerrarSesion):
+    admin = str(data.usuario or "").strip().lower()
+    if admin != "giomar":
+        return {"ok": False, "success": False, "msg": "Solo Giomar maestro puede cerrar sesiones."}
+    session_id = re.sub(r"[^A-Za-z0-9_-]+", "", str(data.session_id or "").strip())[:80]
+    if not session_id:
+        return {"ok": False, "success": False, "msg": "Session requerida."}
     conn = get_conn()
     cur = conn.cursor()
-    try:
-        if session_id_actual:
-            cur.execute(
-                """
-                UPDATE usuario_sesiones
-                SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
-                WHERE lower(usuario)=lower(%s)
-                  AND session_id <> %s
-                  AND COALESCE(revocada,FALSE)=FALSE
-                """,
-                (usuario, session_id_actual),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE usuario_sesiones
-                SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
-                WHERE lower(usuario)=lower(%s)
-                  AND COALESCE(revocada,FALSE)=FALSE
-                """,
-                (usuario,),
-            )
-        n = cur.rowcount or 0
-        conn.commit()
-        return {"ok": True, "success": True, "msg": f"Se cerraron {n} sesion(es) de {usuario}", "cerradas": n}
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "success": False, "msg": str(e)}
-    finally:
+    cur.execute("SELECT usuario FROM usuarios_sesiones WHERE session_id=%s", (session_id,))
+    row = cur.fetchone()
+    if not row:
         release_conn(conn)
+        return {"ok": False, "success": False, "msg": "Sesion no encontrada."}
+    target = str(row[0] or "").strip()
+    if target.lower() == "giomar":
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "No se puede cerrar la sesion del maestro."}
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT DEFAULT '',
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
+        INSERT INTO usuarios_cierre_sesiones (session_id, usuario, solicitado_por, motivo, solicitado_en)
+        VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (session_id)
+        DO UPDATE SET usuario=EXCLUDED.usuario,
+                      solicitado_por=EXCLUDED.solicitado_por,
+                      motivo=EXCLUDED.motivo,
+                      solicitado_en=CURRENT_TIMESTAMP
+    """, (session_id, target, data.usuario or "", "Cierre de este PC"))
+    cur.execute("DELETE FROM usuarios_sesiones WHERE session_id=%s", (session_id,))
+    conn.commit()
+    release_conn(conn)
+    return {"ok": True, "success": True, "usuario": target, "session_id": session_id}
 
 
-@app.post("/usuarios/sesiones/cerrar-todas")
-def cerrar_todas_sesiones_usuario(data: CerrarSesionRequest):
-    solicitante = (data.solicitante or "").strip()
-    usuario = (data.usuario or "").strip()
-    if not _es_maestro(solicitante):
-        return {"ok": False, "success": False, "msg": "Solo Giomar (control maestro) puede cerrar todas las sesiones de un usuario"}
-    if not usuario:
-        return {"ok": False, "success": False, "msg": "usuario objetivo obligatorio"}
+@app.post("/sesiones/cerrar-usuario")
+def cerrar_sesiones_usuario(data: UsuarioCerrarSesion):
+    admin = str(data.usuario or "").strip().lower()
+    if admin != "giomar":
+        return {"ok": False, "success": False, "msg": "Solo Giomar maestro puede cerrar sesiones."}
+    target = str(data.target_usuario or "").strip()
+    if not target:
+        return {"ok": False, "success": False, "msg": "Usuario requerido."}
+    if target.lower() == "giomar":
+        return {"ok": False, "success": False, "msg": "No se puede cerrar la sesion del maestro."}
     conn = get_conn()
     cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            UPDATE usuario_sesiones
-            SET revocada=TRUE, ultima_actividad=CURRENT_TIMESTAMP
-            WHERE lower(usuario)=lower(%s)
-              AND COALESCE(revocada,FALSE)=FALSE
-            """,
-            (usuario,),
-        )
-        n = cur.rowcount or 0
-        cur.execute("DELETE FROM usuarios_online WHERE lower(usuario)=lower(%s)", (usuario,))
-        conn.commit()
-        return {"ok": True, "success": True, "msg": f"Control maestro: {n} sesion(es) de {usuario} cerradas", "cerradas": n}
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "success": False, "msg": str(e)}
-    finally:
-        release_conn(conn)
+    cur.execute("""
+        INSERT INTO usuarios_cierre_sesion (usuario, solicitado_por, motivo, solicitado_en)
+        VALUES (%s,%s,%s,CURRENT_TIMESTAMP)
+        ON CONFLICT (usuario)
+        DO UPDATE SET solicitado_por=EXCLUDED.solicitado_por,
+                      motivo=EXCLUDED.motivo,
+                      solicitado_en=CURRENT_TIMESTAMP
+    """, (target, data.usuario or "", data.motivo or "Cierre de todas las sesiones"))
+    cur.execute("DELETE FROM usuarios_sesiones WHERE lower(usuario)=lower(%s)", (target,))
+    cur.execute("DELETE FROM usuarios_online WHERE lower(usuario)=lower(%s)", (target,))
+    conn.commit()
+    release_conn(conn)
+    return {"ok": True, "success": True, "usuario": target}
+
+
+@app.post("/sesiones/cerrar-otras")
+def cerrar_otras_sesiones(data: UsuarioCerrarSesion):
+    admin = str(data.usuario or "").strip().lower()
+    keep = re.sub(r"[^A-Za-z0-9_-]+", "", str(data.keep_session_id or "").strip())[:80]
+    if admin != "giomar":
+        return {"ok": False, "success": False, "msg": "Solo Giomar maestro puede cerrar sesiones."}
+    if not keep:
+        return {"ok": False, "success": False, "msg": "Sesion actual requerida."}
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT session_id, usuario FROM usuarios_sesiones WHERE session_id<>%s AND lower(usuario)<>lower('giomar')", (keep,))
+    rows = cur.fetchall()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_cierre_sesiones (
+            session_id TEXT PRIMARY KEY,
+            usuario TEXT DEFAULT '',
+            solicitado_por TEXT DEFAULT '',
+            motivo TEXT DEFAULT '',
+            solicitado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    for session_id, target in rows:
+        cur.execute("""
+            INSERT INTO usuarios_cierre_sesiones (session_id, usuario, solicitado_por, motivo, solicitado_en)
+            VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT (session_id)
+            DO UPDATE SET usuario=EXCLUDED.usuario,
+                          solicitado_por=EXCLUDED.solicitado_por,
+                          motivo=EXCLUDED.motivo,
+                          solicitado_en=CURRENT_TIMESTAMP
+        """, (session_id, target, data.usuario or "", "Cierre de otras sesiones"))
+    cur.execute("DELETE FROM usuarios_sesiones WHERE session_id<>%s AND lower(usuario)<>lower('giomar')", (keep,))
+    cur.execute("DELETE FROM usuarios_online WHERE lower(usuario)<>lower('giomar')")
+    conn.commit()
+    release_conn(conn)
+    return {"ok": True, "success": True, "cerradas": len(rows)}
 
 
 @app.delete("/usuarios/{usuario_id}")
@@ -3570,6 +3859,324 @@ def enviar_boquitoqui_live(data: BoquitoquiMensaje):
     return {"ok": True, "success": True, "id": msg_id, "recipients": recipients}
 
 
+# ================= WHATSAPP (sesion unica compartida) =================
+def _whatsapp_unavailable():
+    return {
+        "ok": False,
+        "success": False,
+        "msg": "Modulo WhatsApp no disponible en este servidor (whatsapp_bridge no cargado).",
+        "connected": False,
+        "status": "unavailable",
+    }
+
+
+def _log_whatsapp_mensaje(
+    *,
+    sucursal="",
+    usuario="",
+    telefono="",
+    tipo="TEXTO",
+    documento_id=None,
+    documento_tipo="",
+    documento_numero="",
+    mensaje="",
+    estado="ENVIADO",
+    error_msg="",
+    message_id="",
+):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO whatsapp_mensajes (
+                sucursal, usuario, telefono, tipo, documento_id, documento_tipo,
+                documento_numero, mensaje, estado, error_msg, message_id
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                norm_sucursal(sucursal),
+                str(usuario or "").strip()[:80],
+                str(telefono or "").strip()[:40],
+                str(tipo or "TEXTO").strip()[:40],
+                int(documento_id) if documento_id else None,
+                str(documento_tipo or "").strip()[:40],
+                str(documento_numero or "").strip()[:80],
+                str(mensaje or "")[:4000],
+                str(estado or "")[:40],
+                str(error_msg or "")[:1000],
+                str(message_id or "")[:120],
+            ),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        if conn is not None:
+            try:
+                release_conn(conn)
+            except Exception:
+                pass
+
+
+def _public_base_url() -> str:
+    return (os.getenv("PUBLIC_BASE_URL") or "http://64.181.176.160:8000").rstrip("/")
+
+
+def _cliente_telefono_para_documento(documento: dict) -> str:
+    if not isinstance(documento, dict):
+        return ""
+    for key in ("telefono", "telefono_cliente", "cliente_telefono", "celular"):
+        val = str(documento.get(key) or "").strip()
+        if val:
+            return val
+    # Buscar en clientes por documento
+    doc_num = str(
+        documento.get("numero_documento_cliente")
+        or documento.get("documento_cliente")
+        or ""
+    ).strip()
+    if not doc_num:
+        return ""
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS telefono TEXT DEFAULT ''")
+        cur.execute(
+            """
+            SELECT COALESCE(telefono,'') FROM clientes
+            WHERE regexp_replace(COALESCE(numero_documento,''), '[^0-9A-Za-z]', '', 'g')
+                  = regexp_replace(%s, '[^0-9A-Za-z]', '', 'g')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (doc_num,),
+        )
+        row = cur.fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                release_conn(conn)
+            except Exception:
+                pass
+
+
+@app.get("/whatsapp/status")
+def whatsapp_status():
+    if whatsapp_bridge is None:
+        return _whatsapp_unavailable()
+    data = whatsapp_bridge.status()
+    data["gateway_url"] = whatsapp_bridge.gateway_url()
+    return data
+
+
+@app.get("/whatsapp/qr")
+def whatsapp_qr():
+    if whatsapp_bridge is None:
+        return _whatsapp_unavailable()
+    data = whatsapp_bridge.qr()
+    data["gateway_url"] = whatsapp_bridge.gateway_url()
+    return data
+
+
+@app.post("/whatsapp/logout")
+def whatsapp_logout():
+    if whatsapp_bridge is None:
+        return _whatsapp_unavailable()
+    return whatsapp_bridge.logout()
+
+
+@app.post("/whatsapp/restart")
+def whatsapp_restart():
+    if whatsapp_bridge is None:
+        return _whatsapp_unavailable()
+    return whatsapp_bridge.restart()
+
+
+@app.get("/whatsapp/mensajes")
+def whatsapp_listar_mensajes(limit: int = 50, sucursal: str = DEFAULT_SUCURSAL):
+    limit = max(1, min(int(limit or 50), 200))
+    sucursal = norm_sucursal(sucursal)
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, usuario, telefono, tipo, documento_id, documento_tipo, documento_numero,
+                   mensaje, estado, error_msg, message_id, creado_en
+            FROM whatsapp_mensajes
+            WHERE COALESCE(sucursal,%s)=%s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (DEFAULT_SUCURSAL, sucursal, limit),
+        )
+        rows = cur.fetchall() or []
+        data = []
+        for r in rows:
+            data.append(
+                {
+                    "id": r[0],
+                    "usuario": r[1],
+                    "telefono": r[2],
+                    "tipo": r[3],
+                    "documento_id": r[4],
+                    "documento_tipo": r[5],
+                    "documento_numero": r[6],
+                    "mensaje": r[7],
+                    "estado": r[8],
+                    "error_msg": r[9],
+                    "message_id": r[10],
+                    "creado_en": str(r[11] or ""),
+                }
+            )
+        return {"ok": True, "success": True, "data": data}
+    except Exception as exc:
+        return {"ok": False, "success": False, "msg": str(exc), "data": []}
+    finally:
+        if conn is not None:
+            try:
+                release_conn(conn)
+            except Exception:
+                pass
+
+
+@app.post("/whatsapp/enviar")
+def whatsapp_enviar(data: WhatsAppEnviar):
+    """Envia texto y opcionalmente PDF de un documento. Todos los asesores usan la misma sesion."""
+    if whatsapp_bridge is None:
+        return _whatsapp_unavailable()
+
+    telefono = whatsapp_bridge.normalize_phone_pe(data.telefono)
+    if not telefono:
+        return {"ok": False, "success": False, "msg": "Telefono invalido. Ejemplo: 999888777"}
+
+    sucursal = norm_sucursal(data.sucursal)
+    usuario = str(data.usuario or "").strip()
+    mensaje = str(data.mensaje or "").strip()
+    documento = None
+    documento_id = data.documento_id
+    public_url = ""
+    pdf_bytes = None
+    pdf_name = "documento.pdf"
+    tipo_doc = ""
+    num_doc = ""
+
+    if documento_id:
+        detail = _detalle_documento_para_pdf(int(documento_id))
+        if not detail.get("ok"):
+            return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+        documento = detail.get("documento") or {}
+        tipo_doc = str(documento.get("tipo") or "")
+        num_doc = str(documento.get("numero") or documento_id)
+        public_url = f"{_public_base_url()}/public/documento/{int(documento_id)}?sucursal={sucursal}"
+        if not mensaje:
+            mensaje = whatsapp_bridge.build_documento_mensaje(documento, public_url)
+        if data.adjuntar_pdf:
+            cached_pdf, cached_name, _cache_src = _read_pdf_cache(int(documento_id))
+            if cached_pdf:
+                pdf_bytes = cached_pdf
+                pdf_name = cached_name or pdf_name
+            else:
+                try:
+                    detalle = detail.get("detalle") or detail.get("data") or []
+                    cfg = cargar_config_documento_dict(sucursal or documento.get("sucursal") or DEFAULT_SUCURSAL)
+                    pdf_bytes = generar_pdf_documento_original(documento, detalle, cfg)
+                    raw_name = f"{documento_pdf_label(documento.get('tipo'))}_{documento.get('numero') or documento_id}.pdf"
+                    pdf_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name)
+                    _store_pdf_cache(int(documento_id), pdf_bytes, pdf_name)
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "success": False,
+                        "msg": f"No se pudo generar PDF: {exc}",
+                    }
+
+    if not mensaje and not pdf_bytes:
+        return {"ok": False, "success": False, "msg": "Indica un mensaje o un documento."}
+
+    # Preferir enviar PDF con caption; si no hay PDF, solo texto
+    if pdf_bytes:
+        result = whatsapp_bridge.send_document(
+            telefono,
+            filename=pdf_name,
+            data=pdf_bytes,
+            mimetype="application/pdf",
+            caption=mensaje,
+        )
+        tipo_envio = "DOCUMENTO"
+    else:
+        result = whatsapp_bridge.send_text(telefono, mensaje)
+        tipo_envio = "TEXTO"
+
+    ok = bool(result.get("ok"))
+    _log_whatsapp_mensaje(
+        sucursal=sucursal,
+        usuario=usuario,
+        telefono=telefono,
+        tipo=tipo_envio,
+        documento_id=documento_id,
+        documento_tipo=tipo_doc,
+        documento_numero=num_doc,
+        mensaje=mensaje,
+        estado="ENVIADO" if ok else "ERROR",
+        error_msg="" if ok else str(result.get("msg") or "Error al enviar"),
+        message_id=str(result.get("message_id") or ""),
+    )
+    if ok:
+        return {
+            "ok": True,
+            "success": True,
+            "msg": result.get("msg") or "Enviado por WhatsApp",
+            "telefono": telefono,
+            "tipo": tipo_envio,
+            "message_id": result.get("message_id") or "",
+            "public_url": public_url,
+        }
+    # Fallback: link wa.me para abrir en el celular del asesor
+    link = whatsapp_bridge.wa_me_link(telefono, mensaje)
+    return {
+        "ok": False,
+        "success": False,
+        "msg": result.get("msg") or "No se pudo enviar por la sesion compartida.",
+        "telefono": telefono,
+        "wa_link": link,
+        "gateway_down": bool(result.get("gateway_down")),
+        "status": result.get("status") or "",
+    }
+
+
+@app.get("/whatsapp/sugerir-telefono")
+def whatsapp_sugerir_telefono(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
+    detail = _detalle_documento_para_pdf(int(documento_id))
+    if not detail.get("ok"):
+        return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+    documento = detail.get("documento") or {}
+    telefono = _cliente_telefono_para_documento(documento)
+    if whatsapp_bridge is not None:
+        normalizado = whatsapp_bridge.normalize_phone_pe(telefono)
+    else:
+        normalizado = re.sub(r"\D+", "", telefono or "")
+    return {
+        "ok": True,
+        "success": True,
+        "telefono": telefono,
+        "telefono_normalizado": normalizado,
+        "cliente_nombre": documento.get("cliente_nombre") or "",
+        "documento_tipo": documento.get("tipo") or "",
+        "documento_numero": documento.get("numero") or "",
+    }
+
+
 # ================= AUDITORIA CENTRAL =================
 @app.post("/auditoria")
 def registrar_auditoria(data: dict):
@@ -3655,6 +4262,30 @@ def guardar_config_documento(data: dict):
     cur = conn.cursor()
     sucursal = norm_sucursal(data.get("sucursal") or data.get("empresa") or DEFAULT_SUCURSAL)
     clave = f"documento:{sucursal}"
+    # Normalizar medidas de logo en doc_editor (sync layout <-> campos top-level)
+    if isinstance(data, dict):
+        editor = data.get("doc_editor") if isinstance(data.get("doc_editor"), dict) else {}
+        layout = editor.get("layout") if isinstance(editor.get("layout"), dict) else {}
+        try:
+            lw = float(layout.get("logo_ancho_mm") or editor.get("logo_w") or 24)
+            lh = float(layout.get("logo_alto_mm") or editor.get("logo_h") or 15)
+            lx = float(layout.get("logo_x_mm") or editor.get("logo_x") or 16)
+            ly = float(layout.get("logo_bajar_mm") or layout.get("logo_y_mm") or editor.get("logo_y") or 25)
+        except Exception:
+            lw, lh, lx, ly = 24.0, 15.0, 16.0, 25.0
+        layout["logo_ancho_mm"] = max(10.0, min(55.0, lw))
+        layout["logo_alto_mm"] = max(8.0, min(40.0, lh))
+        layout["logo_x_mm"] = max(4.0, min(90.0, lx))
+        layout["logo_bajar_mm"] = max(4.0, min(50.0, ly))
+        layout["logo_y_mm"] = layout["logo_bajar_mm"]
+        editor["layout"] = layout
+        editor["logo_w"] = layout["logo_ancho_mm"]
+        editor["logo_h"] = layout["logo_alto_mm"]
+        editor["logo_x"] = layout["logo_x_mm"]
+        editor["logo_y"] = layout["logo_bajar_mm"]
+        data["doc_editor"] = editor
+        if data.get("logo") is None:
+            data["logo"] = ""
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_config (
         clave TEXT PRIMARY KEY,
@@ -3670,7 +4301,8 @@ def guardar_config_documento(data: dict):
     """, (clave, json.dumps(data, ensure_ascii=False)))
     conn.commit()
     release_conn(conn)
-    return {"ok": True, "success": True}
+    invalidate_api_cache("documentos|")
+    return {"ok": True, "success": True, "data": cargar_config_documento_dict(sucursal)}
 
 
 def documento_config_default():
@@ -3732,18 +4364,138 @@ def documento_config_default():
                 "letra_descripcion_px": 7.0,
                 "logo_ancho_mm": 24,
                 "logo_alto_mm": 15,
-                "logo_bajar_mm": 23,
+                "logo_x_mm": 16,
+                "logo_bajar_mm": 25,
+                "logo_y_mm": 25,
+                "logo_escala": 100,
                 "margen_superior_mm": 8,
             },
         },
     }
 
 
+_DOC_CFG_CACHE = {}
+_DOC_CFG_CACHE_LOCK = threading.Lock()
+_PDF_BYTES_CACHE = {}
+_PDF_BYTES_CACHE_LOCK = threading.Lock()
+_PDF_LOGO_CACHE = {}
+_PDF_LOGO_CACHE_LOCK = threading.Lock()
+_PDF_CACHE_TTL = int(os.getenv("PDF_CACHE_TTL", "600") or "600")
+_PDF_DISK_DIR = os.getenv("PDF_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "erp_pdf_cache")
+try:
+    os.makedirs(_PDF_DISK_DIR, exist_ok=True)
+except Exception:
+    pass
+
+
+def _pdf_disk_path(documento_id):
+    return os.path.join(_PDF_DISK_DIR, f"doc_{int(documento_id)}.pdf")
+
+
+def invalidate_pdf_cache(documento_id=None):
+    with _PDF_BYTES_CACHE_LOCK:
+        if documento_id is None:
+            _PDF_BYTES_CACHE.clear()
+        else:
+            key = str(documento_id)
+            for k in list(_PDF_BYTES_CACHE.keys()):
+                if k == key or k.startswith(f"{key}|"):
+                    _PDF_BYTES_CACHE.pop(k, None)
+    try:
+        if documento_id is None:
+            if os.path.isdir(_PDF_DISK_DIR):
+                for name in os.listdir(_PDF_DISK_DIR):
+                    if name.startswith("doc_") and name.endswith(".pdf"):
+                        try:
+                            os.remove(os.path.join(_PDF_DISK_DIR, name))
+                        except Exception:
+                            pass
+        else:
+            path = _pdf_disk_path(documento_id)
+            if os.path.isfile(path):
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def _store_pdf_cache(documento_id, pdf_bytes, safe_name):
+    key = str(documento_id)
+    now = time.time()
+    with _PDF_BYTES_CACHE_LOCK:
+        if len(_PDF_BYTES_CACHE) >= 100:
+            oldest = sorted(_PDF_BYTES_CACHE.items(), key=lambda kv: kv[1].get("ts", 0))[:25]
+            for k, _ in oldest:
+                _PDF_BYTES_CACHE.pop(k, None)
+        _PDF_BYTES_CACHE[key] = {"ts": now, "pdf": pdf_bytes, "name": safe_name}
+    try:
+        path = _pdf_disk_path(documento_id)
+        with open(path, "wb") as fh:
+            fh.write(pdf_bytes)
+        # meta name
+        with open(path + ".name", "w", encoding="utf-8") as fh:
+            fh.write(safe_name or f"documento_{documento_id}.pdf")
+    except Exception:
+        pass
+
+
+def _read_pdf_cache(documento_id):
+    key = str(documento_id)
+    now = time.time()
+    with _PDF_BYTES_CACHE_LOCK:
+        hit = _PDF_BYTES_CACHE.get(key)
+        if hit and (now - hit.get("ts", 0)) < _PDF_CACHE_TTL and hit.get("pdf"):
+            return hit.get("pdf"), hit.get("name") or f"documento_{documento_id}.pdf", "MEM"
+    try:
+        path = _pdf_disk_path(documento_id)
+        if os.path.isfile(path):
+            # disco: reusar mientras el archivo exista (se invalida al editar/anular)
+            age = now - os.path.getmtime(path)
+            if age < max(_PDF_CACHE_TTL * 4, 3600):
+                with open(path, "rb") as fh:
+                    pdf = fh.read()
+                name = f"documento_{documento_id}.pdf"
+                try:
+                    with open(path + ".name", "r", encoding="utf-8") as fh:
+                        name = (fh.read() or name).strip() or name
+                except Exception:
+                    pass
+                with _PDF_BYTES_CACHE_LOCK:
+                    _PDF_BYTES_CACHE[key] = {"ts": now, "pdf": pdf, "name": name}
+                return pdf, name, "DISK"
+    except Exception:
+        pass
+    return None, None, None
+
+
+def warm_pdf_cache(documento_id, sucursal=None):
+    """Genera y cachea el PDF en segundo plano (tras emitir)."""
+    try:
+        detail = _detalle_documento_para_pdf(int(documento_id))
+        if not detail.get("ok"):
+            return False
+        documento = detail.get("documento") or {}
+        detalle = detail.get("detalle") or []
+        cfg = cargar_config_documento_dict(sucursal or documento.get("sucursal") or DEFAULT_SUCURSAL)
+        pdf = generar_pdf_documento_original(documento, detalle, cfg)
+        raw_name = f"{documento_pdf_label(documento.get('tipo'))}_{documento.get('numero') or documento_id}.pdf"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name)
+        _store_pdf_cache(documento_id, pdf, safe_name)
+        return True
+    except Exception:
+        return False
+
+
 def cargar_config_documento_dict(sucursal=DEFAULT_SUCURSAL):
+    suc = norm_sucursal(sucursal)
+    now = time.time()
+    with _DOC_CFG_CACHE_LOCK:
+        hit = _DOC_CFG_CACHE.get(suc)
+        if hit and (now - hit.get("ts", 0)) < 120:
+            return dict(hit.get("data") or {})
     base = documento_config_default()
     conn = get_conn()
     cur = conn.cursor()
-    clave = f"documento:{norm_sucursal(sucursal)}"
+    clave = f"documento:{suc}"
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_config (
         clave TEXT PRIMARY KEY,
@@ -3777,7 +4529,14 @@ def cargar_config_documento_dict(sucursal=DEFAULT_SUCURSAL):
                 base["doc_editor"]["texts"] = texts
         except Exception:
             pass
-    return base
+    with _DOC_CFG_CACHE_LOCK:
+        _DOC_CFG_CACHE[suc] = {"ts": now, "data": base}
+    # Prepara logo chico en disco en segundo plano (no bloquea)
+    try:
+        threading.Thread(target=_prepare_pdf_logo_path, args=(base,), daemon=True, name="pdf-logo-prep").start()
+    except Exception:
+        pass
+    return dict(base)
 
 
 def _pdf_text_lines(canvas_obj, text, max_width, font_name, font_size, max_lines=2):
@@ -3895,25 +4654,66 @@ def _pdf_words_soles(value):
     return f"SON {words} Y {cent:02d}/100 SOLES"
 
 
+def _prepare_pdf_logo_path(cfg):
+    """Convierte logo base64 grande a PNG chico en disco (acelera PDF ~4x)."""
+    logo = str((cfg or {}).get("logo") or (cfg or {}).get("document_logo") or "").strip()
+    fallback = os.path.join(WEBAPP_DIR, "army-logo-doc.png")
+    if not logo:
+        return fallback if os.path.exists(fallback) else ""
+    # Ya es ruta de archivo
+    if not logo.startswith(("data:image", "http://", "https://")) and os.path.exists(logo):
+        return logo
+    cache_path = os.path.join(_PDF_DISK_DIR, "company_logo_pdf.png")
+    try:
+        raw = None
+        if logo.startswith("data:image") and "," in logo:
+            raw = base64.b64decode(logo.split(",", 1)[1])
+        elif logo.startswith(("http://", "https://")):
+            with urllib.request.urlopen(logo, timeout=2) as resp:
+                raw = resp.read()
+        if not raw:
+            return fallback if os.path.exists(fallback) else ""
+        # Si ya existe y es reciente y del mismo tamaño aprox, reusar
+        if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 200:
+            # refrescar max cada 6h
+            if (time.time() - os.path.getmtime(cache_path)) < 6 * 3600:
+                return cache_path
+        # Redimensionar: el base64 original es ~125KB y demora el PDF
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA")
+            img.thumbnail((280, 280), Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            raw = buf.getvalue()
+        except Exception:
+            pass
+        with open(cache_path, "wb") as fh:
+            fh.write(raw)
+        return cache_path
+    except Exception:
+        return fallback if os.path.exists(fallback) else ""
+
+
 def _draw_pdf_logo(c, cfg, x, y, w, h, mm_unit, page_h):
     try:
         from reportlab.lib.utils import ImageReader
-        logo = str(cfg.get("logo") or cfg.get("document_logo") or "").strip()
-        if not logo:
-            candidate = os.path.join(WEBAPP_DIR, "army-logo-doc.png")
-            logo = candidate if os.path.exists(candidate) else ""
-        if not logo:
+        logo_path = _prepare_pdf_logo_path(cfg)
+        if not logo_path:
             return
-        if logo.startswith("data:image") and "," in logo:
-            raw = base64.b64decode(logo.split(",", 1)[1])
-            image = ImageReader(io.BytesIO(raw))
-        elif logo.startswith(("http://", "https://")):
-            with urllib.request.urlopen(logo, timeout=8) as resp:
-                image = ImageReader(io.BytesIO(resp.read()))
-        elif os.path.exists(logo):
-            image = logo
-        else:
-            return
+        cache_key = f"file:{logo_path}:{os.path.getmtime(logo_path) if os.path.isfile(logo_path) else 0}"
+        image = None
+        with _PDF_LOGO_CACHE_LOCK:
+            cached = _PDF_LOGO_CACHE.get(cache_key)
+            if cached is not None:
+                image = cached
+        if image is None:
+            # ImageReader desde archivo es mucho mas rapido que data-url enorme
+            image = ImageReader(logo_path) if os.path.isfile(logo_path) else logo_path
+            with _PDF_LOGO_CACHE_LOCK:
+                _PDF_LOGO_CACHE[cache_key] = image
         c.drawImage(image, x * mm_unit, page_h - ((y + h) * mm_unit), width=w * mm_unit, height=h * mm_unit, preserveAspectRatio=True, mask="auto")
     except Exception:
         pass
@@ -4499,15 +5299,198 @@ def guardar_servicio_tecnico(data: ServicioTecnico):
         return {"ok": False, "success": False, "msg": str(e)}
 
 
+def _parse_fecha_retiro(value):
+    text = str(value or "").strip()[:10]
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except Exception:
+        try:
+            return datetime.strptime(text.replace("/", "-"), "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+
+def _ensure_reservas_pagos_table(cur):
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reservas_pagos (
+        id SERIAL PRIMARY KEY,
+        reserva_id INT NOT NULL,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        monto NUMERIC DEFAULT 0,
+        metodo_pago TEXT DEFAULT '',
+        observacion TEXT DEFAULT '',
+        usuario TEXT DEFAULT '',
+        sucursal TEXT DEFAULT 'computer_army',
+        comprobante_pago_nombre TEXT DEFAULT '',
+        comprobante_pago_mime TEXT DEFAULT '',
+        comprobante_pago_base64 TEXT DEFAULT '',
+        comprobante_pago_data_url TEXT DEFAULT ''
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reservas_pagos_reserva ON reservas_pagos (reserva_id, fecha)")
+
+
+def _listar_pagos_reserva(cur, reserva_id):
+    try:
+        _ensure_reservas_pagos_table(cur)
+        cur.execute("""
+            SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
+                   COALESCE(monto,0) AS monto,
+                   COALESCE(metodo_pago,'') AS metodo_pago,
+                   COALESCE(observacion,'') AS observacion,
+                   COALESCE(usuario,'') AS usuario,
+                   COALESCE(comprobante_pago_nombre,'') AS comprobante_pago_nombre,
+                   COALESCE(comprobante_pago_mime,'') AS comprobante_pago_mime,
+                   CASE WHEN COALESCE(comprobante_pago_base64,'') <> ''
+                              OR COALESCE(comprobante_pago_data_url,'') <> ''
+                        THEN 1 ELSE 0 END AS tiene_comprobante
+            FROM reservas_pagos
+            WHERE reserva_id=%s
+            ORDER BY fecha ASC, id ASC
+        """, (reserva_id,))
+        return [_jsonable_row(r) for r in dict_fetchall(cur)]
+    except Exception:
+        return []
+
+
+def _insertar_pago_reserva(cur, reserva_id, monto, metodo_pago="", observacion="", usuario="", sucursal=DEFAULT_SUCURSAL, comprobante=None):
+    _ensure_reservas_pagos_table(cur)
+    comprobante = comprobante or {}
+    cur.execute("""
+        INSERT INTO reservas_pagos (
+            reserva_id, monto, metodo_pago, observacion, usuario, sucursal,
+            comprobante_pago_nombre, comprobante_pago_mime,
+            comprobante_pago_base64, comprobante_pago_data_url
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id, to_char(fecha, 'YYYY-MM-DD HH24:MI')
+    """, (
+        reserva_id,
+        round(float(monto or 0), 2),
+        str(metodo_pago or "").strip().upper()[:40],
+        str(observacion or "").strip()[:500],
+        str(usuario or "").strip()[:80],
+        norm_sucursal(sucursal),
+        str(comprobante.get("comprobante_pago_nombre") or "").strip()[:180],
+        str(comprobante.get("comprobante_pago_mime") or "").strip()[:80],
+        str(comprobante.get("comprobante_pago_base64") or ""),
+        str(comprobante.get("comprobante_pago_data_url") or ""),
+    ))
+    return cur.fetchone()
+
+
+def _ensure_reserva_cotizacion_cols(cur):
+    try:
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS cotizacion_id INT")
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS cotizacion_numero TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS fecha_retiro DATE")
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS venta_id INT")
+    except Exception:
+        pass
+
+
+def _parse_cotizacion_id(value):
+    try:
+        n = int(value)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _cargar_cotizacion_para_reserva(cur, cotizacion_id, sucursal=DEFAULT_SUCURSAL):
+    """Valida que exista una PROFORMA y devuelve datos basicos para la separacion."""
+    if not cotizacion_id:
+        return None
+    cur.execute(
+        """
+        SELECT id, tipo, COALESCE(numero,'') AS numero,
+               COALESCE(cliente,'') AS cliente_nombre,
+               COALESCE(documento_cliente,'') AS documento_cliente,
+               COALESCE(total,0) AS total,
+               COALESCE(observacion,'') AS observacion,
+               COALESCE(estado,'EMITIDO') AS estado
+        FROM ventas
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+        """,
+        (cotizacion_id, DEFAULT_SUCURSAL, sucursal),
+    )
+    row = dict_fetchone(cur)
+    if not row:
+        return None
+    tipo = str(row.get("tipo") or "").upper()
+    if tipo != "PROFORMA":
+        return None
+    estado = str(row.get("estado") or "").upper()
+    if estado in ("ANULADO", "PROCESADO", "CONVERTIDO"):
+        # Aun se puede vincular; solo advertimos en observacion del lado UI
+        pass
+    return _jsonable_row(row)
+
+
 @app.post("/reservas")
 def crear_reserva(data: ReservaCliente):
     conn = get_conn()
     cur = conn.cursor()
+    try:
+        _ensure_reserva_cotizacion_cols(cur)
+        conn.commit()
+    except Exception:
+        conn.rollback()
     sucursal = norm_sucursal(data.sucursal)
     documento = only_digits(data.numero_documento)
     cliente = (data.cliente_nombre or "CLIENTE RESERVA").strip() or "CLIENTE RESERVA"
     producto_nombre = (data.producto_nombre or "").strip()
     producto_id = data.producto_id
+    cotizacion_id = _parse_cotizacion_id(getattr(data, "cotizacion_id", None))
+    cotizacion_numero = str(getattr(data, "cotizacion_numero", None) or "").strip()
+    if cotizacion_id:
+        coti = _cargar_cotizacion_para_reserva(cur, cotizacion_id, sucursal)
+        if not coti:
+            release_conn(conn)
+            return {
+                "ok": False,
+                "success": False,
+                "msg": "La cotizacion elegida no existe o no es una PROFORMA valida (incluye procesadas).",
+            }
+        # Incluye cotizaciones PROCESADAS: se usan solo como referencia de datos del cliente/items
+        cotizacion_numero = str(coti.get("numero") or cotizacion_numero or cotizacion_id).strip()
+        coti_cliente = str(coti.get("cliente_nombre") or "").strip()
+        coti_doc = only_digits(coti.get("documento_cliente") or "")
+        if coti_cliente and (not cliente or cliente == "CLIENTE RESERVA"):
+            cliente = coti_cliente
+        if coti_doc and not documento:
+            documento = coti_doc
+        # Si el front no mando producto, armar resumen desde la cotizacion
+        if not producto_nombre:
+            cur.execute(
+                """
+                SELECT COALESCE(descripcion, '') AS descripcion, COALESCE(cantidad, 1) AS cantidad
+                FROM ventas_detalle
+                WHERE venta_id=%s
+                ORDER BY id
+                LIMIT 20
+                """,
+                (cotizacion_id,),
+            )
+            lines = dict_fetchall(cur) or []
+            names = []
+            for ln in lines:
+                desc = str(ln.get("descripcion") or "").strip()
+                if desc:
+                    names.append(desc)
+            if names:
+                producto_nombre = names[0] if len(names) == 1 else f"Cotizacion {cotizacion_numero} ({len(names)} items)"
+            else:
+                producto_nombre = f"Cotizacion {cotizacion_numero}"
+        # Si no mandaron total, usar el de la cotizacion
+        if float(data.monto_total or 0) <= 0:
+            try:
+                data.monto_total = float(coti.get("total") or 0)
+            except Exception:
+                pass
     if producto_id and not producto_nombre:
         cur.execute("""
         SELECT COALESCE(nombre,'') FROM productos
@@ -4521,14 +5504,33 @@ def crear_reserva(data: ReservaCliente):
         return {"ok": False, "success": False, "msg": "Ingresa DNI/RUC del cliente para controlar la reserva."}
     if not producto_nombre:
         release_conn(conn)
-        return {"ok": False, "success": False, "msg": "Selecciona o escribe el producto reservado."}
+        return {"ok": False, "success": False, "msg": "Selecciona o escribe el producto reservado (o elige una cotizacion)."}
     cantidad = max(1, int(data.cantidad or 1))
     monto_total = round(float(data.monto_total or 0), 2)
     monto_reserva = round(float(data.monto_reserva or 0), 2)
+    if monto_reserva <= 0:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "La separacion requiere un adelanto (monto separado) mayor a 0."}
+    if monto_total > 0 and monto_reserva > monto_total:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "El adelanto no puede ser mayor al total de la venta."}
     saldo = max(0.0, round(monto_total - monto_reserva, 2))
+    fecha_retiro = _parse_fecha_retiro(getattr(data, "fecha_retiro", None))
+    if not fecha_retiro:
+        release_conn(conn)
+        return {
+            "ok": False,
+            "success": False,
+            "msg": "Indica la fecha de retiro (cuando vendra el cliente por el producto).",
+        }
     estado = (data.estado or "RESERVADO").upper()
     if estado not in ("RESERVADO", "PAGADO", "ENTREGADO", "ANULADO"):
         estado = "RESERVADO"
+    observacion = (data.observacion or "").strip()
+    if cotizacion_id and cotizacion_numero:
+        tag = f"Cotizacion {cotizacion_numero}"
+        if tag.lower() not in observacion.lower():
+            observacion = f"{tag}\n{observacion}".strip() if observacion else tag
     try:
         comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data)
     except ValueError as e:
@@ -4539,13 +5541,14 @@ def crear_reserva(data: ReservaCliente):
         tipo_documento, numero_documento, cliente_nombre, producto_id, producto_nombre,
         cantidad, monto_total, monto_reserva, saldo, estado, observacion, usuario,
         comprobante_pago, comprobante_pago_nombre, comprobante_pago_mime, comprobante_pago_tamano,
-        comprobante_pago_base64, comprobante_pago_data_url, comprobantes_pago_json, sucursal
+        comprobante_pago_base64, comprobante_pago_data_url, comprobantes_pago_json, sucursal, fecha_retiro,
+        cotizacion_id, cotizacion_numero
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    RETURNING id, fecha
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    RETURNING id, fecha, COALESCE(to_char(fecha_retiro, 'YYYY-MM-DD'), '')
     """, (
         (data.tipo_documento or "DNI").upper(), documento, cliente, producto_id, producto_nombre,
-        cantidad, monto_total, monto_reserva, saldo, estado, data.observacion or "", data.usuario or "",
+        cantidad, monto_total, monto_reserva, saldo, estado, observacion, data.usuario or "",
         comprobante.get("comprobante_pago") or "",
         comprobante.get("comprobante_pago_nombre") or "",
         comprobante.get("comprobante_pago_mime") or "",
@@ -4553,12 +5556,47 @@ def crear_reserva(data: ReservaCliente):
         comprobante.get("comprobante_pago_base64") or "",
         comprobante.get("comprobante_pago_data_url") or "",
         comprobantes_json or "",
-        sucursal
+        sucursal,
+        fecha_retiro,
+        cotizacion_id,
+        cotizacion_numero or "",
     ))
     row = cur.fetchone()
+    reserva_id = row[0]
+    # Primer abono = adelanto inicial (no debe anular la separacion si falla)
+    try:
+        cur.execute("SAVEPOINT sp_pago_inicial")
+        _insertar_pago_reserva(
+            cur,
+            reserva_id,
+            monto_reserva,
+            metodo_pago="",
+            observacion="Adelanto inicial al registrar separacion",
+            usuario=data.usuario or "",
+            sucursal=sucursal,
+            comprobante=comprobante,
+        )
+        cur.execute("RELEASE SAVEPOINT sp_pago_inicial")
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_pago_inicial")
+        except Exception:
+            pass
     conn.commit()
     release_conn(conn)
-    return {"ok": True, "success": True, "id": row[0], "fecha": row[1], "saldo": saldo}
+    return {
+        "ok": True,
+        "success": True,
+        "id": reserva_id,
+        "fecha": row[1],
+        "saldo": saldo,
+        "monto_total": monto_total,
+        "monto_reserva": monto_reserva,
+        "fecha_retiro": row[2] or "",
+        "cotizacion_id": cotizacion_id,
+        "cotizacion_numero": cotizacion_numero or "",
+        "msg": f"Separacion #{reserva_id} registrada. Adelanto {monto_reserva:.2f} / Restante {saldo:.2f}.",
+    }
 
 
 @app.get("/reservas")
@@ -4576,6 +5614,11 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
     if estado and estado != "TODOS":
         where.append("UPPER(COALESCE(estado,''))=%s")
         params.append(estado)
+    try:
+        _ensure_reserva_cotizacion_cols(cur)
+        conn.commit()
+    except Exception:
+        conn.rollback()
     cur.execute(f"""
         SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
                COALESCE(tipo_documento,'DNI') AS tipo_documento,
@@ -4593,10 +5636,17 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
                COALESCE(comprobante_pago_nombre,'') AS comprobante_pago_nombre,
                COALESCE(comprobante_pago_mime,'') AS comprobante_pago_mime,
                COALESCE(comprobante_pago_tamano,0) AS comprobante_pago_tamano,
-               COALESCE(comprobantes_pago_json,'') AS comprobantes_pago_json
+               COALESCE(comprobantes_pago_json,'') AS comprobantes_pago_json,
+               COALESCE(to_char(fecha_retiro, 'YYYY-MM-DD'), '') AS fecha_retiro,
+               venta_id,
+               cotizacion_id,
+               COALESCE(cotizacion_numero,'') AS cotizacion_numero
         FROM reservas_clientes
         WHERE {' AND '.join(where)}
-        ORDER BY fecha DESC, id DESC
+        ORDER BY
+          CASE WHEN fecha_retiro IS NULL THEN 1 ELSE 0 END,
+          fecha_retiro ASC NULLS LAST,
+          fecha DESC, id DESC
         LIMIT 200
     """, tuple(params))
     reservas = []
@@ -4605,6 +5655,13 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
         item["comprobantes_pago"] = comprobantes_metadata_liviana(item.get("comprobantes_pago_json"))
         item["comprobantes_pago_count"] = len(item["comprobantes_pago"])
         item["comprobantes_pago_json"] = ""
+        try:
+            pagos = _listar_pagos_reserva(cur, item.get("id"))
+            item["pagos"] = pagos
+            item["pagos_count"] = len(pagos)
+        except Exception:
+            item["pagos"] = []
+            item["pagos_count"] = 0
         reservas.append(item)
     documentos = []
     if documento_digits:
@@ -4613,16 +5670,100 @@ def listar_reservas(documento: str = "", estado: str = "", sucursal: str = DEFAU
                    COALESCE(documento_cliente,'') AS documento_cliente,
                    COALESCE(total,0) AS total,
                    COALESCE(estado_pago,'PAGADO') AS estado_pago,
+                   COALESCE(estado,'EMITIDO') AS estado,
                    to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha
             FROM ventas
-            WHERE regexp_replace(COALESCE(documento_cliente,''), '\\D', '', 'g')=%s
-              AND COALESCE(sucursal,%s)=%s
-            ORDER BY fecha DESC, id DESC
-            LIMIT 100
-        """, (documento_digits, DEFAULT_SUCURSAL, sucursal))
+            WHERE COALESCE(sucursal,%s)=%s
+              AND (
+                regexp_replace(COALESCE(documento_cliente,''), '\\D', '', 'g')=%s
+                OR regexp_replace(COALESCE(cliente,''), '\\D', '', 'g')=%s
+              )
+            ORDER BY
+              CASE WHEN UPPER(COALESCE(tipo,''))='PROFORMA' THEN 0 ELSE 1 END,
+              fecha DESC, id DESC
+            LIMIT 120
+        """, (DEFAULT_SUCURSAL, sucursal, documento_digits, documento_digits))
         documentos = [_jsonable_row(row) for row in dict_fetchall(cur)]
     release_conn(conn)
     return {"ok": True, "success": True, "data": reservas, "reservas": reservas, "documentos": documentos}
+
+
+@app.get("/reservas/cotizaciones")
+def listar_cotizaciones_para_separacion(q: str = "", sucursal: str = DEFAULT_SUCURSAL, limit: int = 40):
+    """Lista PROFORMAS (cotizaciones) para vincular a separacion.
+
+    Incluye cotizaciones vigentes Y ya procesadas (PROCESADO).
+    Solo excluye ANULADAS.
+    """
+    conn = None
+    try:
+        sucursal = norm_sucursal(sucursal)
+        limit = max(1, min(int(limit or 40), 100))
+        raw_q = (q or "").strip()
+        texto = f"%{raw_q.lower()}%"
+        digits = only_digits(raw_q)
+        digits_like = f"%{digits}%" if digits else "%%"
+        # Numero sin guiones/espacios: P001-00012 -> p00100012
+        numero_compact = re.sub(r"[^a-z0-9]+", "", raw_q.lower()) if raw_q else ""
+        numero_like = f"%{numero_compact}%" if numero_compact else "%%"
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, tipo, COALESCE(numero,'') AS numero,
+                   COALESCE(cliente,'') AS cliente_nombre,
+                   COALESCE(documento_cliente,'') AS documento_cliente,
+                   COALESCE(direccion_cliente,'') AS direccion_cliente,
+                   COALESCE(total,0) AS total,
+                   COALESCE(estado,'EMITIDO') AS estado,
+                   COALESCE(estado_pago,'PAGADO') AS estado_pago,
+                   to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
+                   COALESCE(TO_CHAR(fecha_vencimiento, 'YYYY-MM-DD'), '') AS fecha_vencimiento
+            FROM ventas
+            WHERE COALESCE(sucursal,%s)=%s
+              AND UPPER(COALESCE(tipo,''))='PROFORMA'
+              AND UPPER(COALESCE(estado,'')) <> 'ANULADO'
+              AND (
+                %s='%%'
+                OR LOWER(COALESCE(numero,'')) LIKE %s
+                OR regexp_replace(LOWER(COALESCE(numero,'')), '[^a-z0-9]', '', 'g') LIKE %s
+                OR LOWER(COALESCE(cliente,'')) LIKE %s
+                OR LOWER(COALESCE(documento_cliente,'')) LIKE %s
+                OR regexp_replace(COALESCE(documento_cliente,''), '\\D', '', 'g') LIKE %s
+                OR CAST(id AS TEXT) LIKE %s
+              )
+            ORDER BY
+              CASE
+                WHEN UPPER(COALESCE(estado,'')) IN ('EMITIDO','') THEN 0
+                WHEN UPPER(COALESCE(estado,''))='PROCESADO' THEN 1
+                ELSE 2
+              END,
+              fecha DESC, id DESC
+            LIMIT %s
+            """,
+            (
+                DEFAULT_SUCURSAL,
+                sucursal,
+                texto,
+                texto,
+                numero_like,
+                texto,
+                texto,
+                digits_like,
+                texto,
+                limit,
+            ),
+        )
+        rows = [_jsonable_row(r) for r in dict_fetchall(cur)]
+        return {"ok": True, "success": True, "data": rows, "cotizaciones": rows}
+    except Exception as exc:
+        return {"ok": False, "success": False, "msg": str(exc), "data": []}
+    finally:
+        if conn is not None:
+            try:
+                release_conn(conn)
+            except Exception:
+                pass
 
 
 @app.get("/reservas/{reserva_id}")
@@ -4630,6 +5771,11 @@ def detalle_reserva(reserva_id: int, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    try:
+        _ensure_reserva_cotizacion_cols(cur)
+        conn.commit()
+    except Exception:
+        conn.rollback()
     cur.execute("""
         SELECT id, to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha,
                COALESCE(tipo_documento,'DNI') AS tipo_documento,
@@ -4650,18 +5796,151 @@ def detalle_reserva(reserva_id: int, sucursal: str = DEFAULT_SUCURSAL):
                COALESCE(comprobante_pago_tamano,0) AS comprobante_pago_tamano,
                COALESCE(comprobante_pago_base64,'') AS comprobante_pago_base64,
                COALESCE(comprobante_pago_data_url,'') AS comprobante_pago_data_url,
-               COALESCE(comprobantes_pago_json,'') AS comprobantes_pago_json
+               COALESCE(comprobantes_pago_json,'') AS comprobantes_pago_json,
+               COALESCE(to_char(fecha_retiro, 'YYYY-MM-DD'), '') AS fecha_retiro,
+               venta_id,
+               cotizacion_id,
+               COALESCE(cotizacion_numero,'') AS cotizacion_numero
         FROM reservas_clientes
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
         LIMIT 1
     """, (reserva_id, DEFAULT_SUCURSAL, sucursal))
     row = dict_fetchone(cur)
-    release_conn(conn)
     if not row:
+        release_conn(conn)
         return {"ok": False, "success": False, "msg": "Reserva no encontrada."}
     row = _jsonable_row(row)
     row["comprobantes_pago"] = cargar_comprobantes_json(row.get("comprobantes_pago_json"))
+    row["pagos"] = _listar_pagos_reserva(cur, reserva_id)
+    row["pagos_count"] = len(row["pagos"])
+    release_conn(conn)
     return {"ok": True, "success": True, "data": row, "reserva": row}
+
+
+@app.post("/reservas/{reserva_id}/pagos")
+def agregar_pago_reserva(reserva_id: int, data: dict):
+    """Suma un abono parcial a la separacion (cliente paga por partes)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    sucursal = norm_sucursal(data.get("sucursal") or DEFAULT_SUCURSAL)
+    try:
+        monto = round(float(data.get("monto") or 0), 2)
+    except Exception:
+        monto = 0.0
+    if monto <= 0:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "El abono debe ser mayor a 0."}
+    metodo = str(data.get("metodo_pago") or data.get("metodo") or "").strip().upper()[:40]
+    observacion = str(data.get("observacion") or "").strip()[:500]
+    usuario = str(data.get("usuario") or "").strip()[:80]
+    try:
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS fecha_retiro DATE")
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS venta_id INT")
+    except Exception:
+        conn.rollback()
+    cur.execute("""
+        SELECT id, COALESCE(monto_total,0), COALESCE(monto_reserva,0), COALESCE(saldo,0),
+               COALESCE(estado,'RESERVADO'), COALESCE(comprobantes_pago_json,'')
+        FROM reservas_clientes
+        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        LIMIT 1
+    """, (reserva_id, DEFAULT_SUCURSAL, sucursal))
+    row = cur.fetchone()
+    if not row:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": "Separacion no encontrada."}
+    estado_actual = str(row[4] or "RESERVADO").upper()
+    if estado_actual in ("ANULADO", "ENTREGADO"):
+        release_conn(conn)
+        return {
+            "ok": False,
+            "success": False,
+            "msg": f"No se puede abonar una separacion en estado {estado_actual}.",
+        }
+    total = round(float(row[1] or 0), 2)
+    adelanto_actual = round(float(row[2] or 0), 2)
+    saldo_actual = round(float(row[3] if row[3] is not None else max(0.0, total - adelanto_actual)), 2)
+    if total > 0 and monto > saldo_actual + 0.009:
+        release_conn(conn)
+        return {
+            "ok": False,
+            "success": False,
+            "msg": f"El abono ({monto:.2f}) supera el saldo restante ({saldo_actual:.2f}).",
+        }
+    nuevo_adelanto = round(adelanto_actual + monto, 2)
+    if total > 0:
+        nuevo_adelanto = min(nuevo_adelanto, total)
+    nuevo_saldo = max(0.0, round(total - nuevo_adelanto, 2)) if total > 0 else 0.0
+    nuevo_estado = "PAGADO" if (total > 0 and nuevo_saldo <= 0.009) else estado_actual
+    if nuevo_estado not in ("RESERVADO", "PAGADO", "ENTREGADO", "ANULADO"):
+        nuevo_estado = "RESERVADO"
+    try:
+        comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data, row[5] or "")
+    except ValueError as e:
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": str(e)}
+    try:
+        pago_row = _insertar_pago_reserva(
+            cur,
+            reserva_id,
+            monto,
+            metodo_pago=metodo,
+            observacion=observacion or f"Abono parcial {monto:.2f}",
+            usuario=usuario,
+            sucursal=sucursal,
+            comprobante=comprobante,
+        )
+        cur.execute("""
+            UPDATE reservas_clientes
+            SET monto_reserva=%s, saldo=%s, estado=%s,
+                comprobante_pago=COALESCE(%s, comprobante_pago, ''),
+                comprobante_pago_nombre=COALESCE(%s, comprobante_pago_nombre, ''),
+                comprobante_pago_mime=COALESCE(%s, comprobante_pago_mime, ''),
+                comprobante_pago_tamano=COALESCE(%s, comprobante_pago_tamano, 0),
+                comprobante_pago_base64=COALESCE(%s, comprobante_pago_base64, ''),
+                comprobante_pago_data_url=COALESCE(%s, comprobante_pago_data_url, ''),
+                comprobantes_pago_json=COALESCE(%s, comprobantes_pago_json, '')
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (
+            nuevo_adelanto, nuevo_saldo, nuevo_estado,
+            comprobante.get("comprobante_pago"),
+            comprobante.get("comprobante_pago_nombre"),
+            comprobante.get("comprobante_pago_mime"),
+            comprobante.get("comprobante_pago_tamano"),
+            comprobante.get("comprobante_pago_base64"),
+            comprobante.get("comprobante_pago_data_url"),
+            comprobantes_json,
+            reserva_id, DEFAULT_SUCURSAL, sucursal,
+        ))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        release_conn(conn)
+        return {"ok": False, "success": False, "msg": f"No se pudo registrar el abono: {e}"}
+    pagos = _listar_pagos_reserva(cur, reserva_id)
+    release_conn(conn)
+    try:
+        invalidate_api_cache("dashboard|")
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "success": True,
+        "id": reserva_id,
+        "pago_id": pago_row[0] if pago_row else None,
+        "pago_fecha": pago_row[1] if pago_row else "",
+        "monto_abono": monto,
+        "monto_total": total,
+        "monto_reserva": nuevo_adelanto,
+        "saldo": nuevo_saldo,
+        "estado": nuevo_estado,
+        "pagos": pagos,
+        "pagos_count": len(pagos),
+        "msg": (
+            f"Abono de {monto:.2f} registrado. "
+            f"Total adelantado {nuevo_adelanto:.2f} / Restante {nuevo_saldo:.2f}."
+        ),
+    }
 
 
 @app.put("/reservas/{reserva_id}")
@@ -4708,6 +5987,23 @@ def actualizar_reserva(reserva_id: int, data: dict):
     except ValueError as e:
         release_conn(conn)
         return {"ok": False, "success": False, "msg": str(e)}
+    try:
+        _ensure_reserva_cotizacion_cols(cur)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    fecha_retiro = _parse_fecha_retiro(data.get("fecha_retiro"))
+    cotizacion_id = _parse_cotizacion_id(data.get("cotizacion_id")) if "cotizacion_id" in data else None
+    cotizacion_numero = str(data.get("cotizacion_numero") or "").strip()
+    clear_cotizacion = str(data.get("cotizacion_id") or "").strip() in ("", "0", "null", "None") and "cotizacion_id" in data
+    if cotizacion_id:
+        coti = _cargar_cotizacion_para_reserva(cur, cotizacion_id, sucursal)
+        if coti:
+            cotizacion_numero = str(coti.get("numero") or cotizacion_numero or cotizacion_id)
+        else:
+            release_conn(conn)
+            return {"ok": False, "success": False, "msg": "Cotizacion no valida (debe ser PROFORMA)."}
+    # Si no envian fecha_retiro, no la borramos (CASE)
     cur.execute("""
         UPDATE reservas_clientes
         SET estado=%s, monto_total=%s, monto_reserva=%s, saldo=%s,
@@ -4718,6 +6014,17 @@ def actualizar_reserva(reserva_id: int, data: dict):
             producto_nombre=CASE WHEN %s <> '' THEN %s ELSE COALESCE(producto_nombre,'') END,
             cantidad=COALESCE(%s, cantidad, 1),
             observacion=CASE WHEN %s <> '' THEN %s ELSE COALESCE(observacion,'') END,
+            fecha_retiro=CASE WHEN %s::date IS NOT NULL THEN %s::date ELSE fecha_retiro END,
+            cotizacion_id=CASE
+                WHEN %s THEN NULL
+                WHEN %s IS NOT NULL THEN %s
+                ELSE cotizacion_id
+            END,
+            cotizacion_numero=CASE
+                WHEN %s THEN ''
+                WHEN %s <> '' THEN %s
+                ELSE COALESCE(cotizacion_numero,'')
+            END,
             comprobante_pago=COALESCE(%s, comprobante_pago, ''),
             comprobante_pago_nombre=COALESCE(%s, comprobante_pago_nombre, ''),
             comprobante_pago_mime=COALESCE(%s, comprobante_pago_mime, ''),
@@ -4735,6 +6042,9 @@ def actualizar_reserva(reserva_id: int, data: dict):
         producto_nombre, producto_nombre,
         cantidad,
         observacion, observacion,
+        fecha_retiro, fecha_retiro,
+        clear_cotizacion, cotizacion_id, cotizacion_id,
+        clear_cotizacion, cotizacion_numero, cotizacion_numero,
         comprobante.get("comprobante_pago"),
         comprobante.get("comprobante_pago_nombre"),
         comprobante.get("comprobante_pago_mime"),
@@ -4746,7 +6056,18 @@ def actualizar_reserva(reserva_id: int, data: dict):
     ))
     conn.commit()
     release_conn(conn)
-    return {"ok": True, "success": True, "id": reserva_id, "saldo": saldo, "estado": estado}
+    return {
+        "ok": True,
+        "success": True,
+        "id": reserva_id,
+        "saldo": saldo,
+        "monto_total": total,
+        "monto_reserva": reservado,
+        "estado": estado,
+        "fecha_retiro": fecha_retiro.isoformat() if fecha_retiro else "",
+        "cotizacion_id": None if clear_cotizacion else cotizacion_id,
+        "cotizacion_numero": "" if clear_cotizacion else cotizacion_numero,
+    }
 
 
 # ================= PRODUCTOS =================
@@ -5016,15 +6337,20 @@ def actualizar_producto(producto_id: int, data: Producto, sucursal: str = DEFAUL
         release_conn(conn)
         woo_sync = None
         if bool(data.sync_to_woo):
+            # Publicacion completa (crear/actualizar ficha)
             woo_sync = maybe_sync_updated_product_to_woo(producto_id, sucursal=sucursal)
-            if isinstance(woo_sync, dict) and woo_sync.get("ok") is False:
-                return {
-                    "ok": True,
-                    "success": True,
-                    "id": row[0],
-                    "woo_sync": woo_sync,
-                    "msg": woo_sync.get("msg") or "Producto guardado, pero no se pudo publicar en la pagina.",
-                }
+        else:
+            # Auto: si tiene SKU/vinculo y auto-sync activo, sube precio+nombre+stock
+            woo_sync = auto_push_linked_product_to_web(producto_id, sucursal=sucursal, force=False)
+        if isinstance(woo_sync, dict) and woo_sync.get("ok") is False and not woo_sync.get("skipped"):
+            invalidate_productos_cache(sucursal)
+            return {
+                "ok": True,
+                "success": True,
+                "id": row[0],
+                "woo_sync": woo_sync,
+                "msg": woo_sync.get("msg") or "Producto guardado, pero no se pudo publicar en la pagina.",
+            }
         invalidate_productos_cache(sucursal)
         return {"ok": True, "success": True, "id": row[0], "woo_sync": woo_sync}
     except Exception as e:
@@ -5068,16 +6394,152 @@ def actualizar_precio_venta_producto(producto_id: int, data: ProductoPrecioVenta
         ))
         conn.commit()
         invalidate_productos_cache(sucursal)
+        woo_sync = auto_push_linked_product_to_web(producto_id, sucursal=sucursal, force=False)
         return {
             "ok": True,
             "success": True,
             "id": row[0],
             "nombre": row[1],
             "precio_venta": float(row[2] or 0),
+            "woo_sync": woo_sync,
         }
     except Exception as e:
         conn.rollback()
         return {"ok": False, "success": False, "msg": str(e)}
+    finally:
+        release_conn(conn)
+
+
+@app.put("/productos/{producto_id}/sku")
+def guardar_sku_producto(producto_id: int, data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    """Asigna SKU manual y opcionalmente lo escribe en Woo + auto-push de campos."""
+    data = data or {}
+    sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or sucursal))
+    sku = str(data.get("sku_woo") or data.get("sku") or "").strip().upper()
+    if not sku:
+        sku = f"ERP-{int(producto_id)}"
+    push_to_web = bool(data.get("push_to_web", True))
+    write_sku_on_web = bool(data.get("write_sku_on_web", True))
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        ensure_producto_web_columns(cur)
+        cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
+        cur.execute("""
+            SELECT id, nombre, COALESCE(sku_woo,'') AS sku_woo, COALESCE(woo_id,0) AS woo_id,
+                   COALESCE(nombre_web,'') AS nombre_web
+            FROM productos
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (producto_id, DEFAULT_SUCURSAL, sucursal))
+        producto = dict_fetchone(cur)
+        if not producto:
+            release_conn(conn)
+            return {"ok": False, "msg": "Producto no encontrado."}
+        cur.execute("""
+            UPDATE productos SET sku_woo=%s
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        """, (sku, producto_id, DEFAULT_SUCURSAL, sucursal))
+        conn.commit()
+        release_conn(conn)
+        invalidate_productos_cache(sucursal)
+
+        link = None
+        # Si ya existe en web con ese SKU, guarda woo_id
+        web = _woo_find_product_by_sku(sku, sucursal=sucursal) if woo_config(sucursal) else {"ok": False}
+        if web.get("ok"):
+            woo_id = int(web.get("woo_id") or 0)
+            nombre_web = str(web.get("nombre_web") or "").strip()
+            conn2 = get_conn()
+            cur2 = conn2.cursor()
+            cur2.execute("""
+                UPDATE productos
+                SET woo_id=%s,
+                    nombre_web=CASE WHEN %s<>'' AND COALESCE(nombre_web,'')='' THEN %s ELSE nombre_web END
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (woo_id, nombre_web, nombre_web, producto_id, DEFAULT_SUCURSAL, sucursal))
+            conn2.commit()
+            release_conn(conn2)
+            link = {"woo_id": woo_id, "nombre_web": nombre_web}
+        elif write_sku_on_web and int(producto.get("woo_id") or 0) > 0:
+            # Producto ya vinculado por woo_id pero sin SKU en la web: escribelo
+            w = woo_write_sku_on_web_product(int(producto.get("woo_id") or 0), sku, sucursal=sucursal)
+            if w.get("ok"):
+                link = {"woo_id": int(producto.get("woo_id") or 0), "sku_written": True}
+
+        woo_sync = None
+        if push_to_web:
+            # force: al asignar SKU conviene empujar una vez aunque auto-sync este off
+            woo_sync = auto_push_linked_product_to_web(producto_id, sucursal=sucursal, force=True)
+            if not woo_sync.get("ok") and not link:
+                # intentar publicacion completa si no hay match
+                woo_sync = maybe_sync_updated_product_to_woo(producto_id, sucursal=sucursal)
+
+        return {
+            "ok": True,
+            "success": True,
+            "id": producto_id,
+            "sku_woo": sku,
+            "link": link,
+            "woo_sync": woo_sync,
+            "msg": f"SKU {sku} guardado en producto #{producto_id}."
+                   + (f" Vinculado a web #{link.get('woo_id')}." if link and link.get("woo_id") else "")
+                   + (f" {woo_sync.get('msg')}" if isinstance(woo_sync, dict) and woo_sync.get("msg") else ""),
+        }
+    except Exception as e:
+        try:
+            conn.rollback()
+            release_conn(conn)
+        except Exception:
+            pass
+        return {"ok": False, "msg": str(e)}
+
+
+@app.post("/productos/bulk-sku-default")
+def asignar_sku_default_masivo(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
+    """Asigna ERP-{id} a productos sin SKU (para luego sincronizar)."""
+    data = data or {}
+    sucursal = inventario_sucursal(norm_sucursal(data.get("sucursal") or sucursal))
+    solo_sin_sku = bool(data.get("solo_sin_sku", True))
+    prefix = str(data.get("prefix") or "ERP-").strip().upper() or "ERP-"
+    limit = max(1, min(int(data.get("limit") or 2000), 5000))
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        ensure_producto_web_columns(cur)
+        sql = """
+            SELECT id, COALESCE(sku_woo,'') AS sku_woo
+            FROM productos
+            WHERE COALESCE(sucursal,%s)=%s
+        """
+        params = [DEFAULT_SUCURSAL, sucursal]
+        if solo_sin_sku:
+            sql += " AND TRIM(COALESCE(sku_woo,''))=''"
+        sql += " ORDER BY id LIMIT %s"
+        params.append(limit)
+        cur.execute(sql, params)
+        rows = dict_fetchall(cur)
+        updated = 0
+        for row in rows:
+            pid = int(row.get("id") or 0)
+            if not pid:
+                continue
+            sku = f"{prefix}{pid}"
+            cur.execute("""
+                UPDATE productos SET sku_woo=%s
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            """, (sku, pid, DEFAULT_SUCURSAL, sucursal))
+            updated += 1
+        conn.commit()
+        invalidate_productos_cache(sucursal)
+        return {
+            "ok": True,
+            "success": True,
+            "updated": updated,
+            "msg": f"SKU por defecto asignado a {updated} producto(s) (formato {prefix}ID).",
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "msg": str(e)}
     finally:
         release_conn(conn)
 
@@ -5323,15 +6785,29 @@ def vincular_producto_por_sku(data: dict):
     solo_vincular = bool(data.get("solo_vincular", True))
     nombre_web = str(data.get("nombre_web") or web.get("nombre_web") or "").strip()
 
+    woo_id = int(web.get("woo_id") or 0)
     cur.execute("""
         UPDATE productos
         SET sku_woo=%s,
             woo_id=%s,
             nombre_web=CASE WHEN %s<>'' THEN %s ELSE nombre_web END
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (sku, int(web.get("woo_id") or 0), nombre_web, nombre_web, producto_id, DEFAULT_SUCURSAL, sucursal))
+    """, (sku, woo_id, nombre_web, nombre_web, producto_id, DEFAULT_SUCURSAL, sucursal))
     conn.commit()
     release_conn(conn)
+
+    # Si en Woo el producto no tenia SKU o tenia otro, escribelo (enlace estable)
+    sku_web_actual = str(web.get("sku") or "").strip().upper()
+    if woo_id > 0 and sku and sku_web_actual != sku:
+        try:
+            woo_write_sku_on_web_product(woo_id, sku, sucursal=sucursal)
+        except Exception:
+            pass
+    # Auto-push precio/nombre/stock al vincular
+    try:
+        auto_push_linked_product_to_web(producto_id, sucursal=sucursal, force=True)
+    except Exception:
+        pass
 
     msg = f"Producto ERP #{producto_id} vinculado al SKU {sku} (web: {nombre_web or web.get('nombre_web')}). Nombre interno se mantiene: {producto.get('nombre')}."
     if otros:
@@ -6541,6 +8017,184 @@ def movimientos_producto(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
         return {"ok": False, "data": [], "msg": str(e)}
 
 
+def _xlsx_col_name(index: int) -> str:
+    name = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(65 + rem) + name
+    return name or "A"
+
+
+def _xlsx_cell(value, row_idx: int, col_idx: int) -> str:
+    ref = f"{_xlsx_col_name(col_idx)}{row_idx}"
+    if value is None:
+        value = ""
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        return f'<c r="{ref}"><v>{float(value)}</v></c>'
+    text = html.escape(str(value), quote=True)
+    return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+def _xlsx_sheet(rows):
+    body = []
+    for row_idx, row in enumerate(rows, 1):
+        cells = "".join(_xlsx_cell(value, row_idx, col_idx) for col_idx, value in enumerate(row, 1))
+        body.append(f'<row r="{row_idx}">{cells}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(body)}</sheetData>'
+        '</worksheet>'
+    )
+
+
+def _build_xlsx(sheets):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            + ''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(sheets) + 1))
+            + '</Types>'
+        ))
+        z.writestr("_rels/.rels", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>'
+        ))
+        z.writestr("xl/workbook.xml", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+            + ''.join(f'<sheet name="{html.escape(name[:31], quote=True)}" sheetId="{i}" r:id="rId{i}"/>' for i, (name, _) in enumerate(sheets, 1))
+            + '</sheets></workbook>'
+        ))
+        z.writestr("xl/_rels/workbook.xml.rels", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + ''.join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheets) + 1))
+            + '</Relationships>'
+        ))
+        for i, (_, rows) in enumerate(sheets, 1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", _xlsx_sheet(rows))
+    out.seek(0)
+    return out
+
+
+@app.get("/productos/cierre-inventario.xlsx")
+def descargar_cierre_inventario(sucursal: str = DEFAULT_SUCURSAL):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sucursal = norm_sucursal(sucursal)
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS almacen TEXT DEFAULT 'TIENDA'")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS usuario_ingreso TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE producto_series ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+        cur.execute("""
+        SELECT p.id, COALESCE(p.nombre,'') AS producto, COALESCE(p.categoria,'') AS categoria,
+               COALESCE(p.marca,'') AS marca, COALESCE(p.modelo,'') AS modelo,
+               COALESCE(p.stock,0) AS stock_sistema,
+               COUNT(ps.id) AS series_total,
+               SUM(CASE WHEN UPPER(COALESCE(ps.estado,'DISPONIBLE'))='DISPONIBLE' THEN 1 ELSE 0 END) AS series_disponibles,
+               SUM(CASE WHEN UPPER(COALESCE(ps.estado,''))='VENDIDO' THEN 1 ELSE 0 END) AS series_vendidas,
+               SUM(CASE WHEN UPPER(COALESCE(ps.estado,''))='RESERVADO' THEN 1 ELSE 0 END) AS series_reservadas
+        FROM productos p
+        LEFT JOIN producto_series ps ON ps.producto_id=p.id AND COALESCE(ps.sucursal,%s)=%s
+        WHERE COALESCE(p.sucursal,%s)=%s
+        GROUP BY p.id, p.nombre, p.categoria, p.marca, p.modelo, p.stock
+        ORDER BY p.categoria, p.nombre
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+        resumen_rows = [["ID", "Producto", "Categoria", "Marca", "Modelo", "Stock sistema", "Series total", "Disponibles", "Vendidas", "Reservadas"]]
+        resumen_rows += [[r.get("id"), r.get("producto"), r.get("categoria"), r.get("marca"), r.get("modelo"), r.get("stock_sistema"), r.get("series_total"), r.get("series_disponibles"), r.get("series_vendidas"), r.get("series_reservadas")] for r in dict_fetchall(cur)]
+
+        cur.execute("""
+        SELECT p.id AS producto_id, COALESCE(p.nombre,'') AS producto, COALESCE(p.categoria,'') AS categoria,
+               COALESCE(p.marca,'') AS marca, COALESCE(p.modelo,'') AS modelo,
+               COALESCE(ps.serie,'') AS serie, COALESCE(ps.estado,'DISPONIBLE') AS estado,
+               COALESCE(ps.almacen,'TIENDA') AS almacen, COALESCE(ps.proveedor,'') AS proveedor,
+               COALESCE(ps.fecha_ingreso::text,'') AS fecha_ingreso, COALESCE(ps.fecha_salida::text,'') AS fecha_salida,
+               COALESCE(ps.usuario_ingreso,'') AS usuario_ingreso
+        FROM producto_series ps
+        LEFT JOIN productos p ON p.id=ps.producto_id AND COALESCE(p.sucursal,%s)=%s
+        WHERE COALESCE(ps.sucursal,%s)=%s
+        ORDER BY p.categoria, p.nombre, ps.serie
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+        series_rows = [["Producto ID", "Producto", "Categoria", "Marca", "Modelo", "Serie", "Estado actual", "Almacen", "Proveedor", "Fecha ingreso", "Fecha salida", "Usuario ingreso"]]
+        series_rows += [[r.get("producto_id"), r.get("producto"), r.get("categoria"), r.get("marca"), r.get("modelo"), r.get("serie"), r.get("estado"), r.get("almacen"), r.get("proveedor"), r.get("fecha_ingreso"), r.get("fecha_salida"), r.get("usuario_ingreso")] for r in dict_fetchall(cur)]
+
+        movimientos_rows = [["Fecha", "Movimiento", "Producto ID", "Producto", "Categoria", "Serie", "Cantidad", "Documento", "Cliente/Proveedor", "Usuario", "Estado", "Almacen", "Monto", "Detalle"]]
+        for r in series_rows[1:]:
+            movimientos_rows.append([r[9], "INGRESO SERIE", r[0], r[1], r[2], r[5], 1, "", r[8], r[11], r[6], r[7], "", "Registro actual de serie"])
+
+        cur.execute("""
+        SELECT to_char(c.fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha, COALESCE(c.proveedor_nombre,'') AS proveedor,
+               COALESCE(c.comprobante,'') AS comprobante, COALESCE(c.usuario_registro,'') AS usuario,
+               COALESCE(c.items_json,'') AS items_json
+        FROM compras c
+        WHERE COALESCE(c.sucursal,%s)=%s AND COALESCE(c.items_json,'')<>''
+        ORDER BY c.fecha DESC, c.id DESC
+        """, (DEFAULT_SUCURSAL, sucursal))
+        for compra in dict_fetchall(cur):
+            for item in _parse_compra_items(compra.get("items_json")):
+                series = item.get("series_list") if isinstance(item.get("series_list"), list) else split_series_text(item.get("series_texto") or "")
+                for serie in [str(s or "").strip().upper() for s in series if str(s or "").strip()]:
+                    movimientos_rows.append([compra.get("fecha"), "COMPRA / INGRESO", item.get("producto_id") or "", item.get("nombre") or "", item.get("categoria") or "", serie, 1, compra.get("comprobante"), compra.get("proveedor"), compra.get("usuario"), "DISPONIBLE", "TIENDA", item.get("precio") or "", "Compra registrada con serie"])
+
+        cur.execute("""
+        SELECT to_char(v.fecha, 'YYYY-MM-DD HH24:MI:SS') AS fecha, COALESCE(v.tipo,'') AS tipo,
+               COALESCE(v.numero,'') AS numero, COALESCE(v.cliente,'') AS cliente,
+               COALESCE(v.usuario_emisor,'') AS usuario, COALESCE(v.metodo_pago,'') AS metodo_pago,
+               COALESCE(v.observacion,'') AS observacion, COALESCE(vd.producto_id,0) AS producto_id,
+               COALESCE(vd.descripcion,'') AS producto, COALESCE(p.categoria,'') AS categoria,
+               COALESCE(vd.series_texto,'') AS series_texto, COALESCE(vd.cantidad,0) AS cantidad,
+               COALESCE(vd.total,0) AS total
+        FROM ventas_detalle vd
+        JOIN ventas v ON v.id=vd.venta_id
+        LEFT JOIN productos p ON p.id=vd.producto_id
+        WHERE COALESCE(v.sucursal,%s)=%s
+          AND COALESCE(vd.sucursal,%s)=%s
+          AND COALESCE(vd.series_texto,'')<>''
+          AND UPPER(COALESCE(v.estado,''))<>'ANULADO'
+        ORDER BY v.fecha DESC, v.id DESC
+        """, (DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal))
+        for venta in dict_fetchall(cur):
+            tipo_mov = "SALIDA MANUAL" if str(venta.get("metodo_pago") or "").upper() == "MANUAL" or "manual" in str(venta.get("observacion") or "").lower() else "VENTA / SALIDA"
+            series = split_series_text(venta.get("series_texto") or "")
+            per_total = float(venta.get("total") or 0) / max(1, len(series))
+            for serie in series:
+                movimientos_rows.append([venta.get("fecha"), tipo_mov, venta.get("producto_id"), venta.get("producto"), venta.get("categoria"), serie, 1, f"{venta.get('tipo')} {venta.get('numero')}".strip(), venta.get("cliente"), venta.get("usuario"), "VENDIDO", "", round(per_total, 2), venta.get("observacion")])
+
+        movimientos_rows[1:] = sorted(movimientos_rows[1:], key=lambda row: str(row[0] or ""), reverse=True)
+        generated = lima_now().strftime("%Y-%m-%d %H:%M:%S")
+        portada_rows = [
+            ["Cierre de inventario por series"],
+            ["Sucursal", sucursal],
+            ["Generado", generated],
+            ["Contenido", "Resumen, Series, Movimientos"],
+        ]
+        workbook = _build_xlsx([
+            ("Portada", portada_rows),
+            ("Resumen", resumen_rows),
+            ("Series", series_rows),
+            ("Movimientos", movimientos_rows),
+        ])
+        release_conn(conn)
+        filename = f"cierre_inventario_{sucursal}_{lima_now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            workbook,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        release_conn(conn)
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 _BACKUP_TABLES_FULL = [
     "usuarios",
     "usuario_permisos",
@@ -6795,6 +8449,10 @@ def crear_venta(data: Venta):
         if mueve_stock:
             for item_index, item in enumerate(data.items):
                 producto_id = item.producto_id or item.id
+                try:
+                    producto_id = int(producto_id) if str(producto_id or "").strip() not in ("", "0", "None") else None
+                except Exception:
+                    producto_id = None
                 descripcion = item.nombre
                 marca = item.marca
                 modelo = item.modelo
@@ -6812,6 +8470,25 @@ def crear_venta(data: Venta):
                         conn.rollback()
                         release_conn(conn)
                         return {"ok": False, "success": False, "msg": error_prueba}
+                    continue
+                if item_es_compra_externa(item):
+                    producto_id, error_externa = procesar_compra_externa_venta(
+                        cur,
+                        producto_id,
+                        descripcion,
+                        marca,
+                        modelo,
+                        item.cantidad,
+                        series_texto,
+                        sucursal,
+                        usuario=getattr(data, "usuario_emisor", "") or "",
+                    )
+                    if error_externa:
+                        conn.rollback()
+                        release_conn(conn)
+                        return {"ok": False, "success": False, "msg": error_externa}
+                    if producto_id:
+                        resolved_product_ids[item_index] = producto_id
                     continue
                 if is_test_product_name(descripcion, marca, modelo) or ((not producto_id) and series_texto):
                     error_combo = procesar_combo_generico_venta(cur, descripcion, series_texto, sucursal)
@@ -6936,22 +8613,89 @@ def crear_venta(data: Venta):
                 WHERE id=%s
                 """, (f"\nConvertida a {data.tipo} {numero}", proforma_origen_id))
 
+        # Cierre de separacion: al emitir boleta/factura se marca ENTREGADO
+        reserva_origen_id = getattr(data, "reserva_origen_id", None)
+        if reserva_origen_id and doc_tipo_upper in ("BOLETA", "FACTURA", "NOTA DE VENTA", "PASE"):
+            try:
+                reserva_origen_id = int(reserva_origen_id)
+            except Exception:
+                reserva_origen_id = None
+        if reserva_origen_id:
+            try:
+                cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS venta_id INT")
+            except Exception:
+                conn.rollback()
+            cur.execute("""
+            SELECT id, COALESCE(estado,'RESERVADO'), COALESCE(monto_reserva,0), COALESCE(saldo,0)
+            FROM reservas_clientes
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            LIMIT 1
+            """, (reserva_origen_id, DEFAULT_SUCURSAL, sucursal))
+            res_row = cur.fetchone()
+            if res_row:
+                nota = (
+                    f"\nCerrada con {data.tipo} {numero} (venta #{venta_id}). "
+                    f"Adelanto {float(res_row[2] or 0):.2f} / Restante previo {float(res_row[3] or 0):.2f}."
+                )
+                cur.execute("""
+                UPDATE reservas_clientes
+                SET estado='ENTREGADO',
+                    saldo=0,
+                    venta_id=%s,
+                    observacion=TRIM(COALESCE(observacion,'') || %s)
+                WHERE id=%s AND COALESCE(sucursal,%s)=%s
+                """, (venta_id, nota, reserva_origen_id, DEFAULT_SUCURSAL, sucursal))
+
         conn.commit()
         release_conn(conn)
         invalidate_productos_cache(sucursal)
         invalidate_api_cache("documentos|")
         invalidate_api_cache("caja|")
 
+        # Precalentar PDF en segundo plano para que "Ver PDF" sea instantaneo
+        def _bg_warm_pdf(vid=venta_id, suc=sucursal):
+            try:
+                warm_pdf_cache(vid, suc)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_bg_warm_pdf,
+            daemon=True,
+            name=f"pdf-warm-{venta_id}",
+        ).start()
+
+        # Emision al instante: no bloquear la respuesta esperando SUNAT.
+        # El envio legal se hace en segundo plano y el estado se actualiza luego.
         sunat_auto = None
         if doc_tipo_upper in ("BOLETA", "FACTURA") and legal_sunat:
-            try:
-                sunat_auto = enviar_documento_sunat(
-                    venta_id,
-                    SunatEnviarRequest(regenerar=True, permitir_sin_firma=False),
-                    sucursal,
-                )
-            except Exception as sunat_error:
-                sunat_auto = {"ok": False, "auto": True, "msg": str(sunat_error)}
+            def _bg_enviar_sunat(vid=venta_id, suc=sucursal):
+                try:
+                    enviar_documento_sunat(
+                        vid,
+                        SunatEnviarRequest(regenerar=True, permitir_sin_firma=False),
+                        suc,
+                    )
+                except Exception:
+                    pass
+                try:
+                    invalidate_api_cache("documentos|")
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_bg_enviar_sunat,
+                daemon=True,
+                name=f"sunat-auto-{venta_id}",
+            ).start()
+            sunat_auto = {
+                "ok": True,
+                "success": True,
+                "auto": True,
+                "async": True,
+                "msg": "Documento emitido. Envio a SUNAT en segundo plano.",
+                "sunat_estado": "PENDIENTE",
+            }
 
         return {
             "ok": True,
@@ -6985,9 +8729,26 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(data.sucursal)
+        usuario_op = str(getattr(data, "usuario_emisor", "") or getattr(data, "usuario", "") or "").strip()
         doc_tipo = (data.tipo or "BOLETA").strip().upper()
         if doc_tipo not in STOCK_DOC_TYPES:
             doc_tipo = "BOLETA"
+        # Boleta/Factura: solo Giomar. Pase: giomar/mily (series).
+        if doc_tipo in ("BOLETA", "FACTURA"):
+            if not usuario_puede_editar_documento({"usuario": usuario_op, "usuario_emisor": usuario_op}):
+                release_conn(conn)
+                return {
+                    "ok": False,
+                    "success": False,
+                    "msg": "Solo Giomar puede crear o ajustar boletas/facturas por series manuales.",
+                }
+        elif not usuario_puede_editar_series({"usuario": usuario_op, "usuario_emisor": usuario_op}):
+            release_conn(conn)
+            return {
+                "ok": False,
+                "success": False,
+                "msg": "No tienes permiso para salida manual por series.",
+            }
         series = split_series_text(data.series_texto)
         if not series:
             release_conn(conn)
@@ -7036,9 +8797,22 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
 
         fecha_emision = parse_fecha_emision(data.fecha_emision)
         cliente = (data.cliente_nombre or "CLIENTE MANUAL").strip() or "CLIENTE MANUAL"
+        tipo_cliente = str(data.tipo_documento_cliente or "").strip().upper()
+        numero_cliente = str(data.numero_documento_cliente or "").strip()
+        documento_cliente = str(data.documento_cliente or "").strip()
+        if tipo_cliente and numero_cliente:
+            documento_cliente = f"{tipo_cliente}: {numero_cliente}"
+        direccion_cliente = str(data.direccion_cliente or "").strip()
         total = round(sum(float(found[s].get("precio_venta") or 0) for s in series if s in found), 2)
         if existing_doc:
             venta_id = existing_doc[0]
+            cur.execute("""
+            UPDATE ventas
+            SET cliente=%s,
+                documento_cliente=CASE WHEN %s<>'' THEN %s ELSE documento_cliente END,
+                direccion_cliente=CASE WHEN %s<>'' THEN %s ELSE direccion_cliente END
+            WHERE id=%s
+            """, (cliente, documento_cliente, documento_cliente, direccion_cliente, direccion_cliente, venta_id))
         else:
             sunat_estado_doc, sunat_modo_doc = _sunat_defaults_nuevo_documento(cur, sucursal, fecha_emision)
             cur.execute("""
@@ -7047,10 +8821,10 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
                 subtotal, igv, total, observacion, fecha_vencimiento, usuario_emisor,
                 estado, estado_pago, metodo_pago, sucursal, sunat_estado, sunat_modo
             )
-            VALUES (%s,%s,%s,%s,'','',%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,'EMITIDO','PAGADO','MANUAL',%s,%s,%s)
             RETURNING id
             """, (
-                fecha_emision, doc_tipo, numero, cliente, total, total,
+                fecha_emision, doc_tipo, numero, cliente, documento_cliente, direccion_cliente, total, total,
                 data.observacion or f"{doc_tipo} manual ingresado por series",
                 fecha_emision.date().isoformat(), data.usuario_emisor or "", sucursal,
                 sunat_estado_doc, sunat_modo_doc,
@@ -7084,9 +8858,9 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
             cur.execute("""
             UPDATE producto_series
             SET estado='VENDIDO',
-                fecha_salida=TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD')
+                fecha_salida=%s
             WHERE id=%s
-            """, (row.get("serie_id"),))
+            """, (fecha_emision.date().isoformat(), row.get("serie_id"),))
             if producto_id:
                 touched_products.add(producto_id)
         for producto_id in touched_products:
@@ -7103,8 +8877,21 @@ def crear_documento_manual_series(data: DocumentoManualSeries):
                 total, data.usuario_emisor or "", doc_tipo, numero, data.observacion or "", sucursal
             ))
 
+        cur.execute("""
+        INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+        VALUES (%s,'ADMIN',%s,%s,%s)
+        """, (
+            usuario_op or "giomar",
+            sucursal,
+            "BOLETA MANUAL SERIES",
+            f"{doc_tipo} {numero} | series=[{_resumen_lista_auditoria(series)}] | "
+            f"{'actualizado' if existing_doc else 'creado'} por {usuario_op or 'giomar'} | total={total:.2f}",
+        ))
         conn.commit()
         release_conn(conn)
+        invalidate_productos_cache(sucursal)
+        invalidate_api_cache("documentos|")
+        invalidate_api_cache("series|")
         return {
             "ok": True,
             "success": True,
@@ -7248,11 +9035,11 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
         filtro_fecha = (fecha or "").strip()
         texto_q = (q or "").strip().lower()
         cache_key = f"documentos|lite|{sucursal}|{filtro_fecha}|{texto_q}"
-        # Caja: ver boletas al instante (cache muy corto si no hay busqueda)
+        # Cache un poco mas largo: listados se revalidan al abrir modulo
         if not texto_q:
-            cached = _api_cache_get(cache_key, 6)
+            cached = _api_cache_get(cache_key, 90)
             if cached is not None:
-                return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=3", "X-Caja-Fresh": "1"})
+                return JSONResponse(cached, headers={"X-Api-Cache": "HIT", "Cache-Control": "private, max-age=30"})
         texto = f"%{texto_q}%"
         conn = get_conn()
         cur = conn.cursor()
@@ -7263,7 +9050,6 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
         SELECT
             v.id,
             v.tipo,
-            COALESCE(v.es_pase, FALSE) AS es_pase,
             v.numero,
             v.cliente AS cliente_nombre,
             COALESCE(documento_cliente, '') AS documento_cliente,
@@ -7314,7 +9100,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
                            OR LOWER(COALESCE(vd.modelo,'')) LIKE %s
                            OR LOWER(COALESCE(vd.series_texto,'')) LIKE %s)
                ))
-        ORDER BY v.id DESC
+        ORDER BY v.fecha DESC, v.id DESC
         LIMIT 800
         """, (
             DEFAULT_SUCURSAL, sucursal, filtro_fecha, filtro_fecha,
@@ -7352,7 +9138,7 @@ def listar_documentos(sucursal: str = DEFAULT_SUCURSAL, fecha: str = "", q: str 
             rows.append(row)
         if not texto_q:
             _api_cache_set(cache_key, rows)
-            return JSONResponse(rows, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=3", "X-Caja-Fresh": "1"})
+            return JSONResponse(rows, headers={"X-Api-Cache": "MISS", "Cache-Control": "private, max-age=30"})
         return rows
     except Exception as e:
         import traceback
@@ -7377,18 +9163,16 @@ def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
         SELECT
             id,
             tipo,
-            COALESCE(es_pase, FALSE) AS es_pase,
             numero,
             cliente AS cliente_nombre,
             fecha AS fecha_emision,
             COALESCE(total, 0) AS total,
             COALESCE(usuario_emisor, '') AS usuario_emisor,
             COALESCE(estado_pago, 'PAGADO') AS estado_pago,
-            COALESCE(metodo_pago, '') AS metodo_pago,
-            COALESCE(estado, 'EMITIDO') AS estado
+            COALESCE(metodo_pago, '') AS metodo_pago
         FROM ventas
         WHERE COALESCE(sucursal,%s)=%s
-          AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA','NOTA DE VENTA','PASE')
+          AND UPPER(COALESCE(tipo,'')) IN ('BOLETA','FACTURA','NOTA DE VENTA')
         ORDER BY id DESC
         LIMIT 1
         """, (DEFAULT_SUCURSAL, sucursal))
@@ -7408,30 +9192,118 @@ def ultimo_documento_caja(sucursal: str = DEFAULT_SUCURSAL):
                 pass
 
 
+def _detalle_documento_para_pdf(documento_id: int):
+    """Detalle liviano para PDF: sin base64 de comprobantes (acelera mucho)."""
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT
+            id, tipo, numero,
+            cliente AS cliente_nombre,
+            COALESCE(documento_cliente, '') AS documento_cliente,
+            COALESCE(direccion_cliente, '') AS direccion_cliente,
+            fecha AS fecha_emision,
+            COALESCE(TO_CHAR(fecha_vencimiento, 'YYYY-MM-DD'), '') AS fecha_vencimiento,
+            COALESCE(subtotal, total, 0) AS subtotal,
+            COALESCE(igv, 0) AS igv,
+            COALESCE(total, 0) AS total,
+            COALESCE(observacion, '') AS observacion,
+            COALESCE(usuario_emisor, '') AS usuario_emisor,
+            COALESCE(estado, 'EMITIDO') AS estado,
+            COALESCE(estado_pago, 'PAGADO') AS estado_pago,
+            COALESCE(metodo_pago, '') AS metodo_pago,
+            COALESCE(sucursal, %s) AS sucursal
+        FROM ventas
+        WHERE id=%s
+        LIMIT 1
+        """, (DEFAULT_SUCURSAL, documento_id))
+        documento = dict_fetchone(cur) or {}
+        if not documento:
+            return {"ok": False, "documento": {}, "detalle": []}
+        cur.execute("""
+        SELECT
+            vd.id,
+            vd.venta_id AS documento_id,
+            vd.producto_id,
+            COALESCE(vd.descripcion, p.nombre, '') AS descripcion,
+            COALESCE(vd.marca, p.marca, '') AS marca,
+            COALESCE(vd.modelo, p.modelo, '') AS modelo,
+            COALESCE(vd.series_texto, '') AS series_texto,
+            vd.cantidad,
+            vd.precio AS precio_unitario,
+            vd.total
+        FROM ventas_detalle vd
+        LEFT JOIN productos p ON p.id = vd.producto_id
+        WHERE vd.venta_id = %s
+        ORDER BY vd.id
+        """, (documento_id,))
+        detalle = [_jsonable_row(r) for r in dict_fetchall(cur)]
+        documento = _jsonable_row(documento)
+        return {"ok": True, "documento": documento, "detalle": detalle, "data": detalle}
+    except Exception:
+        return {"ok": False, "documento": {}, "detalle": []}
+    finally:
+        if conn is not None:
+            try:
+                release_conn(conn)
+            except Exception:
+                pass
+
+
 @app.get("/documentos/{documento_id}/pdf")
 def descargar_documento_pdf(documento_id: int, sucursal: str = DEFAULT_SUCURSAL, inline: bool = False):
-    detail = detalle_documento(documento_id)
+    pdf, safe_name, cache_src = _read_pdf_cache(documento_id)
+    if pdf:
+        disposition = "inline" if inline else "attachment"
+        return Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'{disposition}; filename="{safe_name}"; filename*=UTF-8\'\'{safe_name}',
+                "Content-Type": "application/pdf",
+                "Content-Length": str(len(pdf)),
+                "Cache-Control": "private, max-age=300",
+                "X-Pdf-Cache": f"HIT-{cache_src}",
+                "X-Content-Type-Options": "nosniff",
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Type, Content-Length, X-Pdf-Cache",
+            },
+        )
+
+    detail = _detalle_documento_para_pdf(documento_id)
     if not detail.get("ok"):
-        return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+        return JSONResponse({"ok": False, "success": False, "msg": "Documento no encontrado."}, status_code=404)
     documento = detail.get("documento") or {}
     detalle = detail.get("detalle") or detail.get("data") or []
     if not documento:
-        return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+        return JSONResponse({"ok": False, "success": False, "msg": "Documento no encontrado."}, status_code=404)
     try:
         cfg = cargar_config_documento_dict(sucursal or documento.get("sucursal") or DEFAULT_SUCURSAL)
         pdf = generar_pdf_documento_original(documento, detalle, cfg)
         raw_name = f"{documento_pdf_label(documento.get('tipo'))}_{documento.get('numero') or documento_id}.pdf"
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name)
+        _store_pdf_cache(documento_id, pdf, safe_name)
+        disposition = "inline" if inline else "attachment"
         return Response(
             content=pdf,
             media_type="application/pdf",
             headers={
-                "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{safe_name}"',
-                "Cache-Control": "no-store",
+                "Content-Disposition": f'{disposition}; filename="{safe_name}"; filename*=UTF-8\'\'{safe_name}',
+                "Content-Type": "application/pdf",
+                "Content-Length": str(len(pdf)),
+                "Cache-Control": "private, max-age=300",
+                "X-Pdf-Cache": "MISS",
+                "X-Content-Type-Options": "nosniff",
+                "Accept-Ranges": "bytes",
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Type, Content-Length, X-Pdf-Cache",
             },
         )
     except Exception as e:
-        return {"ok": False, "success": False, "msg": f"No se pudo generar PDF: {e}"}
+        return JSONResponse(
+            {"ok": False, "success": False, "msg": f"No se pudo generar PDF: {e}"},
+            status_code=500,
+        )
 
 
 @app.post("/documentos/preview/pdf")
@@ -7566,7 +9438,6 @@ def actualizar_observacion_interna_documento(documento_id: int, data: DocumentoO
         VALUES (%s,%s,%s,%s,%s)
         """, (data.usuario or "", "", sucursal, "OBSERVACION INTERNA DOCUMENTO", f"{row.get('tipo')} {row.get('numero')} - {observacion}"))
         conn.commit()
-        invalidate_api_cache("documentos|")
         release_conn(conn)
         return {"ok": True, "success": True, **row}
     except Exception as e:
@@ -7576,9 +9447,23 @@ def actualizar_observacion_interna_documento(documento_id: int, data: DocumentoO
 
 
 @app.get("/documentos/{documento_id}")
-def detalle_documento(documento_id: int):
+def detalle_documento(documento_id: int, lite: bool = False):
     conn = None
     try:
+        # Vista/PDF no necesitan base64 de comprobantes de pago (puede pesar MB)
+        if lite:
+            out = _detalle_documento_para_pdf(documento_id)
+            if not out.get("ok"):
+                return {"ok": False, "success": False, "data": [], "detalle": []}
+            return {
+                "ok": True,
+                "success": True,
+                "documento": out.get("documento") or {},
+                "data": out.get("detalle") or [],
+                "detalle": out.get("detalle") or [],
+                "lite": True,
+            }
+
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS observacion_interna TEXT DEFAULT ''")
@@ -7897,49 +9782,133 @@ def actualizar_documento_patch(documento_id: int, data: dict, sucursal: str = DE
 
 @app.put("/documentos/detalle/{detalle_id}/series")
 def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleSeriesUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    """Solo Giomar puede cambiar/agregar series en boletas/facturas ya procesadas. Queda en Registro."""
     conn = get_conn()
     cur = conn.cursor()
     try:
         sucursal = norm_sucursal(sucursal)
-        if not usuario_puede_editar_documento({"usuario": getattr(data, "usuario", "")}):
+        usuario = str(getattr(data, "usuario", "") or "").strip()
+        if not usuario_puede_editar_documento({"usuario": usuario}):
             release_conn(conn)
-            return {"ok": False, "msg": "Solo Giomar puede cambiar series de boletas ya procesadas."}
+            return {"ok": False, "msg": "Solo Giomar puede cambiar o agregar series de boletas/facturas ya procesadas."}
         series_texto = (data.series_texto or "").strip()
         cur.execute("""
-        UPDATE ventas_detalle
-        SET series_texto=%s
+        SELECT id, venta_id, producto_id, COALESCE(series_texto,''), COALESCE(descripcion,'')
+        FROM ventas_detalle
         WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        RETURNING id, venta_id, producto_id
-        """, (series_texto, detalle_id, DEFAULT_SUCURSAL, sucursal))
+        """, (detalle_id, DEFAULT_SUCURSAL, sucursal))
         row = cur.fetchone()
         if not row:
             release_conn(conn)
             return {"ok": False, "msg": "Detalle no encontrado"}
 
-        _, venta_id, producto_id = row
-        cur.execute("SELECT tipo, numero FROM ventas WHERE id=%s", (venta_id,))
-        doc = cur.fetchone() or ("DOCUMENTO", str(venta_id))
-        doc_ref = f"{doc[0]} {doc[1]}"
+        det_id, venta_id, producto_id, series_antes, descripcion = row
+        cur.execute("""
+        SELECT tipo, numero, COALESCE(estado,'EMITIDO'), COALESCE(sucursal,%s)
+        FROM ventas WHERE id=%s
+        """, (DEFAULT_SUCURSAL, venta_id))
+        doc = cur.fetchone()
+        if not doc:
+            release_conn(conn)
+            return {"ok": False, "msg": "Documento no encontrado"}
+        tipo_doc, numero_doc, estado_doc, sucursal_doc = doc
+        tipo_u = str(tipo_doc or "").upper()
+        if str(estado_doc or "").upper() == "ANULADO":
+            release_conn(conn)
+            return {"ok": False, "msg": "No se pueden editar series de un documento anulado."}
+        if tipo_u not in STOCK_DOC_TYPES and tipo_u not in ("BOLETA", "FACTURA", "PASE", "NOTA DE VENTA"):
+            # permitir en proformas? no: solo documentos de venta procesados
+            pass
+        inv = inventario_sucursal(sucursal_doc or sucursal)
+        doc_ref = f"{tipo_doc} {numero_doc}"
+        series_old = split_series_text(series_antes)
+        series_new = split_series_text(series_texto)
+        set_old = set(series_old)
+        set_new = set(series_new)
 
-        series = split_series_text(series_texto)
-        for serie in series:
+        # 1) Liberar series quitadas
+        liberadas = []
+        for serie in sorted(set_old - set_new):
+            cur.execute("""
+            UPDATE producto_series
+            SET estado='DISPONIBLE', fecha_salida=NULL,
+                almacen=CASE WHEN UPPER(TRIM(COALESCE(almacen,''))) IN ('','VENTA','VENDIDO') THEN 'TIENDA' ELSE COALESCE(almacen,'TIENDA') END
+            WHERE COALESCE(sucursal,%s)=%s
+              AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
+            RETURNING id
+            """, (DEFAULT_SUCURSAL, inv, serie))
+            if cur.fetchone():
+                liberadas.append(serie)
+
+        # 2) Marcar series nuevas/actuales como VENDIDO
+        marcadas = []
+        for serie in series_new:
             cur.execute("""
             UPDATE producto_series
             SET estado='VENDIDO',
                 fecha_salida=COALESCE(fecha_salida, TO_CHAR((timezone('America/Lima', now()))::date, 'YYYY-MM-DD'))
-            WHERE regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
-              AND producto_id=%s
-              AND COALESCE(sucursal,%s)=%s
-            """, (serie, producto_id, DEFAULT_SUCURSAL, sucursal))
+            WHERE COALESCE(sucursal,%s)=%s
+              AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
+              AND (%s IS NULL OR producto_id=%s OR producto_id IS NULL)
+            RETURNING id, producto_id
+            """, (DEFAULT_SUCURSAL, inv, serie, producto_id, producto_id))
+            r = cur.fetchone()
+            if r:
+                marcadas.append(serie)
+                if r[1] and not producto_id:
+                    producto_id = r[1]
 
+        cur.execute("""
+        UPDATE ventas_detalle
+        SET series_texto=%s
+        WHERE id=%s
+        """, (series_texto, detalle_id))
+
+        if producto_id:
+            sync_producto_stock_from_series(cur, producto_id, inv)
+
+        agregadas = sorted(set_new - set_old)
+        quitadas = sorted(set_old - set_new)
+        detalle_audit = (
+            f"{doc_ref} | producto={descripcion or producto_id or '-'} | "
+            f"ANTES=[{_resumen_lista_auditoria(series_old)}] | "
+            f"DESPUES=[{_resumen_lista_auditoria(series_new)}] | "
+            f"agrego={agregadas or '-'} | quito={quitadas or '-'} | "
+            f"usuario={usuario or 'GIOMAR'}"
+        )
         cur.execute("""
         INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
         VALUES (%s,%s,%s,%s,%s)
-        """, (data.usuario or "", "", sucursal, "SERIES DOCUMENTO ACTUALIZADAS", f"{doc_ref} - {series_texto}"))
+        """, (
+            usuario or "giomar",
+            "ADMIN",
+            sucursal_doc or sucursal,
+            "BOLETA SERIES EDITADAS",
+            detalle_audit,
+        ))
+        # Nota interna del documento
+        stamp = lima_now().strftime("%Y-%m-%d %H:%M")
+        nota = f"[{stamp}] SERIES: {usuario or 'giomar'} cambio series del item {descripcion or det_id}. +{agregadas or []} -{quitadas or []}"
+        cur.execute("""
+        UPDATE ventas
+        SET observacion_interna=TRIM(COALESCE(observacion_interna,'') || CASE WHEN COALESCE(observacion_interna,'')='' THEN '' ELSE E'\n' END || %s)
+        WHERE id=%s
+        """, (nota, venta_id))
 
         conn.commit()
         release_conn(conn)
-        return {"ok": True, "success": True, "id": detalle_id, "series_texto": series_texto}
+        invalidate_productos_cache(sucursal_doc or sucursal)
+        invalidate_api_cache("series|")
+        invalidate_api_cache("documentos|")
+        return {
+            "ok": True,
+            "success": True,
+            "id": detalle_id,
+            "series_texto": series_texto,
+            "agregadas": agregadas,
+            "quitadas": quitadas,
+            "msg": f"Series actualizadas en {doc_ref}. Registro guardado.",
+        }
     except Exception as e:
         conn.rollback()
         release_conn(conn)
@@ -7947,6 +9916,7 @@ def actualizar_series_detalle_documento(detalle_id: int, data: DocumentoDetalleS
 
 
 def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
+    """Devuelve series a DISPONIBLE y recalcula stock al anular/eliminar boleta-factura-pase."""
     sucursal_stock = inventario_sucursal(sucursal)
     cur.execute("""
     SELECT producto_id, COALESCE(cantidad, 0), COALESCE(series_texto, '')
@@ -7955,36 +9925,97 @@ def restaurar_stock_documento(cur, documento_id, tipo, sucursal):
     """, (documento_id,))
     detalles = cur.fetchall()
     touched = set()
-    if str(tipo or "").upper() in STOCK_DOC_TYPES:
-        for producto_id, cantidad, series_texto in detalles:
-            series = split_series_text(series_texto)
-            if series:
+    series_restauradas = 0
+    series_no_encontradas = []
+    if str(tipo or "").upper() not in STOCK_DOC_TYPES:
+        return {
+            "series_restauradas": 0,
+            "series_no_encontradas": [],
+            "productos": [],
+        }
+
+    for producto_id, cantidad, series_texto in detalles:
+        try:
+            producto_id = int(producto_id or 0) or None
+        except (TypeError, ValueError):
+            producto_id = None
+        series = split_series_text(series_texto)
+        # Fallback: tokens crudos si el texto trae basura rara
+        if not series and str(series_texto or "").strip():
+            for tok in re.split(r"[,;\n\r|]+", str(series_texto or "")):
+                key = normalize_serie_key(tok)
+                if key:
+                    series.append(key)
+        # Unicos conservando orden
+        seen = set()
+        series = [s for s in series if not (s in seen or seen.add(s))]
+
+        if series:
+            for serie in series:
+                # 1) por clave normalizada (preferido)
                 cur.execute("""
                 UPDATE producto_series
-                SET estado='DISPONIBLE', fecha_salida=NULL
+                SET estado='DISPONIBLE',
+                    fecha_salida=NULL,
+                    almacen=CASE
+                        WHEN UPPER(TRIM(COALESCE(almacen,''))) IN ('', 'VENTA', 'VENDIDO') THEN 'TIENDA'
+                        ELSE COALESCE(almacen, 'TIENDA')
+                    END
                 WHERE COALESCE(sucursal,%s)=%s
-                  AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
-                """, (DEFAULT_SUCURSAL, sucursal_stock, series))
-                cur.execute("""
-                SELECT DISTINCT producto_id
-                FROM producto_series
-                WHERE COALESCE(sucursal,%s)=%s
-                  AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=ANY(%s)
-                  AND producto_id IS NOT NULL
-                """, (DEFAULT_SUCURSAL, sucursal_stock, series))
-                for prow in cur.fetchall():
-                    if prow and prow[0]:
-                        touched.add(prow[0])
+                  AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
+                RETURNING id, producto_id, UPPER(COALESCE(estado,''))
+                """, (DEFAULT_SUCURSAL, sucursal_stock, serie))
+                rows = cur.fetchall() or []
+                if not rows:
+                    # 2) por serie exacta (case-insensitive) por si el key no matchea
+                    cur.execute("""
+                    UPDATE producto_series
+                    SET estado='DISPONIBLE',
+                        fecha_salida=NULL,
+                        almacen=CASE
+                            WHEN UPPER(TRIM(COALESCE(almacen,''))) IN ('', 'VENTA', 'VENDIDO') THEN 'TIENDA'
+                            ELSE COALESCE(almacen, 'TIENDA')
+                        END
+                    WHERE COALESCE(sucursal,%s)=%s
+                      AND UPPER(TRIM(COALESCE(serie,'')))=%s
+                    RETURNING id, producto_id, UPPER(COALESCE(estado,''))
+                    """, (DEFAULT_SUCURSAL, sucursal_stock, serie))
+                    rows = cur.fetchall() or []
+                if not rows and producto_id:
+                    # 3) acotado al producto del detalle
+                    cur.execute("""
+                    UPDATE producto_series
+                    SET estado='DISPONIBLE', fecha_salida=NULL
+                    WHERE producto_id=%s
+                      AND COALESCE(sucursal,%s)=%s
+                      AND regexp_replace(UPPER(COALESCE(serie,'')), '[^A-Z0-9]', '', 'g')=%s
+                    RETURNING id, producto_id, UPPER(COALESCE(estado,''))
+                    """, (producto_id, DEFAULT_SUCURSAL, sucursal_stock, serie))
+                    rows = cur.fetchall() or []
+                if rows:
+                    series_restauradas += len(rows)
+                    for prow in rows:
+                        if prow and prow[1]:
+                            touched.add(int(prow[1]))
+                else:
+                    series_no_encontradas.append(serie)
                 if producto_id:
                     touched.add(producto_id)
-            elif producto_id:
-                cur.execute("""
-                UPDATE productos
-                SET stock = COALESCE(stock, 0) + %s
-                WHERE id = %s AND COALESCE(sucursal,%s)=%s
-                """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal_stock))
-        for producto_id in touched:
-            sync_producto_stock_from_series(cur, producto_id, sucursal_stock)
+        elif producto_id:
+            cur.execute("""
+            UPDATE productos
+            SET stock = COALESCE(stock, 0) + %s
+            WHERE id = %s AND COALESCE(sucursal,%s)=%s
+            """, (cantidad or 0, producto_id, DEFAULT_SUCURSAL, sucursal_stock))
+            touched.add(producto_id)
+
+    for producto_id in list(touched):
+        sync_producto_stock_from_series(cur, producto_id, sucursal_stock)
+    return {
+        "series_restauradas": series_restauradas,
+        "series_no_encontradas": series_no_encontradas,
+        "productos": list(touched),
+    }
 
 
 @app.post("/documentos/{documento_id}/anular")
@@ -8010,7 +10041,9 @@ def anular_documento(documento_id: int, data: dict = None, sucursal: str = DEFAU
             release_conn(conn)
             return {"ok": False, "success": False, "msg": f"{tipo} {numero} ya esta anulado."}
 
-        restaurar_stock_documento(cur, documento_id, tipo, sucursal)
+        restore_info = restaurar_stock_documento(cur, documento_id, tipo, sucursal) or {}
+        series_ok = int(restore_info.get("series_restauradas") or 0)
+        series_miss = list(restore_info.get("series_no_encontradas") or [])
         cur.execute("""
         UPDATE ventas
         SET estado='ANULADO',
@@ -8023,16 +10056,36 @@ def anular_documento(documento_id: int, data: dict = None, sucursal: str = DEFAU
             observacion=TRIM(COALESCE(observacion,'') || CASE WHEN COALESCE(observacion,'')='' THEN '' ELSE E'\n' END || %s)
         WHERE documento_tipo=%s AND documento_numero=%s AND COALESCE(sucursal,%s)=%s
         """, (f"ANULADO por {usuario or 'SISTEMA'}: {motivo}", tipo, numero, DEFAULT_SUCURSAL, sucursal))
+        detalle_aud = f"{tipo} {numero} - {motivo} | series_restauradas={series_ok}"
+        if series_miss:
+            detalle_aud += f" | no_encontradas={','.join(series_miss[:12])}"
         cur.execute("""
         INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
         VALUES (%s,'',%s,'DOCUMENTO ANULADO',%s)
-        """, (usuario, sucursal, f"{tipo} {numero} - {motivo}"))
+        """, (usuario, sucursal, detalle_aud))
         conn.commit()
+        release_conn(conn)
+        # Critico: si no se invalida, la UI sigue mostrando series VENDIDO por cache
+        invalidate_productos_cache(sucursal)
         invalidate_api_cache("documentos|")
         invalidate_api_cache("caja|")
-        invalidate_productos_cache()
-        release_conn(conn)
-        return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero, "msg": f"{tipo} {numero} anulado. Stock restaurado."}
+        invalidate_api_cache("series|")
+        msg = f"{tipo} {numero} anulado. Stock restaurado"
+        if series_ok:
+            msg += f" ({series_ok} serie(s) a DISPONIBLE)"
+        if series_miss:
+            msg += f". Aviso: {len(series_miss)} serie(s) no halladas en inventario"
+        msg += "."
+        return {
+            "ok": True,
+            "success": True,
+            "id": documento_id,
+            "tipo": tipo,
+            "numero": numero,
+            "series_restauradas": series_ok,
+            "series_no_encontradas": series_miss,
+            "msg": msg,
+        }
     except Exception as e:
         conn.rollback()
         release_conn(conn)
@@ -8063,9 +10116,6 @@ def eliminar_documento(documento_id: int, sucursal: str = DEFAULT_SUCURSAL):
         cur.execute("DELETE FROM ventas WHERE id=%s", (documento_id,))
 
         conn.commit()
-        invalidate_api_cache("documentos|")
-        invalidate_api_cache("caja|")
-        invalidate_productos_cache()
         release_conn(conn)
         return {"ok": True, "success": True, "id": documento_id, "tipo": tipo, "numero": numero}
     except Exception as e:
@@ -8197,6 +10247,113 @@ def transferir_stock(data: StockTransferencia):
         return {"ok": False, "msg": str(e)}
 
 
+@app.put("/documentos/{documento_id}/comprobantes")
+def subir_comprobantes_pago_documento(documento_id: int, data: ComprobantesPagoUpdate, sucursal: str = DEFAULT_SUCURSAL):
+    """Adjuntar imagen/PDF de pago. Disponible para TODOS los asesores (sin permiso especial)."""
+    conn = None
+    try:
+        sucursal = norm_sucursal(data.sucursal or sucursal)
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, COALESCE(comprobantes_pago_json,''), COALESCE(comprobante_pago_base64,''),
+                   COALESCE(comprobante_pago_data_url,''), COALESCE(comprobante_pago_nombre,'')
+            FROM ventas
+            WHERE id=%s AND COALESCE(sucursal,%s)=%s
+            LIMIT 1
+        """, (documento_id, DEFAULT_SUCURSAL, sucursal))
+        row = cur.fetchone()
+        if not row:
+            # Reintento sin filtrar sucursal (asesores en otra sucursal / default viejo)
+            cur.execute("""
+                SELECT id, COALESCE(comprobantes_pago_json,''), COALESCE(comprobante_pago_base64,''),
+                       COALESCE(comprobante_pago_data_url,''), COALESCE(comprobante_pago_nombre,''),
+                       COALESCE(sucursal,%s)
+                FROM ventas WHERE id=%s LIMIT 1
+            """, (DEFAULT_SUCURSAL, documento_id))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "success": False, "msg": "Documento no encontrado."}
+            sucursal = norm_sucursal(row[5] if len(row) > 5 else sucursal)
+        existentes = row[1] or ""
+        if not existentes and (row[2] or row[3]):
+            # Migrar legacy a json para no perder el comprobante viejo al agregar
+            legacy = {
+                "comprobante_pago_nombre": row[4] or "comprobante",
+                "comprobante_pago_base64": row[2] or "",
+                "comprobante_pago_data_url": row[3] or "",
+            }
+            existentes = json.dumps([legacy], ensure_ascii=False)
+        try:
+            comprobantes, comprobante, comprobantes_json = normalizar_comprobantes_pago(data, existentes)
+        except ValueError as e:
+            return {"ok": False, "success": False, "msg": str(e)}
+        if not comprobantes_json and not (comprobante.get("comprobante_pago_base64") or comprobante.get("comprobante_pago_data_url")):
+            return {"ok": False, "success": False, "msg": "No se recibio ninguna imagen/PDF de comprobante."}
+        cur.execute("""
+            UPDATE ventas
+            SET comprobante_pago=COALESCE(%s, comprobante_pago, ''),
+                comprobante_pago_nombre=COALESCE(%s, comprobante_pago_nombre, ''),
+                comprobante_pago_mime=COALESCE(%s, comprobante_pago_mime, ''),
+                comprobante_pago_tamano=COALESCE(%s, comprobante_pago_tamano, 0),
+                comprobante_pago_base64=COALESCE(%s, comprobante_pago_base64, ''),
+                comprobante_pago_data_url=COALESCE(%s, comprobante_pago_data_url, ''),
+                comprobantes_pago_json=COALESCE(%s, comprobantes_pago_json, '')
+            WHERE id=%s
+            RETURNING id
+        """, (
+            comprobante.get("comprobante_pago"),
+            comprobante.get("comprobante_pago_nombre"),
+            comprobante.get("comprobante_pago_mime"),
+            comprobante.get("comprobante_pago_tamano"),
+            comprobante.get("comprobante_pago_base64"),
+            comprobante.get("comprobante_pago_data_url"),
+            comprobantes_json,
+            documento_id,
+        ))
+        if not cur.fetchone():
+            return {"ok": False, "success": False, "msg": "No se pudo guardar el comprobante."}
+        try:
+            usuario = str(data.usuario or "").strip() or "CAJA"
+            cur.execute("""
+                INSERT INTO auditoria (usuario, rol, empresa, accion, detalle)
+                VALUES (%s,%s,%s,%s,%s)
+            """, (
+                usuario, "", sucursal, "COMPROBANTE PAGO",
+                f"Documento #{documento_id} · {len(comprobantes or [])} archivo(s)",
+            ))
+        except Exception:
+            pass
+        conn.commit()
+        invalidate_api_cache("documentos|")
+        invalidate_api_cache("caja|")
+        count = len(comprobantes or [])
+        return {
+            "ok": True,
+            "success": True,
+            "id": documento_id,
+            "msg": f"Comprobante guardado ({count}).",
+            "tiene_comprobante": True,
+            "comprobantes_pago_count": count,
+            "comprobantes_pago": [
+                x for x in (comprobante_metadata_liviana(c) for c in (comprobantes or [])) if x
+            ],
+        }
+    except Exception as e:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "success": False, "msg": f"No se pudo subir comprobante: {e}"}
+    finally:
+        if conn is not None:
+            try:
+                release_conn(conn)
+            except Exception:
+                pass
+
+
 @app.put("/documentos/{documento_id}/estado-pago")
 def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, sucursal: str = DEFAULT_SUCURSAL):
     conn = get_conn()
@@ -8209,11 +10366,20 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
 
         metodo_pago = data.metodo_pago.upper() if data.metodo_pago else None
         cur.execute("""
-            SELECT COALESCE(total,0), COALESCE(comprobantes_pago_json,'')
+            SELECT COALESCE(total,0), COALESCE(comprobantes_pago_json,''), COALESCE(sucursal,%s)
             FROM ventas
             WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        """, (documento_id, DEFAULT_SUCURSAL, sucursal))
+        """, (DEFAULT_SUCURSAL, documento_id, DEFAULT_SUCURSAL, sucursal))
         total_row = cur.fetchone()
+        if not total_row:
+            # Algunos asesores envian sucursal distinta; buscar por id
+            cur.execute("""
+                SELECT COALESCE(total,0), COALESCE(comprobantes_pago_json,''), COALESCE(sucursal,%s)
+                FROM ventas WHERE id=%s LIMIT 1
+            """, (DEFAULT_SUCURSAL, documento_id))
+            total_row = cur.fetchone()
+            if total_row:
+                sucursal = norm_sucursal(total_row[2] or sucursal)
         total_doc = float(total_row[0] or 0) if total_row else 0.0
         comprobantes_existentes = total_row[1] if total_row else ""
         pagos_detalle, pagos_total, metodo_resumen, pagos_detalle_json = normalizar_pagos_detalle(data.pagos_detalle, metodo_pago, data.monto_pagado)
@@ -8249,7 +10415,7 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             comprobante_pago_base64=COALESCE(%s, comprobante_pago_base64, ''),
             comprobante_pago_data_url=COALESCE(%s, comprobante_pago_data_url, ''),
             comprobantes_pago_json=COALESCE(%s, comprobantes_pago_json, '')
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
+        WHERE id=%s
         RETURNING id, tipo, numero, cliente, total, usuario_emisor, COALESCE(metodo_pago, ''), COALESCE(sucursal,%s), COALESCE(monto_pagado,0), COALESCE(saldo_pago,0), COALESCE(pagos_detalle_json,''),
                   COALESCE(comprobante_pago,''), COALESCE(comprobante_pago_nombre,''), COALESCE(comprobante_pago_mime,''), COALESCE(comprobante_pago_tamano,0),
                   COALESCE(comprobante_pago_base64,''), COALESCE(comprobante_pago_data_url,''), COALESCE(comprobantes_pago_json,'')
@@ -8257,7 +10423,7 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             estado_pago, metodo_pago, monto_pagado, pagos_detalle_json, saldo_pago, data.observacion_pago or "",
             comprobante["comprobante_pago"], comprobante["comprobante_pago_nombre"], comprobante["comprobante_pago_mime"],
             comprobante["comprobante_pago_tamano"], comprobante["comprobante_pago_base64"], comprobante["comprobante_pago_data_url"], comprobantes_json,
-            documento_id, DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL
+            documento_id, DEFAULT_SUCURSAL
         ))
         row = cur.fetchone()
         if not row:
@@ -8291,9 +10457,10 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             ))
 
         conn.commit()
+        release_conn(conn)
+        # Critico: sin esto la caja sigue mostrando estado/comprobante viejo por cache 90s
         invalidate_api_cache("documentos|")
         invalidate_api_cache("caja|")
-        release_conn(conn)
         return {
             "ok": True,
             "success": True,
@@ -8312,6 +10479,8 @@ def actualizar_estado_pago_documento(documento_id: int, data: EstadoPagoUpdate, 
             "comprobante_pago_data_url": comprobante_data_url_db,
             "comprobantes_pago": cargar_comprobantes_json(comprobantes_json_db),
             "comprobantes_pago_json": comprobantes_json_db,
+            "tiene_comprobante": bool(comprobantes_json_db or comprobante_pago_db or comprobante_base64_db or comprobante_data_url_db),
+            "comprobantes_pago_count": len(cargar_comprobantes_json(comprobantes_json_db) or ([] if not (comprobante_base64_db or comprobante_data_url_db) else [1])),
         }
     except ValueError as e:
         conn.rollback()
@@ -9677,18 +11846,24 @@ def registrar_caja(data: CajaMovimiento):
 
 # ================= COMPRAS / PROVEEDORES =================
 @app.get("/proveedores")
-def listar_proveedores(sucursal: str = DEFAULT_SUCURSAL):
+def listar_proveedores(sucursal: str = DEFAULT_SUCURSAL, q: str = ""):
     conn = get_conn()
     cur = conn.cursor()
     sucursal = norm_sucursal(sucursal)
+    texto = f"%{(q or '').strip().lower()}%"
     cur.execute("""
     SELECT id, nombre, COALESCE(ruc,'') AS ruc, COALESCE(telefono,'') AS telefono,
            COALESCE(direccion,'') AS direccion, COALESCE(sucursal,%s) AS sucursal,
            creado_en
     FROM proveedores
     WHERE COALESCE(sucursal,%s)=%s
+      AND (%s='%%'
+           OR LOWER(COALESCE(nombre,'')) LIKE %s
+           OR LOWER(COALESCE(ruc,'')) LIKE %s
+           OR LOWER(COALESCE(telefono,'')) LIKE %s
+           OR LOWER(COALESCE(direccion,'')) LIKE %s)
     ORDER BY nombre ASC, id DESC
-    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal))
+    """, (DEFAULT_SUCURSAL, DEFAULT_SUCURSAL, sucursal, texto, texto, texto, texto, texto))
     data = [_jsonable_row(r) for r in dict_fetchall(cur)]
     release_conn(conn)
     return data
@@ -9851,7 +12026,7 @@ def guardar_compra(data: Compra):
             "usuario": data.usuario or data.usuario_registro,
             "usuario_registro": data.usuario_registro or data.usuario,
         }):
-            return {"ok": False, "msg": "Solo giomar, mily y tiffco pueden ingresar series en compras."}
+            return {"ok": False, "msg": "Tu usuario no tiene acceso a series en compras."}
 
         if proveedor:
             cur.execute("""
@@ -10414,12 +12589,31 @@ def woo_payload_from_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
 
 def woo_upsert_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
     sku, payload = woo_payload_from_erp_product(p, sucursal=sucursal)
-    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
-    if not found.get("ok"):
-        return found
-    existing = found.get("data") or []
-    if existing:
-        r = woo_request("put", f"products/{existing[0]['id']}", sucursal=sucursal, json=payload)
+    existing_item = None
+
+    woo_id = int(p.get("woo_id") or 0)
+    if woo_id > 0:
+        detail = woo_request("get", f"products/{woo_id}", sucursal=sucursal)
+        if detail.get("ok") and isinstance(detail.get("data"), dict) and detail["data"].get("id"):
+            existing_item = detail["data"]
+
+    if not existing_item and sku:
+        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
+        if not found.get("ok"):
+            return found
+        existing = found.get("data") or []
+        if existing:
+            existing_item = existing[0]
+
+    if not existing_item:
+        query_name = str(p.get("nombre_web") or p.get("nombre") or "").strip()
+        if query_name:
+            found_name = _woo_find_product_by_name(query_name, sucursal=sucursal)
+            if found_name.get("ok") and float(found_name.get("score") or 0) >= 0.9:
+                existing_item = found_name.get("data") or {}
+
+    if existing_item and existing_item.get("id"):
+        r = woo_request("put", f"products/{existing_item['id']}", sucursal=sucursal, json=payload)
         action = "actualizado"
     else:
         r = woo_request("post", "products", sucursal=sucursal, json=payload)
@@ -10432,24 +12626,7 @@ def woo_upsert_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
 
 
 def woo_create_new_erp_product(p: dict, sucursal: str = DEFAULT_SUCURSAL):
-    sku, payload = woo_payload_from_erp_product(p, sucursal=sucursal)
-    found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
-    if not found.get("ok"):
-        return found
-    existing = found.get("data") or []
-    if existing:
-        r = woo_request("put", f"products/{existing[0]['id']}", sucursal=sucursal, json=payload)
-        if not r.get("ok"):
-            return r
-        woo_data = r.get("data", {}) or {}
-        woo_save_product_link(p.get("id"), woo_data, sku, sucursal=sucursal)
-        return {"ok": True, "action": "actualizado", "sku": sku, "data": woo_data}
-    r = woo_request("post", "products", sucursal=sucursal, json=payload)
-    if not r.get("ok"):
-        return r
-    woo_data = r.get("data", {}) or {}
-    woo_save_product_link(p.get("id"), woo_data, sku, sucursal=sucursal)
-    return {"ok": True, "action": "creado", "sku": sku, "data": woo_data}
+    return woo_upsert_erp_product(p, sucursal=sucursal)
 
 
 def _erp_stock_select_sql(alias="p"):
@@ -10491,7 +12668,13 @@ def _woo_find_product_by_sku(sku, sucursal: str = DEFAULT_SUCURSAL):
     if not items:
         return {"ok": False, "msg": f"No existe producto WooCommerce con SKU {sku}."}
     item = items[0]
-    return {"ok": True, "sku": sku, "woo_id": int(item.get("id") or 0), "data": item}
+    return {
+        "ok": True,
+        "sku": sku,
+        "woo_id": int(item.get("id") or 0),
+        "nombre_web": str(item.get("name") or "").strip(),
+        "data": item,
+    }
 
 
 def _woo_find_product_by_name(nombre, sucursal: str = DEFAULT_SUCURSAL):
@@ -10544,17 +12727,17 @@ def woo_sync_fields_for_product(
     web = None
     if sku:
         web = _woo_find_product_by_sku(sku, sucursal=sucursal)
-    elif match_mode in ("name", "nombre", "auto") and (p.get("nombre_web") or p.get("nombre")):
-        web = _woo_find_product_by_name(p.get("nombre_web") or p.get("nombre"), sucursal=sucursal)
-        if web.get("ok"):
-            sku = str(web.get("sku") or "").strip().upper()
-            woo_id = int(web.get("woo_id") or 0)
-    elif woo_id > 0:
+    if (not web or not web.get("ok")) and woo_id > 0:
         detail = woo_request("get", f"products/{woo_id}", sucursal=sucursal)
         if detail.get("ok"):
             item = detail.get("data") or {}
             sku = str(item.get("sku") or sku).strip().upper()
             web = {"ok": True, "sku": sku, "woo_id": woo_id, "data": item}
+    if (not web or not web.get("ok")) and match_mode in ("name", "nombre", "auto") and (p.get("nombre_web") or p.get("nombre")):
+        web = _woo_find_product_by_name(p.get("nombre_web") or p.get("nombre"), sucursal=sucursal)
+        if web.get("ok"):
+            sku = str(web.get("sku") or "").strip().upper()
+            woo_id = int(web.get("woo_id") or 0)
     if not web or not web.get("ok"):
         return web or {"ok": False, "msg": "Asigna un SKU web o activa coincidencia por nombre."}
     woo_id = int(web.get("woo_id") or woo_id or 0)
@@ -10649,6 +12832,49 @@ def maybe_sync_updated_product_to_woo(producto_id: int, sucursal: str = DEFAULT_
         "woo_id": (r.get("data") or {}).get("id"),
         "msg": f"Producto {action} en WooCommerce.",
     }
+
+
+def auto_push_linked_product_to_web(producto_id: int, sucursal: str = DEFAULT_SUCURSAL, force: bool = False):
+    """Si el producto tiene SKU/woo_id y auto-sync esta activo, sube precio+nombre+stock a la web.
+    No crea productos nuevos: solo actualiza los ya vinculados. force=True ignora el flag de config.
+    """
+    sucursal = norm_sucursal(sucursal)
+    if not woo_config(sucursal):
+        return {"ok": False, "skipped": True, "msg": "WooCommerce no configurado."}
+    if not force and not woo_auto_sync_enabled(sucursal):
+        return {"ok": False, "skipped": True, "msg": "Auto-sync web desactivado en modulo Web."}
+    conn = get_conn()
+    cur = conn.cursor()
+    p = _erp_product_for_woo_sync(cur, producto_id, sucursal)
+    release_conn(conn)
+    if not p:
+        return {"ok": False, "skipped": True, "msg": "Producto ERP no encontrado."}
+    sku = str(p.get("sku_woo") or "").strip().upper()
+    woo_id = int(p.get("woo_id") or 0)
+    if not sku and woo_id <= 0:
+        return {"ok": False, "skipped": True, "msg": "Sin SKU ni vinculo web: no se auto-sincroniza."}
+    r = woo_sync_fields_for_product(
+        p,
+        sucursal=sucursal,
+        sync_stock=True,
+        sync_price=True,
+        sync_name=True,
+        sync_image=False,
+        match_by="sku" if sku else "name",
+    )
+    if r.get("ok"):
+        r["synced"] = True
+        r["auto"] = True
+    return r
+
+
+def woo_write_sku_on_web_product(woo_id: int, sku: str, sucursal: str = DEFAULT_SUCURSAL):
+    """Escribe el SKU en el producto de WooCommerce (si el ID existe)."""
+    woo_id = int(woo_id or 0)
+    sku = str(sku or "").strip().upper()
+    if woo_id <= 0 or not sku:
+        return {"ok": False, "msg": "woo_id y sku requeridos."}
+    return woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"sku": sku})
 
 
 def woo_apply_web_categories_to_erp(sucursal: str = DEFAULT_SUCURSAL, limit: int = 500):
@@ -10958,11 +13184,38 @@ def guardar_web_config(data: dict, sucursal: str = DEFAULT_SUCURSAL):
 
 
 @app.get("/web/woocommerce/categories")
-def woo_categories(parent_id: int = None, tree: bool = False, sucursal: str = DEFAULT_SUCURSAL):
+def woo_categories(
+    parent_id: int = None,
+    tree: bool = False,
+    sucursal: str = DEFAULT_SUCURSAL,
+    force: bool = False,
+):
+    """Categorias WooCommerce. Cache de servidor ~10 min para no golpear la web cada vez."""
     sucursal = norm_sucursal(sucursal)
-    if tree:
-        return woo_categories_tree(sucursal=sucursal)
-    return woo_list_categories(sucursal=sucursal, parent_id=parent_id)
+    cache_key = f"woo_cats|{sucursal}|tree={1 if tree else 0}|parent={parent_id if parent_id is not None else 'all'}"
+    if not force:
+        cached = _api_cache_get(cache_key, 600)
+        if cached is not None:
+            if isinstance(cached, dict):
+                out = dict(cached)
+                out["cached"] = True
+                out["count"] = len(out.get("data") or [])
+                return out
+            return cached
+    try:
+        if tree:
+            result = woo_categories_tree(sucursal=sucursal)
+        else:
+            result = woo_list_categories(sucursal=sucursal, parent_id=parent_id)
+    except Exception as exc:
+        return {"ok": False, "msg": f"Error al leer categorias de la web: {exc}", "data": []}
+    if isinstance(result, dict) and result.get("ok"):
+        result = {**result, "count": len(result.get("data") or [])}
+        _api_cache_set(cache_key, result)
+        return result
+    if isinstance(result, dict):
+        return {**result, "data": result.get("data") or [], "count": 0}
+    return {"ok": False, "msg": "Respuesta invalida de WooCommerce", "data": []}
 
 
 @app.post("/web/woocommerce/apply-categories-to-erp")
@@ -11059,164 +13312,16 @@ def woo_upload_product_image(producto_id: int, sucursal: str = DEFAULT_SUCURSAL)
         if found.get("ok") and (found.get("data") or []):
             woo_id = int(found["data"][0].get("id") or 0)
     if not woo_id:
-        return {"ok": False, "msg": "Primero sincroniza el producto con WooCommerce (SKU/web)."}
+        return {"ok": False, "msg": "Primero sincroniza el producto con WooCommerce."}
     updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"images": [{"src": image_url}]})
     if not updated.get("ok"):
         return updated
     return {
         "ok": True,
-        "success": True,
-        "msg": "Solo imagen actualizada en la web (SKU y demas sin cambios).",
+        "msg": "Imagen enviada a WooCommerce.",
         "image_url": image_url,
         "woo_id": woo_id,
-        "sku": sku,
         "data": updated.get("data", {}),
-    }
-
-
-@app.post("/web/woocommerce/sync-sku/{producto_id}")
-def woo_sync_product_sku(producto_id: int, data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
-    """Actualiza/guarda SKU en ERP y lo empuja a WooCommerce. Opcional: body {sku_woo}."""
-    sucursal = norm_sucursal(sucursal)
-    data = data or {}
-    sku_new = str(data.get("sku_woo") or data.get("sku") or "").strip().upper()
-    conn = get_conn()
-    cur = conn.cursor()
-    ensure_producto_web_columns(cur)
-    cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS woo_id INT")
-    cur.execute("""
-        SELECT id, nombre, COALESCE(sku_woo,'') AS sku_woo, COALESCE(woo_id,0) AS woo_id,
-               COALESCE(imagen_url,'') AS imagen_url, COALESCE(nombre_web,'') AS nombre_web,
-               COALESCE(precio_venta,0) AS precio_venta, COALESCE(stock,0) AS stock
-        FROM productos
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
-    p = dict_fetchone(cur)
-    if not p:
-        release_conn(conn)
-        return {"ok": False, "success": False, "msg": "Producto ERP no encontrado."}
-    sku_old = str(p.get("sku_woo") or "").strip().upper()
-    sku = sku_new or sku_old or f"ERP-{producto_id}"
-    if sku != sku_old:
-        cur.execute("""
-            UPDATE productos SET sku_woo=%s
-            WHERE id=%s AND COALESCE(sucursal,%s)=%s
-        """, (sku, producto_id, DEFAULT_SUCURSAL, sucursal))
-        conn.commit()
-        p["sku_woo"] = sku
-    release_conn(conn)
-
-    if not woo_config(sucursal):
-        return {"ok": False, "success": False, "msg": "WooCommerce no configurado para esta sucursal.", "sku": sku}
-
-    woo_id = int(p.get("woo_id") or 0)
-    # Buscar producto web por woo_id, SKU nuevo o SKU viejo
-    if not woo_id and sku:
-        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
-        if found.get("ok") and (found.get("data") or []):
-            woo_id = int(found["data"][0].get("id") or 0)
-    if not woo_id and sku_old and sku_old != sku:
-        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku_old, "per_page": 1})
-        if found.get("ok") and (found.get("data") or []):
-            woo_id = int(found["data"][0].get("id") or 0)
-
-    if woo_id:
-        updated = woo_request("put", f"products/{woo_id}", sucursal=sucursal, json={"sku": sku})
-        if not updated.get("ok"):
-            return {
-                "ok": False,
-                "success": False,
-                "msg": updated.get("msg") or "No se pudo actualizar el SKU en la web.",
-                "sku": sku,
-                "woo_id": woo_id,
-            }
-        woo_save_product_link(producto_id, updated.get("data") or {}, sku, sucursal=sucursal)
-        return {
-            "ok": True,
-            "success": True,
-            "msg": f"SKU actualizado en la web: {sku} (producto web #{woo_id}).",
-            "sku": sku,
-            "woo_id": woo_id,
-            "action": "updated",
-        }
-
-    # Si no existe en web, crear/vincular completo
-    r = woo_upsert_erp_product(p, sucursal=sucursal)
-    if not r.get("ok"):
-        return {
-            "ok": False,
-            "success": False,
-            "msg": r.get("msg") or "No se encontro producto web y no se pudo crear.",
-            "sku": sku,
-        }
-    return {
-        "ok": True,
-        "success": True,
-        "msg": f"SKU {sku} publicado/vinculado en la web ({r.get('action') or 'ok'}).",
-        "sku": sku,
-        "woo_id": int((r.get("data") or {}).get("id") or 0),
-        "action": r.get("action") or "upsert",
-        "data": r.get("data"),
-    }
-
-
-@app.post("/web/woocommerce/pull-image/{producto_id}")
-def woo_pull_product_image(producto_id: int, sucursal: str = DEFAULT_SUCURSAL):
-    """Trae la imagen de la web (Woo) hacia el ERP por SKU o woo_id."""
-    sucursal = norm_sucursal(sucursal)
-    conn = get_conn()
-    cur = conn.cursor()
-    ensure_producto_web_columns(cur)
-    cur.execute("""
-        SELECT id, nombre, COALESCE(sku_woo,'') AS sku_woo, COALESCE(woo_id,0) AS woo_id,
-               COALESCE(imagen_url,'') AS imagen_url
-        FROM productos
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (producto_id, DEFAULT_SUCURSAL, sucursal))
-    p = dict_fetchone(cur)
-    if not p:
-        release_conn(conn)
-        return {"ok": False, "success": False, "msg": "Producto ERP no encontrado."}
-    sku = str(p.get("sku_woo") or "").strip().upper() or f"ERP-{producto_id}"
-    woo_id = int(p.get("woo_id") or 0)
-    item = None
-    if woo_id > 0:
-        detail = woo_request("get", f"products/{woo_id}", sucursal=sucursal)
-        if detail.get("ok"):
-            item = detail.get("data") or {}
-    if not item:
-        found = woo_request("get", "products", sucursal=sucursal, params={"sku": sku, "per_page": 1})
-        if not found.get("ok"):
-            release_conn(conn)
-            return {"ok": False, "success": False, "msg": found.get("msg") or "Error consultando la web."}
-        items = found.get("data") or []
-        if not items:
-            release_conn(conn)
-            return {"ok": False, "success": False, "msg": f"No hay producto web con SKU {sku}."}
-        item = items[0]
-        woo_id = int(item.get("id") or 0)
-    images = item.get("images") or []
-    image_url = images[0].get("src", "") if images and isinstance(images[0], dict) else ""
-    if not image_url:
-        release_conn(conn)
-        return {"ok": False, "success": False, "msg": "El producto web no tiene imagen."}
-    cur.execute("""
-        UPDATE productos
-        SET imagen_url=%s,
-            woo_id=CASE WHEN %s > 0 THEN %s ELSE woo_id END,
-            sku_woo=CASE WHEN COALESCE(sku_woo,'')='' THEN %s ELSE sku_woo END
-        WHERE id=%s AND COALESCE(sucursal,%s)=%s
-    """, (image_url, woo_id, woo_id, sku, producto_id, DEFAULT_SUCURSAL, sucursal))
-    conn.commit()
-    release_conn(conn)
-    return {
-        "ok": True,
-        "success": True,
-        "msg": "Imagen traida de la web al ERP.",
-        "image_url": image_url,
-        "sku": sku,
-        "woo_id": woo_id,
-        "producto_id": producto_id,
     }
 
 
@@ -11226,14 +13331,26 @@ def woo_sync_products(data: dict = None, sucursal: str = DEFAULT_SUCURSAL):
     only_with_stock = bool((data or {}).get("only_with_stock", False))
     conn = get_conn()
     cur = conn.cursor()
+    stock_sql = _erp_stock_select_sql("p")
     sql = """
-        SELECT id, nombre, categoria, marca, modelo, precio_venta, stock, COALESCE(imagen_url,'') AS imagen_url, COALESCE(sku_woo,'') AS sku_woo
-        FROM productos
-        WHERE COALESCE(sucursal,%s)=%s
+        SELECT p.id, p.nombre, p.categoria, p.marca, p.modelo, p.precio_venta,
+               ({stock_sql}) AS stock,
+               COALESCE(p.imagen_url,'') AS imagen_url,
+               COALESCE(p.sku_woo,'') AS sku_woo,
+               COALESCE(p.nombre_web,'') AS nombre_web,
+               COALESCE(p.categoria_web,'') AS categoria_web,
+               COALESCE(p.subcategoria_web,'') AS subcategoria_web,
+               COALESCE(p.woo_categoria_id,0) AS woo_categoria_id,
+               COALESCE(p.woo_subcategoria_id,0) AS woo_subcategoria_id,
+               COALESCE(p.woo_id,0) AS woo_id
+        FROM productos p
+        WHERE COALESCE(p.sucursal,%s)=%s
     """
-    params = [DEFAULT_SUCURSAL, sucursal]
+    sql = sql.format(stock_sql=stock_sql)
+    params = [DEFAULT_SUCURSAL, sucursal, DEFAULT_SUCURSAL, sucursal]
     if only_with_stock:
-        sql += " AND COALESCE(stock,0) > 0"
+        sql += f" AND ({stock_sql}) > 0"
+        params.extend([DEFAULT_SUCURSAL, sucursal])
     sql += " ORDER BY id LIMIT 300"
     cur.execute(sql, params)
     productos = dict_fetchall(cur)
@@ -12478,7 +14595,7 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
         cur.execute("""
             SELECT COUNT(*), COALESCE(SUM(saldo),0)
             FROM reservas_clientes
-            WHERE UPPER(COALESCE(estado,'RESERVADO'))='RESERVADO'
+            WHERE UPPER(COALESCE(estado,'RESERVADO')) IN ('RESERVADO','PAGADO')
               AND COALESCE(sucursal,%s)=%s
         """, (DEFAULT_SUCURSAL, sucursal))
         reserva_row = cur.fetchone()
@@ -12488,6 +14605,63 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
         conn.rollback()
         reservas_activas = 0
         reservas_saldo = 0.0
+    # Alertas diarias de retiro de separaciones (pago adelantado)
+    separaciones_hoy = []
+    separaciones_atrasadas = []
+    separaciones_hoy_count = 0
+    separaciones_atrasadas_count = 0
+    try:
+        cur.execute("ALTER TABLE reservas_clientes ADD COLUMN IF NOT EXISTS fecha_retiro DATE")
+        cur.execute("""
+            SELECT id, COALESCE(cliente_nombre,'') AS cliente_nombre,
+                   COALESCE(numero_documento,'') AS numero_documento,
+                   COALESCE(producto_nombre,'') AS producto_nombre,
+                   COALESCE(cantidad,1) AS cantidad,
+                   COALESCE(monto_total,0) AS monto_total,
+                   COALESCE(monto_reserva,0) AS monto_reserva,
+                   COALESCE(saldo,0) AS saldo,
+                   COALESCE(estado,'RESERVADO') AS estado,
+                   COALESCE(to_char(fecha_retiro, 'YYYY-MM-DD'), '') AS fecha_retiro,
+                   COALESCE(observacion,'') AS observacion,
+                   to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha
+            FROM reservas_clientes
+            WHERE UPPER(COALESCE(estado,'RESERVADO')) IN ('RESERVADO','PAGADO')
+              AND fecha_retiro IS NOT NULL
+              AND fecha_retiro = (timezone('America/Lima', now()))::date
+              AND COALESCE(sucursal,%s)=%s
+            ORDER BY cliente_nombre ASC, id ASC
+            LIMIT 40
+        """, (DEFAULT_SUCURSAL, sucursal))
+        separaciones_hoy = [_jsonable_row(r) for r in dict_fetchall(cur)]
+        separaciones_hoy_count = len(separaciones_hoy)
+        cur.execute("""
+            SELECT id, COALESCE(cliente_nombre,'') AS cliente_nombre,
+                   COALESCE(numero_documento,'') AS numero_documento,
+                   COALESCE(producto_nombre,'') AS producto_nombre,
+                   COALESCE(cantidad,1) AS cantidad,
+                   COALESCE(monto_total,0) AS monto_total,
+                   COALESCE(monto_reserva,0) AS monto_reserva,
+                   COALESCE(saldo,0) AS saldo,
+                   COALESCE(estado,'RESERVADO') AS estado,
+                   COALESCE(to_char(fecha_retiro, 'YYYY-MM-DD'), '') AS fecha_retiro,
+                   COALESCE(observacion,'') AS observacion,
+                   to_char(fecha, 'YYYY-MM-DD HH24:MI') AS fecha
+            FROM reservas_clientes
+            WHERE UPPER(COALESCE(estado,'RESERVADO')) IN ('RESERVADO','PAGADO')
+              AND fecha_retiro IS NOT NULL
+              AND fecha_retiro < (timezone('America/Lima', now()))::date
+              AND COALESCE(sucursal,%s)=%s
+            ORDER BY fecha_retiro ASC, id ASC
+            LIMIT 40
+        """, (DEFAULT_SUCURSAL, sucursal))
+        separaciones_atrasadas = [_jsonable_row(r) for r in dict_fetchall(cur)]
+        separaciones_atrasadas_count = len(separaciones_atrasadas)
+    except Exception:
+        conn.rollback()
+        separaciones_hoy = []
+        separaciones_atrasadas = []
+        separaciones_hoy_count = 0
+        separaciones_atrasadas_count = 0
     cur.execute(f"""
         SELECT COUNT(*) FROM ventas
         WHERE COALESCE(estado_pago,'PAGADO') IN ('CREDITO','DEUDA')
@@ -12563,6 +14737,10 @@ def dashboard(sucursal: str = DEFAULT_SUCURSAL, fecha: Optional[str] = None):
         "stock_bajo": stock_bajo,
         "reservas_activas": reservas_activas,
         "reservas_saldo": reservas_saldo,
+        "separaciones_hoy": separaciones_hoy,
+        "separaciones_hoy_count": separaciones_hoy_count,
+        "separaciones_atrasadas": separaciones_atrasadas,
+        "separaciones_atrasadas_count": separaciones_atrasadas_count,
         "facturas_cobrar": facturas_cobrar,
         "cuentas_cobrar": cuentas_cobrar,
         "total_cuentas_cobrar": total_cuentas_cobrar,
