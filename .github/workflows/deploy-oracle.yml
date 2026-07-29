@@ -1,0 +1,59 @@
+name: Deploy ERP to Oracle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "webapp/**"
+      - "api.py"
+      - "Dockerfile"
+      - "docker-compose.oracle.yml"
+      - "requirements-api.txt"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require SSH key secret
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "Falta secret ORACLE_SSH_KEY"
+            echo "GitHub > Settings > Secrets and variables > Actions > New repository secret"
+            echo "Name: ORACLE_SSH_KEY"
+            echo "Value: contenido de la llave privada SSH de la VM"
+            exit 1
+          fi
+
+      - name: Setup SSH and deploy
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_KEY }}
+          HOST: ${{ secrets.ORACLE_HOST }}
+        run: |
+          set -e
+          HOST="${HOST:-ubuntu@64.181.176.160}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/oracle.key
+          chmod 600 ~/.ssh/oracle.key
+          ssh-keyscan -H 64.181.176.160 >> ~/.ssh/known_hosts 2>/dev/null || true
+          tar -czf /tmp/erp-oracle-publish.tgz \
+            api.py Dockerfile docker-compose.oracle.yml requirements-api.txt \
+            plataform_sunat_client.py plataform_sunat_server.py plataform_sunat_panel.html \
+            webapp
+          scp -i ~/.ssh/oracle.key -o StrictHostKeyChecking=no \
+            /tmp/erp-oracle-publish.tgz "${HOST}:/tmp/erp-oracle-publish.tgz"
+          ssh -i ~/.ssh/oracle.key -o StrictHostKeyChecking=no "$HOST" '
+            set -e
+            cd ~/erp || mkdir -p ~/erp && cd ~/erp
+            tar -xzf /tmp/erp-oracle-publish.tgz
+            docker compose -f docker-compose.oracle.yml up -d --build api
+            sleep 8
+            curl -sS "http://127.0.0.1:8000/health?db=1" || true
+            echo
+          '
+          echo "Deploy Oracle OK"
