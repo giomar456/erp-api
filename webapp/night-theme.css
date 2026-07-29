@@ -1,0 +1,432 @@
+/* G&G ERP — Tema nocturno suave (ojos descansados, no negro puro) */
+:root {
+  color-scheme: dark;
+  --gg-bg: #0c111b;
+  --gg-surface: #151c2a;
+  --gg-surface-2: #1b2436;
+  --gg-surface-3: #232d42;
+  --gg-border: #2d3a52;
+  --gg-border-soft: #243044;
+  --gg-text: #e6edf7;
+  --gg-text-2: #b6c2d6;
+  --gg-text-3: #8b9bb3;
+  --gg-text-muted: #6b7c96;
+  --gg-overlay: rgba(12, 17, 27, 0.78);
+  --gg-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+
+html,
+body,
+#root {
+  background-color: var(--gg-bg) !important;
+  color: var(--gg-text);
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* —— Superficies claras → paneles nocturnos —— */
+.bg-white,
+.bg-white\/95,
+.bg-white\/80,
+.bg-white\/70 {
+  background-color: var(--gg-surface) !important;
+}
+
+.bg-\[\#f5f7fb\],
+.bg-\[\#f8f9fd\],
+.bg-\[\#eef1fb\] {
+  background-color: var(--gg-bg) !important;
+}
+
+.bg-slate-50,
+.bg-slate-100 {
+  background-color: var(--gg-surface-2) !important;
+}
+
+.bg-slate-200 {
+  background-color: var(--gg-surface-3) !important;
+}
+
+/* Hover / active claros */
+.hover\:bg-slate-50:hover,
+.hover\:bg-\[\#eef1fb\]:hover,
+.hover\:bg-blue-50:hover,
+.hover\:bg-amber-50:hover,
+.hover\:bg-sky-50:hover,
+.hover\:bg-orange-50:hover,
+.hover\:bg-amber-100:hover,
+.hover\:bg-red-100:hover {
+  background-color: var(--gg-surface-3) !important;
+}
+
+.active\:bg-slate-50:active,
+.active\:bg-slate-200:active,
+.active\:bg-blue-50:active,
+.active\:bg-\[\#dfe4f7\]:active {
+  background-color: #2a3650 !important;
+}
+
+/* —— Texto oscuro → texto claro —— */
+.text-slate-950,
+.text-slate-900,
+.text-slate-800 {
+  color: var(--gg-text) !important;
+}
+
+.text-slate-700,
+.text-slate-600 {
+  color: var(--gg-text-2) !important;
+}
+
+.text-slate-500 {
+  color: var(--gg-text-3) !important;
+}
+
+.text-slate-400 {
+  color: var(--gg-text-muted) !important;
+}
+
+/* Bordes suaves */
+.border-slate-100,
+.border-slate-200,
+.border-slate-300,
+.divide-slate-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--gg-border) !important;
+}
+
+.ring-slate-200,
+.ring-slate-300 {
+  --tw-ring-color: var(--gg-border) !important;
+}
+
+/* Sombras un poco más profundas */
+.shadow-sm,
+.shadow,
+.shadow-md,
+.shadow-lg,
+.shadow-xl,
+.shadow-2xl {
+  box-shadow: var(--gg-shadow) !important;
+}
+
+/* Inputs / selects / textareas */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
+textarea,
+select {
+  background-color: var(--gg-surface-2) !important;
+  color: var(--gg-text) !important;
+  border-color: var(--gg-border) !important;
+  color-scheme: dark;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--gg-text-muted) !important;
+  opacity: 1;
+}
+
+option {
+  background-color: var(--gg-surface-2);
+  color: var(--gg-text);
+}
+
+/* File picker buttons */
+.file\:bg-slate-100::file-selector-button,
+.file\:bg-violet-100::file-selector-button {
+  background-color: var(--gg-surface-3) !important;
+  color: var(--gg-text) !important;
+}
+
+/* Botón neutral (antes slate-100) */
+.bg-slate-100.text-slate-800,
+.bg-slate-100.text-slate-700,
+.bg-slate-100.text-slate-600,
+.bg-slate-100.text-slate-500 {
+  background-color: var(--gg-surface-3) !important;
+  color: var(--gg-text-2) !important;
+}
+
+/* —— Chips / alertas con fondo pastel → versión nocturna suave —— */
+.bg-blue-50,
+.bg-blue-50\/40,
+.bg-blue-100 {
+  background-color: rgba(37, 99, 235, 0.16) !important;
+}
+.text-blue-950,
+.text-blue-900,
+.text-blue-800,
+.text-blue-700,
+.text-blue-600 {
+  color: #93c5fd !important;
+}
+.border-blue-100,
+.border-blue-200 {
+  border-color: rgba(59, 130, 246, 0.35) !important;
+}
+
+.bg-emerald-50,
+.bg-emerald-50\/60,
+.bg-emerald-100,
+.bg-emerald-200,
+.bg-green-100 {
+  background-color: rgba(16, 185, 129, 0.14) !important;
+}
+.text-emerald-950,
+.text-emerald-900,
+.text-emerald-800,
+.text-emerald-700,
+.text-emerald-600,
+.text-green-800,
+.text-green-700 {
+  color: #6ee7b7 !important;
+}
+.border-emerald-200,
+.border-emerald-300,
+.border-emerald-400 {
+  border-color: rgba(52, 211, 153, 0.35) !important;
+}
+
+.bg-amber-50,
+.bg-amber-100,
+.bg-amber-200 {
+  background-color: rgba(245, 158, 11, 0.14) !important;
+}
+.text-amber-950,
+.text-amber-900,
+.text-amber-800,
+.text-amber-700 {
+  color: #fcd34d !important;
+}
+.border-amber-100,
+.border-amber-200,
+.border-amber-300 {
+  border-color: rgba(251, 191, 36, 0.35) !important;
+}
+
+.bg-red-50,
+.bg-red-50\/60,
+.bg-red-100,
+.bg-red-200 {
+  background-color: rgba(239, 68, 68, 0.14) !important;
+}
+.text-red-900,
+.text-red-800,
+.text-red-700 {
+  color: #fca5a5 !important;
+}
+.border-red-100,
+.border-red-200,
+.border-red-300 {
+  border-color: rgba(248, 113, 113, 0.35) !important;
+}
+
+.bg-rose-50,
+.bg-rose-100 {
+  background-color: rgba(244, 63, 94, 0.14) !important;
+}
+.text-rose-900,
+.text-rose-800,
+.text-rose-700,
+.text-rose-600 {
+  color: #fda4af !important;
+}
+.border-rose-200,
+.border-rose-300 {
+  border-color: rgba(251, 113, 133, 0.35) !important;
+}
+
+.bg-violet-50,
+.bg-violet-50\/40,
+.bg-violet-100 {
+  background-color: rgba(139, 92, 246, 0.14) !important;
+}
+.text-violet-950,
+.text-violet-900,
+.text-violet-800,
+.text-violet-700,
+.text-violet-600 {
+  color: #c4b5fd !important;
+}
+.border-violet-100,
+.border-violet-200,
+.border-violet-300 {
+  border-color: rgba(167, 139, 250, 0.35) !important;
+}
+
+.bg-indigo-50 {
+  background-color: rgba(99, 102, 241, 0.14) !important;
+}
+.text-indigo-900,
+.text-indigo-800,
+.text-indigo-700 {
+  color: #a5b4fc !important;
+}
+.border-indigo-100,
+.border-indigo-200 {
+  border-color: rgba(129, 140, 248, 0.35) !important;
+}
+
+.bg-purple-50,
+.bg-purple-200 {
+  background-color: rgba(168, 85, 247, 0.14) !important;
+}
+.text-purple-800,
+.text-purple-700 {
+  color: #d8b4fe !important;
+}
+.border-purple-200 {
+  border-color: rgba(192, 132, 252, 0.35) !important;
+}
+
+.bg-cyan-50,
+.bg-cyan-100 {
+  background-color: rgba(6, 182, 212, 0.14) !important;
+}
+.text-cyan-900,
+.text-cyan-800 {
+  color: #67e8f9 !important;
+}
+.border-cyan-200 {
+  border-color: rgba(34, 211, 238, 0.35) !important;
+}
+
+.bg-sky-50,
+.bg-sky-50\/40,
+.bg-sky-100 {
+  background-color: rgba(14, 165, 233, 0.14) !important;
+}
+.text-sky-900,
+.text-sky-800,
+.text-sky-700 {
+  color: #7dd3fc !important;
+}
+.border-sky-200 {
+  border-color: rgba(56, 189, 248, 0.35) !important;
+}
+
+.bg-teal-50,
+.bg-teal-50\/70,
+.bg-teal-100 {
+  background-color: rgba(20, 184, 166, 0.14) !important;
+}
+.text-teal-950,
+.text-teal-800 {
+  color: #5eead4 !important;
+}
+.border-teal-200,
+.border-teal-300 {
+  border-color: rgba(45, 212, 191, 0.35) !important;
+}
+
+.bg-pink-50 {
+  background-color: rgba(236, 72, 153, 0.14) !important;
+}
+.text-pink-900,
+.text-pink-800,
+.text-pink-700,
+.text-pink-600 {
+  color: #f9a8d4 !important;
+}
+.border-pink-200,
+.border-pink-300 {
+  border-color: rgba(244, 114, 182, 0.35) !important;
+}
+
+.bg-orange-50 {
+  background-color: rgba(249, 115, 22, 0.14) !important;
+}
+.text-orange-900 {
+  color: #fdba74 !important;
+}
+.border-orange-200 {
+  border-color: rgba(251, 146, 60, 0.35) !important;
+}
+
+.bg-lime-50 {
+  background-color: rgba(132, 204, 22, 0.14) !important;
+}
+.text-lime-800 {
+  color: #bef264 !important;
+}
+
+.bg-fuchsia-700 {
+  /* keep vivid action color */
+}
+
+/* Gradientes claros de cabeceras suaves */
+.from-pink-50 {
+  --tw-gradient-from: rgba(236, 72, 153, 0.12) !important;
+}
+.to-amber-50 {
+  --tw-gradient-to: rgba(245, 158, 11, 0.12) !important;
+}
+
+/* Tablas / filas seleccionadas */
+.bg-blue-50,
+[class*="bg-blue-50"] {
+  /* already covered */
+}
+
+/* Scrollbar suave */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a4a66 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #3a4a66;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Header sticky un poco más “vidrio” nocturno */
+header.sticky.bg-white,
+header.sticky {
+  background-color: rgba(21, 28, 42, 0.92) !important;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* Footer sticky de caja */
+footer.sticky {
+  background-color: rgba(21, 28, 42, 0.96) !important;
+  border-color: var(--gg-border) !important;
+}
+
+/* Logos en cajas blancas: fondo suave */
+button.bg-white.ring-1,
+.bg-white.ring-1 {
+  background-color: var(--gg-surface-2) !important;
+}
+
+/* Evitar que text-white se pise en botones de color (no tocar .text-white) */
+
+/* Iframes de documentos: fondo oscuro alrededor */
+iframe.bg-slate-100 {
+  background-color: var(--gg-surface-2) !important;
+}
+
+/* Suavizar contraste de cards */
+.rounded-lg.border.bg-white,
+.rounded-xl.border.bg-white,
+.rounded-md.border.bg-white {
+  background-color: var(--gg-surface) !important;
+  border-color: var(--gg-border) !important;
+}
+
+/* Transición suave al cargar */
+body,
+#root,
+.bg-white,
+.bg-\[\#f5f7fb\] {
+  transition: background-color 0.2s ease, color 0.15s ease, border-color 0.15s ease;
+}
