@@ -1,18 +1,17 @@
 name: Oracle Keep Alive
 
-# Pings frecuentes a Oracle Cloud para no perder conectividad / detectar caidas.
-# Oracle Always Free NO se duerme como Render, pero red/Docker si pueden fallar.
+# Pings HTTPS publico (Caddy). El puerto 8000 solo escucha en localhost.
+# Oracle Always Free NO se duerme como Render; esto detecta caidas y avisa.
 on:
   schedule:
-    # Cada 5 minutos (GitHub puede retrasar un poco)
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  ORACLE_URL: http://64.181.176.160:8000
+  ORACLE_URL: https://64.181.176.160.sslip.io
 
 jobs:
   ping:
@@ -23,25 +22,24 @@ jobs:
         run: |
           set -uo pipefail
           ok=0
-          for i in 1 2 3 4 5; do
-            echo "=== Intento $i/5 ==="
-            code=$(curl -sS -o /tmp/body.txt -w "%{http_code}" \
-              --connect-timeout 12 --max-time 45 \
-              "${ORACLE_URL}/health?db=1" || echo "000")
-            body=$(head -c 400 /tmp/body.txt || true)
+          for i in 1 2 3; do
+            echo "=== Intento $i/3 ==="
+            code=$(curl -sS -k -o /tmp/body.txt -w "%{http_code}" \
+              --connect-timeout 12 --max-time 25 \
+              "${ORACLE_URL}/health?db=1" || true)
+            [ -z "$code" ] && code=000
+            body=$(head -c 400 /tmp/body.txt 2>/dev/null || true)
             echo "HTTP $code"
             echo "$body"
             if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":true'; then
               ok=1
               break
             fi
-            sleep 8
+            sleep 5
           done
 
-          # Warm rutas livianas (best effort)
-          curl -sS --connect-timeout 10 --max-time 30 "${ORACLE_URL}/health" -o /dev/null || true
-          curl -sS --connect-timeout 10 --max-time 30 "${ORACLE_URL}/" -o /dev/null || true
-          curl -sS --connect-timeout 10 --max-time 40 "${ORACLE_URL}/erp/" -o /dev/null || true
+          curl -sS -k --connect-timeout 10 --max-time 20 "${ORACLE_URL}/health" -o /dev/null || true
+          curl -sS -k --connect-timeout 10 --max-time 20 "${ORACLE_URL}/erp/" -o /dev/null || true
 
           if [ "$ok" != "1" ]; then
             echo "::error::Oracle no respondio health+db. Revisa VM 64.181.176.160 y docker."

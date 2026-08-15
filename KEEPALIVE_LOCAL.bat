@@ -1,7 +1,7 @@
 @echo off
 title ERP Oracle Keep Alive
 REM Solo Oracle. No Render. No toca base de datos.
-set URL=http://64.181.176.160:8000/health?db=1
+set URL=https://64.181.176.160.sslip.io/health?db=1
 echo ============================================
 echo  ERP Oracle Keep Alive
 echo  %URL%
